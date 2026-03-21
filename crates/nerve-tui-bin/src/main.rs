@@ -14,6 +14,7 @@ use crossterm::{
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 use std::io;
+use std::path::Path;
 use tracing::info;
 
 use nerve_tui::app::App;
@@ -29,6 +30,10 @@ struct Cli {
     /// Node name for registration
     #[arg(short, long, default_value = "tui")]
     name: String,
+
+    /// Project working directory for spawned agents and new channels
+    #[arg(long)]
+    project: Option<String>,
 }
 
 #[tokio::main]
@@ -44,6 +49,14 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
     let url = format!("ws://{}", cli.server);
+    let project = cli.project.as_ref().map(|path| {
+        let project_name = Path::new(path)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or(path);
+        info!("using project {} ({})", project_name, path);
+        path.clone()
+    });
 
     // Connect to nerve
     let (client, event_rx) = NerveClient::connect(&url, &cli.name).await?;
@@ -56,7 +69,10 @@ async fn main() -> Result<()> {
     if keyboard_enhanced {
         execute!(
             stdout,
-            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::REPORT_EVENT_TYPES)
+            PushKeyboardEnhancementFlags(
+                KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                    | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
+            )
         )?;
     }
     execute!(
@@ -69,7 +85,7 @@ async fn main() -> Result<()> {
     let mut terminal = Terminal::new(backend)?;
 
     // Run app
-    let mut app = App::new(client, event_rx);
+    let mut app = App::new_with_project(client, event_rx, project);
     app.init().await?;
     let result = app.run(&mut terminal).await;
 

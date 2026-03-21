@@ -4,6 +4,7 @@ use futures_util::StreamExt;
 use nerve_tui_core::NerveClient;
 use nerve_tui_protocol::*;
 use ratatui::Frame;
+use std::path::Path;
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
@@ -27,6 +28,8 @@ pub struct App {
 
     // DM mode
     active_dm: Option<DmState>,
+    project_path: Option<String>,
+    project_name: Option<String>,
     /// Channel for background task errors (e.g. prompt failures)
     error_tx: mpsc::UnboundedSender<String>,
     error_rx: mpsc::UnboundedReceiver<String>,
@@ -34,7 +37,18 @@ pub struct App {
 
 impl App {
     pub fn new(client: NerveClient, event_rx: mpsc::UnboundedReceiver<NerveEvent>) -> Self {
+        Self::new_with_project(client, event_rx, None)
+    }
+
+    pub fn new_with_project(
+        client: NerveClient,
+        event_rx: mpsc::UnboundedReceiver<NerveEvent>,
+        project_path: Option<String>,
+    ) -> Self {
         let (error_tx, error_rx) = mpsc::unbounded_channel();
+        let project_name = project_path
+            .as_deref()
+            .and_then(Self::project_name_from_path);
         Self {
             client,
             event_rx,
@@ -46,9 +60,27 @@ impl App {
             active_channel: None,
             should_quit: false,
             active_dm: None,
+            project_path,
+            project_name,
             error_tx,
             error_rx,
         }
+    }
+
+    fn project_name_from_path(path: &str) -> Option<String> {
+        Path::new(path)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .filter(|name| !name.is_empty())
+            .map(|name| name.to_string())
+            .or_else(|| {
+                let trimmed = path.trim_end_matches('/');
+                if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(trimmed.to_string())
+                }
+            })
     }
 
     /// Initialize: fetch channels, nodes, join first channel if exists.
@@ -71,8 +103,7 @@ impl App {
         terminal: &mut ratatui::Terminal<impl ratatui::backend::Backend>,
     ) -> Result<()> {
         let mut event_stream = crossterm::event::EventStream::new();
-        let mut redraw_interval =
-            tokio::time::interval(tokio::time::Duration::from_millis(100));
+        let mut redraw_interval = tokio::time::interval(tokio::time::Duration::from_millis(100));
 
         loop {
             terminal.draw(|frame| self.render(frame))?;
@@ -84,7 +115,10 @@ impl App {
             tokio::select! {
                 Some(Ok(evt)) = event_stream.next() => {
                     match evt {
-                        Event::Key(key) => self.handle_key(key).await,
+                        Event::Key(key) => {
+                            debug!("key event: code={:?} modifiers={:?}", key.code, key.modifiers);
+                            self.handle_key(key).await;
+                        }
                         Event::Mouse(mouse) => self.handle_mouse(mouse),
                         Event::Paste(text) => self.input.insert_str(&text),
                         _ => {}
@@ -114,6 +148,7 @@ impl App {
             self.active_channel.as_deref(),
             &self.agents,
             self.active_dm.as_ref().map(|dm| dm.node_name.as_str()),
+            self.project_name.as_deref(),
             layout.sidebar,
             frame.buffer_mut(),
         );
@@ -140,25 +175,44 @@ impl App {
                 self.should_quit = true;
             }
 
-            // Shift+Enter, Alt+Enter, or Ctrl+Enter: insert newline
+            // Shift+Enter, Alt+Enter: insert newline
             KeyCode::Enter
                 if key.modifiers.contains(KeyModifiers::SHIFT)
-                    || key.modifiers.contains(KeyModifiers::ALT)
-                    || key.modifiers.contains(KeyModifiers::CONTROL) =>
+                    || key.modifiers.contains(KeyModifiers::ALT) =>
             {
                 self.input.insert('\n');
             }
 
-            // Submit
+            // Ctrl+O: insert newline (universal fallback, no protocol needed)
+            KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.input.insert('\n');
+            }
+
+            // Ctrl+X: cancel the active DM response (only when agent is responding)
+            KeyCode::Char('x') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if self.active_dm.as_ref().is_some_and(|dm| dm.is_responding) {
+                    self.cancel_active_dm().await;
+                }
+            }
+
+            // Submit or confirm sidebar selection
             KeyCode::Enter => {
                 if !self.input.is_empty() {
                     let text = self.input.take();
                     self.handle_input(&text).await;
+                } else {
+                    self.confirm_selected_navigation().await;
                 }
             }
 
-            // Tab completion
-            KeyCode::Tab => self.input.tab(),
+            // Tab completion or confirm sidebar selection
+            KeyCode::Tab => {
+                if self.input.is_empty() {
+                    self.confirm_selected_navigation().await;
+                } else {
+                    self.input.tab();
+                }
+            }
             KeyCode::BackTab => self.input.shift_tab(),
 
             // Scroll messages
@@ -177,34 +231,24 @@ impl App {
                 self.messages.scroll_down(10);
             }
 
-            // Agent tab navigation (Ctrl+N/P)
+            // Unified navigation list
             KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.status_bar.select_next_tab(&self.agents);
-                self.sync_filter();
+                self.status_bar
+                    .select_next_item(&self.channels, &self.agents);
             }
             KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.status_bar.select_prev_tab(&self.agents);
-                self.sync_filter();
-            }
-
-            // Channel navigation (Ctrl+H/L) — only in channel mode
-            KeyCode::Char('h') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                if self.active_dm.is_none() {
-                    self.status_bar.select_prev_channel(&self.channels);
-                    self.switch_to_selected_channel().await;
-                }
-            }
-            KeyCode::Char('l') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                if self.active_dm.is_none() {
-                    self.status_bar.select_next_channel(&self.channels);
-                    self.switch_to_selected_channel().await;
-                }
+                self.status_bar
+                    .select_prev_item(&self.channels, &self.agents);
             }
 
             // Esc: exit DM or dismiss popup
             KeyCode::Esc => {
                 if self.active_dm.is_some() {
-                    self.exit_dm().await;
+                    if self.active_dm.as_ref().is_some_and(|dm| dm.is_responding) {
+                        self.cancel_active_dm().await;
+                    } else {
+                        self.exit_dm().await;
+                    }
                 } else {
                     self.input.dismiss_popup();
                 }
@@ -230,20 +274,42 @@ impl App {
         }
     }
 
-    /// Sync messages filter with current tab selection
-    fn sync_filter(&mut self) {
-        self.messages.filter = self.status_bar.current_filter(&self.agents);
+    fn sync_navigation_selection(&mut self) {
+        self.messages.filter = None;
+        self.status_bar.sync_to_context(
+            &self.channels,
+            self.active_channel.as_deref(),
+            &self.agents,
+            self.active_dm.as_ref().map(|dm| dm.node_name.as_str()),
+        );
         self.messages.snap_to_bottom();
     }
 
-    /// Switch to the channel currently selected in sidebar
-    async fn switch_to_selected_channel(&mut self) {
-        let idx = self.status_bar.selected_channel;
-        if let Some(ch) = self.channels.get(idx) {
-            let ch_id = ch.id.clone();
-            if self.active_channel.as_deref() != Some(&ch_id) {
-                self.join_channel(&ch_id).await;
+    async fn confirm_selected_navigation(&mut self) {
+        match self
+            .status_bar
+            .selected_target(&self.channels, &self.agents)
+        {
+            Some(NavigationTarget::Channel(idx)) => {
+                if let Some(ch) = self.channels.get(idx) {
+                    let ch_id = ch.id.clone();
+                    if self.active_dm.is_some() {
+                        self.exit_dm().await;
+                    }
+                    if self.active_channel.as_deref() != Some(&ch_id) {
+                        self.join_channel(&ch_id).await;
+                    } else {
+                        self.sync_navigation_selection();
+                    }
+                }
             }
+            Some(NavigationTarget::Agent(idx)) => {
+                if let Some(agent) = self.agents.get(idx) {
+                    let agent_name = agent.name.clone();
+                    self.enter_dm(&agent_name).await;
+                }
+            }
+            None => {}
         }
     }
 
@@ -255,7 +321,20 @@ impl App {
 
         // DM mode: send via node.prompt
         if let Some(ref dm) = self.active_dm.clone() {
-            debug!("dm send to {}: {}", dm.node_name, &text[..text.len().min(50)]);
+            if dm.is_responding {
+                debug!(
+                    "dm send blocked for {}: agent still responding",
+                    dm.node_name
+                );
+                self.push_contextual_system("agent 正在回复，先等待完成或 Ctrl+X 取消");
+                return;
+            }
+
+            debug!(
+                "dm send to {}: {}",
+                dm.node_name,
+                &text[..text.len().min(50)]
+            );
 
             // Add user message locally immediately
             let user_msg = DmMessage {
@@ -298,6 +377,39 @@ impl App {
 
     // --- DM mode ---
 
+    fn push_contextual_system(&mut self, content: &str) {
+        if self.active_dm.is_some() {
+            let dm_msg = DmMessage {
+                role: "系统".to_string(),
+                content: content.to_string(),
+                timestamp: chrono::Local::now().timestamp(),
+            };
+            self.messages.push_dm(&dm_msg);
+            if let Some(ref mut dm_state) = self.active_dm {
+                dm_state.messages.push(dm_msg);
+            }
+        } else {
+            self.messages.push_system(content);
+        }
+    }
+
+    fn reset_dm_before_enter(&mut self, next_node_id: &str) -> Option<String> {
+        let old_dm = self.active_dm.as_ref()?.clone();
+        let same_node = old_dm.node_id == next_node_id;
+        if same_node {
+            debug!(
+                "re-entering DM with {}, resetting local DM state",
+                old_dm.node_name
+            );
+        } else {
+            debug!("switching DM: unsubscribe old node {}", old_dm.node_id);
+        }
+
+        self.messages.exit_dm();
+        self.active_dm = None;
+        Some(old_dm.node_id)
+    }
+
     async fn enter_dm(&mut self, agent_name: &str) {
         let agent = self.agents.iter().find(|a| a.name == agent_name);
         let Some(agent) = agent else {
@@ -308,27 +420,18 @@ impl App {
         let node_id = agent.node_id.clone();
         let node_name = agent.name.clone();
 
-        // Unsubscribe old DM if switching to a different node
-        if let Some(ref old_dm) = self.active_dm {
-            if old_dm.node_id == node_id {
-                debug!("already in DM with {}, ignoring", node_name);
-                return;
-            }
-            let old_node_id = old_dm.node_id.clone();
-            debug!("switching DM: unsubscribe old node {}", old_node_id);
+        // Reset local DM state and resubscribe, even when re-entering the same agent.
+        if let Some(old_node_id) = self.reset_dm_before_enter(&node_id) {
             if let Err(e) = self.client.node_unsubscribe(&old_node_id).await {
                 warn!("unsubscribe old DM failed: {}", e);
             }
-            self.messages.exit_dm();
-            self.active_dm = None;
         }
 
         debug!("entering DM with {} ({})", node_name, node_id);
 
         // Subscribe to node updates
         if let Err(e) = self.client.node_subscribe(&node_id).await {
-            self.messages
-                .push_system(&format!("subscribe 失败: {}", e));
+            self.messages.push_system(&format!("subscribe 失败: {}", e));
             return;
         }
 
@@ -337,8 +440,10 @@ impl App {
             node_name: node_name.clone(),
             messages: Vec::new(),
             streaming: None,
+            is_responding: false,
         });
         self.messages.enter_dm(&node_name);
+        self.sync_navigation_selection();
     }
 
     async fn exit_dm(&mut self) {
@@ -348,7 +453,30 @@ impl App {
                 warn!("unsubscribe failed: {}", e);
             }
             self.messages.exit_dm();
+            self.sync_navigation_selection();
         }
+    }
+
+    async fn cancel_active_dm(&mut self) {
+        let Some((node_id, node_name)) = self
+            .active_dm
+            .as_ref()
+            .map(|dm| (dm.node_id.clone(), dm.node_name.clone()))
+        else {
+            return;
+        };
+
+        debug!("cancelling active DM with {}", node_name);
+        if let Err(e) = self.client.node_cancel(&node_id).await {
+            self.push_contextual_system(&format!("取消失败: {}", e));
+            return;
+        }
+
+        self.flush_streaming_as_dm(&node_id, &node_name);
+        if let Some(ref mut dm_state) = self.active_dm {
+            dm_state.is_responding = false;
+        }
+        self.push_contextual_system(&format!("已中断 {}", node_name));
     }
 
     async fn handle_command(&mut self, text: &str) {
@@ -370,10 +498,13 @@ impl App {
 
             "/create" => {
                 let name = parts.get(1).copied();
-                match self.client.channel_create(name).await {
+                match self
+                    .client
+                    .channel_create(name, self.project_path.as_deref())
+                    .await
+                {
                     Ok(ch) => {
-                        self.messages
-                            .push_system(&format!("频道已创建: {}", ch.id));
+                        self.messages.push_system(&format!("频道已创建: {}", ch.id));
                         let ch_id = ch.id.clone();
                         self.refresh_channels().await;
                         self.join_channel(&ch_id).await;
@@ -403,7 +534,11 @@ impl App {
                 }
                 let adapter = parts[1];
                 let name = parts.get(2).copied();
-                match self.client.node_spawn(adapter, name, None).await {
+                match self
+                    .client
+                    .node_spawn(adapter, name, self.project_path.as_deref())
+                    .await
+                {
                     Ok(node) => {
                         self.messages
                             .push_system(&format!("已启动: {} ({})", node.name, node.node_id));
@@ -413,8 +548,7 @@ impl App {
                                 .channel_add_node(ch_id, &node.node_id, Some(&node.name))
                                 .await
                             {
-                                self.messages
-                                    .push_system(&format!("加入频道失败: {}", e));
+                                self.messages.push_system(&format!("加入频道失败: {}", e));
                             }
                         }
                         self.refresh_agents().await;
@@ -437,9 +571,7 @@ impl App {
                                     .push_system(&format!("已停止: {}", name_or_id));
                                 self.refresh_agents().await;
                             }
-                            Err(e) => {
-                                self.messages.push_system(&format!("停止失败: {}", e))
-                            }
+                            Err(e) => self.messages.push_system(&format!("停止失败: {}", e)),
                         }
                     } else {
                         self.messages
@@ -457,13 +589,10 @@ impl App {
                     {
                         let nid = agent.node_id.clone();
                         match self.client.node_cancel(&nid).await {
-                            Ok(_) => {
-                                self.messages
-                                    .push_system(&format!("已取消: {}", name_or_id))
-                            }
-                            Err(e) => {
-                                self.messages.push_system(&format!("取消失败: {}", e))
-                            }
+                            Ok(_) => self
+                                .messages
+                                .push_system(&format!("已取消: {}", name_or_id)),
+                            Err(e) => self.messages.push_system(&format!("取消失败: {}", e)),
                         }
                     }
                 }
@@ -508,24 +637,33 @@ impl App {
 
             "/help" => {
                 self.messages.push_system("命令:");
-                self.messages.push_system("  /create [name]        创建频道");
-                self.messages.push_system("  /join [id]            加入频道");
-                self.messages.push_system("  /channels             列出频道");
+                self.messages
+                    .push_system("  /create [name]        创建频道");
+                self.messages
+                    .push_system("  /join [id]            加入频道");
+                self.messages
+                    .push_system("  /channels             列出频道");
                 self.messages
                     .push_system("  /add <adapter> [name] 启动 agent");
-                self.messages.push_system("  /stop <name>          停止 agent");
+                self.messages
+                    .push_system("  /stop <name>          停止 agent");
                 self.messages
                     .push_system("  /cancel <name>        取消 agent 任务");
-                self.messages.push_system("  /list                 列出 agents");
+                self.messages
+                    .push_system("  /list                 列出 agents");
                 self.messages
                     .push_system("  /dm <name>            与 agent 1v1 对话");
                 self.messages
                     .push_system("  /back                 退出 DM 回频道");
                 self.messages.push_system("  /help                 帮助");
                 self.messages.push_system("快捷键:");
-                self.messages.push_system("  Ctrl+N/P  切换 agent 过滤 tab");
-                self.messages.push_system("  Ctrl+H/L  切换频道");
-                self.messages.push_system("  Esc       退出 DM / 关闭补全");
+                self.messages
+                    .push_system("  Ctrl+N/P  选中导航列表上一项/下一项");
+                self.messages
+                    .push_system("  Enter/Tab 确认：切频道或进入DM");
+                self.messages.push_system("  Ctrl+X    中断当前 DM 回复");
+                self.messages
+                    .push_system("  Esc       DM回复中=取消，否则退出DM");
                 self.messages.push_system("  Ctrl+C/Q  退出");
             }
 
@@ -597,6 +735,10 @@ impl App {
                 // When agent goes idle, flush any pending streaming buffer as DM message
                 if status == "idle" {
                     self.flush_streaming_as_dm(&node_id, &name);
+                } else if let Some(ref mut dm_state) = self.active_dm {
+                    if dm_state.node_id == node_id && status == "busy" {
+                        dm_state.is_responding = true;
+                    }
                 }
             }
 
@@ -635,6 +777,11 @@ impl App {
             }
         }
         self.messages.streaming.retain(|(n, _)| n != name);
+        if let Some(ref mut dm_state) = self.active_dm {
+            if dm_state.node_id == node_id {
+                dm_state.is_responding = false;
+            }
+        }
     }
 
     fn handle_node_update(&mut self, node_id: &str, name: &str, detail: &serde_json::Value) {
@@ -671,13 +818,12 @@ impl App {
                         .and_then(|v| v.as_str())
                         .unwrap_or("");
                     if text.is_empty() {
-                        debug!("agent_message_chunk from {} has empty text, raw: {:?}", name, update);
+                        debug!(
+                            "agent_message_chunk from {} has empty text, raw: {:?}",
+                            name, update
+                        );
                     }
-                    if let Some(entry) = self
-                        .messages
-                        .streaming
-                        .iter_mut()
-                        .find(|(n, _)| n == name)
+                    if let Some(entry) = self.messages.streaming.iter_mut().find(|(n, _)| n == name)
                     {
                         entry.1.push_str(text);
                     } else {
@@ -685,9 +831,15 @@ impl App {
                             .streaming
                             .push((name.to_string(), text.to_string()));
                     }
+                    // Note: do NOT set is_responding here — chunks arrive during
+                    // replay too (historical data). Only NodeStatusChanged("busy")
+                    // should set is_responding = true.
                 }
                 Some("agent_message_start") => {
-                    debug!("agent_message_start from {}, clearing streaming buffer", name);
+                    debug!(
+                        "agent_message_start from {}, clearing streaming buffer",
+                        name
+                    );
                     self.messages.streaming.retain(|(n, _)| n != name);
                     self.messages
                         .streaming
@@ -745,6 +897,11 @@ impl App {
                     }
                     // In channel mode: final message arrives via channel.message
                     self.messages.streaming.retain(|(n, _)| n != name);
+                    if let Some(ref mut dm_state) = self.active_dm {
+                        if dm_state.node_id == node_id {
+                            dm_state.is_responding = false;
+                        }
+                    }
                 }
                 Some("user_message") => {
                     // Replay of user's prompt (from subscribe buffer)
@@ -791,11 +948,7 @@ impl App {
                 self.messages.clear();
                 self.messages
                     .push_system(&format!("已加入频道: {}", channel_id));
-
-                // Update selected_channel to match
-                if let Some(idx) = self.channels.iter().position(|c| c.id == channel_id) {
-                    self.status_bar.selected_channel = idx;
-                }
+                self.sync_navigation_selection();
 
                 // Load history
                 match self.client.channel_history(channel_id, Some(50)).await {
@@ -828,6 +981,7 @@ impl App {
                         node_count: ch.nodes.len(),
                     })
                     .collect();
+                self.sync_navigation_selection();
             }
             Err(e) => warn!("refresh channels failed: {}", e),
         }
@@ -848,6 +1002,7 @@ impl App {
                     })
                     .collect();
                 self.update_completions();
+                self.sync_navigation_selection();
             }
             Err(e) => warn!("refresh agents failed: {}", e),
         }
@@ -875,5 +1030,182 @@ impl App {
             completions.push(a.to_string());
         }
         self.input.completions = completions;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
+
+    fn make_app() -> App {
+        let (ws_tx, _ws_rx) = mpsc::unbounded_channel::<String>();
+        let pending = Arc::new(Mutex::new(HashMap::new()));
+        let client = NerveClient::from_parts(ws_tx, pending);
+        let (_event_tx, event_rx) = mpsc::unbounded_channel();
+        App::new(client, event_rx)
+    }
+
+    #[test]
+    fn project_name_uses_last_path_segment() {
+        assert_eq!(
+            App::project_name_from_path("/tmp/demo-project"),
+            Some("demo-project".to_string())
+        );
+        assert_eq!(
+            App::project_name_from_path("/tmp/demo-project/"),
+            Some("demo-project".to_string())
+        );
+    }
+
+    #[test]
+    fn new_with_project_sets_project_context() {
+        let (ws_tx, _ws_rx) = mpsc::unbounded_channel::<String>();
+        let pending = Arc::new(Mutex::new(HashMap::new()));
+        let client = NerveClient::from_parts(ws_tx, pending);
+        let (_event_tx, event_rx) = mpsc::unbounded_channel();
+        let app = App::new_with_project(client, event_rx, Some("/tmp/demo-project".into()));
+
+        assert_eq!(app.project_path.as_deref(), Some("/tmp/demo-project"));
+        assert_eq!(app.project_name.as_deref(), Some("demo-project"));
+    }
+
+    #[tokio::test]
+    async fn handle_input_blocks_while_dm_is_responding() {
+        let mut app = make_app();
+        app.active_dm = Some(DmState {
+            node_id: "n1".into(),
+            node_name: "alice".into(),
+            messages: Vec::new(),
+            streaming: None,
+            is_responding: true,
+        });
+        app.messages.enter_dm("alice");
+
+        app.handle_input("hello").await;
+
+        let dm = app.active_dm.as_ref().unwrap();
+        assert_eq!(dm.messages.len(), 1);
+        assert_eq!(dm.messages[0].role, "系统");
+        assert!(dm.messages[0].content.contains("agent 正在回复"));
+    }
+
+    #[test]
+    fn flush_streaming_as_dm_clears_responding_flag() {
+        let mut app = make_app();
+        app.active_dm = Some(DmState {
+            node_id: "n1".into(),
+            node_name: "alice".into(),
+            messages: Vec::new(),
+            streaming: None,
+            is_responding: true,
+        });
+        app.messages.enter_dm("alice");
+        app.messages
+            .streaming
+            .push(("alice".to_string(), "partial".to_string()));
+
+        app.flush_streaming_as_dm("n1", "alice");
+
+        let dm = app.active_dm.as_ref().unwrap();
+        assert!(!dm.is_responding);
+        assert_eq!(dm.messages.len(), 1);
+        assert_eq!(dm.messages[0].content, "partial");
+    }
+
+    #[test]
+    fn reset_dm_before_enter_reinitializes_same_agent_dm() {
+        let mut app = make_app();
+        app.active_dm = Some(DmState {
+            node_id: "n1".into(),
+            node_name: "alice".into(),
+            messages: vec![DmMessage {
+                role: "assistant".into(),
+                content: "stale".into(),
+                timestamp: 0,
+            }],
+            streaming: None,
+            is_responding: true,
+        });
+        app.messages.enter_dm("alice");
+        app.messages
+            .streaming
+            .push(("alice".to_string(), "partial".to_string()));
+
+        let old_node_id = app.reset_dm_before_enter("n1");
+
+        assert_eq!(old_node_id.as_deref(), Some("n1"));
+        assert!(app.active_dm.is_none());
+        assert!(!app.messages.is_dm_mode());
+        assert!(app.messages.streaming.is_empty());
+    }
+
+    #[test]
+    fn sync_navigation_selection_tracks_active_channel() {
+        let mut app = make_app();
+        app.channels = vec![
+            ChannelDisplay {
+                id: "ch1".into(),
+                name: Some("main".into()),
+                node_count: 2,
+            },
+            ChannelDisplay {
+                id: "ch2".into(),
+                name: Some("ops".into()),
+                node_count: 1,
+            },
+        ];
+        app.agents = vec![AgentDisplay {
+            name: "alice".into(),
+            status: "idle".into(),
+            activity: None,
+            adapter: Some("claude".into()),
+            node_id: "n1".into(),
+        }];
+        app.active_channel = Some("ch2".into());
+
+        app.sync_navigation_selection();
+
+        assert_eq!(app.status_bar.selected_nav, 1);
+    }
+
+    #[test]
+    fn sync_navigation_selection_tracks_active_dm() {
+        let mut app = make_app();
+        app.channels = vec![ChannelDisplay {
+            id: "ch1".into(),
+            name: Some("main".into()),
+            node_count: 2,
+        }];
+        app.agents = vec![
+            AgentDisplay {
+                name: "alice".into(),
+                status: "idle".into(),
+                activity: None,
+                adapter: Some("claude".into()),
+                node_id: "n1".into(),
+            },
+            AgentDisplay {
+                name: "bob".into(),
+                status: "busy".into(),
+                activity: None,
+                adapter: Some("codex".into()),
+                node_id: "n2".into(),
+            },
+        ];
+        app.active_channel = Some("ch1".into());
+        app.active_dm = Some(DmState {
+            node_id: "n2".into(),
+            node_name: "bob".into(),
+            messages: Vec::new(),
+            streaming: None,
+            is_responding: false,
+        });
+
+        app.sync_navigation_selection();
+
+        assert_eq!(app.status_bar.selected_nav, 2);
     }
 }

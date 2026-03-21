@@ -1,12 +1,12 @@
+use crate::theme;
 use chrono::{Local, TimeZone};
+use nerve_tui_protocol::DmMessage;
 use nerve_tui_protocol::MessageInfo;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Widget, Wrap};
-use crate::theme;
-use nerve_tui_protocol::DmMessage;
 
 struct MessageLine {
     from: String,
@@ -146,7 +146,9 @@ impl MessagesView {
         if self.auto_scroll {
             self.scroll_offset = total.saturating_sub(self.visible_height);
         } else {
-            self.scroll_offset = self.scroll_offset.min(total.saturating_sub(self.visible_height));
+            self.scroll_offset = self
+                .scroll_offset
+                .min(total.saturating_sub(self.visible_height));
         }
 
         let para = Paragraph::new(text_lines)
@@ -185,9 +187,7 @@ impl MessagesView {
             let name_style = if msg.from == "系统" {
                 Style::default().fg(theme::SYSTEM_MSG)
             } else {
-                Style::default()
-                    .fg(name_color)
-                    .add_modifier(Modifier::BOLD)
+                Style::default().fg(name_color).add_modifier(Modifier::BOLD)
             };
 
             out.push(Line::from(vec![
@@ -217,7 +217,15 @@ impl MessagesView {
                 Span::styled(" ▌", Style::default().fg(theme::MENTION)),
             ]));
             // Show last few lines of streaming content
-            let preview: String = content.lines().rev().take(3).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join("\n");
+            let preview: String = content
+                .lines()
+                .rev()
+                .take(3)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect::<Vec<_>>()
+                .join("\n");
             for line in preview.lines() {
                 out.push(Line::from(Span::styled(
                     line.to_string(),
@@ -232,7 +240,11 @@ impl MessagesView {
 
 fn format_time(ts: f64) -> String {
     // Handle both seconds and milliseconds
-    let secs = if ts > 1e12 { (ts / 1000.0) as i64 } else { ts as i64 };
+    let secs = if ts > 1e12 {
+        (ts / 1000.0) as i64
+    } else {
+        ts as i64
+    };
     Local
         .timestamp_opt(secs, 0)
         .single()
@@ -255,7 +267,9 @@ pub(crate) fn highlight_mentions(text: &str) -> Vec<Span<'static>> {
         if end > 0 {
             spans.push(Span::styled(
                 rest[idx..idx + 1 + end].to_string(),
-                Style::default().fg(theme::MENTION).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(theme::MENTION)
+                    .add_modifier(Modifier::BOLD),
             ));
             rest = &rest[idx + 1 + end..];
         } else {
@@ -423,9 +437,13 @@ mod tests {
     #[test]
     fn streaming_preview() {
         let mut view = MessagesView::new();
-        view.streaming.push(("alice".to_string(), "partial output...".to_string()));
+        view.streaming
+            .push(("alice".to_string(), "partial output...".to_string()));
         let lines = view.build_text(80);
-        let text: String = lines.iter().flat_map(|l| l.spans.iter().map(|s| s.content.to_string())).collect();
+        let text: String = lines
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
+            .collect();
         assert!(text.contains("alice"));
         assert!(text.contains("partial output..."));
     }
@@ -513,16 +531,42 @@ mod tests {
 
         // Streaming chunks accumulate
         view.streaming.push(("agent-1".to_string(), String::new()));
-        view.streaming.iter_mut().find(|(n, _)| n == "agent-1").unwrap().1.push_str("chunk1 ");
-        view.streaming.iter_mut().find(|(n, _)| n == "agent-1").unwrap().1.push_str("chunk2 ");
-        view.streaming.iter_mut().find(|(n, _)| n == "agent-1").unwrap().1.push_str("chunk3");
+        view.streaming
+            .iter_mut()
+            .find(|(n, _)| n == "agent-1")
+            .unwrap()
+            .1
+            .push_str("chunk1 ");
+        view.streaming
+            .iter_mut()
+            .find(|(n, _)| n == "agent-1")
+            .unwrap()
+            .1
+            .push_str("chunk2 ");
+        view.streaming
+            .iter_mut()
+            .find(|(n, _)| n == "agent-1")
+            .unwrap()
+            .1
+            .push_str("chunk3");
 
         // Verify streaming buffer has content
-        let buf = &view.streaming.iter().find(|(n, _)| n == "agent-1").unwrap().1;
+        let buf = &view
+            .streaming
+            .iter()
+            .find(|(n, _)| n == "agent-1")
+            .unwrap()
+            .1;
         assert_eq!(buf, "chunk1 chunk2 chunk3");
 
         // Simulate idle-flush: take content, push as DM, clear streaming
-        let content = view.streaming.iter().find(|(n, _)| n == "agent-1").unwrap().1.clone();
+        let content = view
+            .streaming
+            .iter()
+            .find(|(n, _)| n == "agent-1")
+            .unwrap()
+            .1
+            .clone();
         let dm_msg = make_dm("assistant", &content);
         view.push_dm(&dm_msg);
         view.streaming.retain(|(n, _)| n != "agent-1");
@@ -550,10 +594,15 @@ mod tests {
         view.push_dm(&make_dm("user", "question 1"));
 
         // Turn 1: agent chunks (no start/end)
-        view.streaming.push(("agent-1".to_string(), "answer 1".to_string()));
+        view.streaming
+            .push(("agent-1".to_string(), "answer 1".to_string()));
 
         // Turn 2: new user_message arrives — flush agent streaming first
-        let agent_content = view.streaming.iter().find(|(n, _)| n == "agent-1").map(|(_, c)| c.clone());
+        let agent_content = view
+            .streaming
+            .iter()
+            .find(|(n, _)| n == "agent-1")
+            .map(|(_, c)| c.clone());
         if let Some(content) = agent_content {
             if !content.is_empty() {
                 view.push_dm(&make_dm("assistant", &content));
@@ -563,10 +612,15 @@ mod tests {
         view.push_dm(&make_dm("user", "question 2"));
 
         // Turn 2: agent chunks
-        view.streaming.push(("agent-1".to_string(), "answer 2".to_string()));
+        view.streaming
+            .push(("agent-1".to_string(), "answer 2".to_string()));
 
         // Final flush (idle)
-        let agent_content = view.streaming.iter().find(|(n, _)| n == "agent-1").map(|(_, c)| c.clone());
+        let agent_content = view
+            .streaming
+            .iter()
+            .find(|(n, _)| n == "agent-1")
+            .map(|(_, c)| c.clone());
         if let Some(content) = agent_content {
             if !content.is_empty() {
                 view.push_dm(&make_dm("assistant", &content));

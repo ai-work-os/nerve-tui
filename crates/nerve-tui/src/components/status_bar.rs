@@ -28,66 +28,86 @@ impl ChannelDisplay {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NavigationTarget {
+    Channel(usize),
+    Agent(usize),
+}
+
 pub struct StatusBar {
-    /// Selected agent tab: 0 = "全部", 1+ = agent index
-    pub selected_tab: usize,
-    /// Selected channel index
-    pub selected_channel: usize,
+    /// Unified navigation selection: channels first, then agents.
+    pub selected_nav: usize,
 }
 
 impl StatusBar {
     pub fn new() -> Self {
-        Self {
-            selected_tab: 0,
-            selected_channel: 0,
+        Self { selected_nav: 0 }
+    }
+
+    pub fn nav_count(channels: &[ChannelDisplay], agents: &[AgentDisplay]) -> usize {
+        channels.len() + agents.len()
+    }
+
+    pub fn select_next_item(&mut self, channels: &[ChannelDisplay], agents: &[AgentDisplay]) {
+        let total = Self::nav_count(channels, agents);
+        if total > 0 {
+            self.selected_nav = (self.selected_nav + 1) % total;
         }
     }
 
-    /// Tab count = 1 (全部) + agents.len()
-    pub fn tab_count(agents: &[AgentDisplay]) -> usize {
-        1 + agents.len()
-    }
-
-    pub fn select_next_tab(&mut self, agents: &[AgentDisplay]) {
-        let total = Self::tab_count(agents);
+    pub fn select_prev_item(&mut self, channels: &[ChannelDisplay], agents: &[AgentDisplay]) {
+        let total = Self::nav_count(channels, agents);
         if total > 0 {
-            self.selected_tab = (self.selected_tab + 1) % total;
-        }
-    }
-
-    pub fn select_prev_tab(&mut self, agents: &[AgentDisplay]) {
-        let total = Self::tab_count(agents);
-        if total > 0 {
-            self.selected_tab = if self.selected_tab == 0 {
+            self.selected_nav = if self.selected_nav == 0 {
                 total - 1
             } else {
-                self.selected_tab - 1
+                self.selected_nav - 1
             };
         }
     }
 
-    pub fn select_next_channel(&mut self, channels: &[ChannelDisplay]) {
-        if !channels.is_empty() {
-            self.selected_channel = (self.selected_channel + 1) % channels.len();
-        }
-    }
-
-    pub fn select_prev_channel(&mut self, channels: &[ChannelDisplay]) {
-        if !channels.is_empty() {
-            self.selected_channel = if self.selected_channel == 0 {
-                channels.len() - 1
-            } else {
-                self.selected_channel - 1
-            };
-        }
-    }
-
-    /// Get the current filter name: None = show all, Some(name) = filter by agent
-    pub fn current_filter(&self, agents: &[AgentDisplay]) -> Option<String> {
-        if self.selected_tab == 0 {
-            None
+    pub fn selected_target(
+        &self,
+        channels: &[ChannelDisplay],
+        agents: &[AgentDisplay],
+    ) -> Option<NavigationTarget> {
+        if self.selected_nav < channels.len() {
+            Some(NavigationTarget::Channel(self.selected_nav))
         } else {
-            agents.get(self.selected_tab - 1).map(|a| a.name.clone())
+            let agent_idx = self.selected_nav.checked_sub(channels.len())?;
+            if agent_idx < agents.len() {
+                Some(NavigationTarget::Agent(agent_idx))
+            } else {
+                None
+            }
+        }
+    }
+
+    pub fn sync_to_context(
+        &mut self,
+        channels: &[ChannelDisplay],
+        active_channel: Option<&str>,
+        agents: &[AgentDisplay],
+        active_dm: Option<&str>,
+    ) {
+        if let Some(dm_name) = active_dm {
+            if let Some(agent_idx) = agents.iter().position(|a| a.name == dm_name) {
+                self.selected_nav = channels.len() + agent_idx;
+                return;
+            }
+        }
+        if let Some(channel_id) = active_channel {
+            if let Some(channel_idx) = channels.iter().position(|c| c.id == channel_id) {
+                self.selected_nav = channel_idx;
+                return;
+            }
+        }
+
+        let total = Self::nav_count(channels, agents);
+        if total == 0 {
+            self.selected_nav = 0;
+        } else if self.selected_nav >= total {
+            self.selected_nav = total - 1;
         }
     }
 
@@ -97,6 +117,7 @@ impl StatusBar {
         active_channel: Option<&str>,
         agents: &[AgentDisplay],
         active_dm: Option<&str>,
+        project_name: Option<&str>,
         area: Rect,
         buf: &mut Buffer,
     ) {
@@ -108,129 +129,105 @@ impl StatusBar {
         block.render(area, buf);
 
         let mut lines: Vec<Line> = Vec::new();
-
-        // --- Channels section ---
         lines.push(Line::from(Span::styled(
-            "频道",
+            "导航",
             Style::default()
                 .fg(theme::TITLE)
                 .add_modifier(Modifier::BOLD),
         )));
 
-        if channels.is_empty() {
+        if let Some(project) = project_name {
+            lines.push(Line::from(vec![
+                Span::styled("项目 ", Style::default().fg(theme::TIMESTAMP)),
+                Span::styled(
+                    project.to_string(),
+                    Style::default()
+                        .fg(theme::TITLE)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ]));
+            lines.push(Line::from(""));
+        }
+
+        if channels.is_empty() && agents.is_empty() {
             lines.push(Line::from(Span::styled(
                 "  (无)",
                 Style::default().fg(theme::SYSTEM_MSG),
             )));
-        } else {
-            for (i, ch) in channels.iter().enumerate() {
-                let is_active = active_channel.map_or(false, |id| id == ch.id);
-                let is_selected = i == self.selected_channel;
-                let marker = if is_selected { "▸" } else { " " };
-
-                let name_color = if is_active {
-                    theme::CHANNEL_ACTIVE
-                } else {
-                    theme::CHANNEL_INACTIVE
-                };
-                let name_style = if is_active {
-                    Style::default()
-                        .fg(name_color)
-                        .add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default().fg(name_color)
-                };
-
-                let display = ch.display_name();
-                // Truncate channel name to fit
-                let max_w = inner.width.saturating_sub(4) as usize;
-                let truncated: String = if display.len() > max_w {
-                    format!("{}…", &display[..max_w.saturating_sub(1)])
-                } else {
-                    display.to_string()
-                };
-
-                lines.push(Line::from(vec![
-                    Span::raw(format!("{} ", marker)),
-                    Span::styled(truncated, name_style),
-                    Span::styled(
-                        format!(" ({})", ch.node_count),
-                        Style::default().fg(theme::TIMESTAMP),
-                    ),
-                ]));
-            }
+            Paragraph::new(lines).render(inner, buf);
+            return;
         }
 
-        // --- DM indicator ---
-        if let Some(dm_name) = active_dm {
-            lines.push(Line::from(""));
-            lines.push(Line::from(Span::styled(
-                "DM",
+        let selected = self.selected_target(channels, agents);
+
+        for (i, ch) in channels.iter().enumerate() {
+            let is_selected = selected == Some(NavigationTarget::Channel(i));
+            let is_active = active_channel == Some(ch.id.as_str()) && active_dm.is_none();
+            let marker = if is_selected { "▸" } else { " " };
+            let base_style = if is_active {
                 Style::default()
-                    .fg(theme::TITLE)
-                    .add_modifier(Modifier::BOLD),
-            )));
+                    .fg(theme::CHANNEL_ACTIVE)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(theme::CHANNEL_INACTIVE)
+            };
+            let name_style = if is_selected {
+                base_style.add_modifier(Modifier::BOLD)
+            } else {
+                base_style
+            };
+
+            let display = ch.display_name();
+            let max_w = inner.width.saturating_sub(6) as usize;
+            let char_count = display.chars().count();
+            let truncated = if char_count > max_w {
+                let s: String = display.chars().take(max_w.saturating_sub(1)).collect();
+                format!("{}…", s)
+            } else {
+                display.to_string()
+            };
+
             lines.push(Line::from(vec![
-                Span::styled("▸ ", Style::default().fg(theme::MENTION)),
+                Span::raw(format!("{} ", marker)),
+                Span::styled(format!("#{}", truncated), name_style),
                 Span::styled(
-                    dm_name.to_string(),
-                    Style::default()
-                        .fg(theme::MENTION)
-                        .add_modifier(Modifier::BOLD),
+                    format!(" ({})", ch.node_count),
+                    Style::default().fg(theme::TIMESTAMP),
                 ),
             ]));
         }
 
-        // --- Separator ---
-        lines.push(Line::from(""));
-
-        // --- Agent tabs section ---
-        lines.push(Line::from(Span::styled(
-            "消息",
-            Style::default()
-                .fg(theme::TITLE)
-                .add_modifier(Modifier::BOLD),
-        )));
-
-        // Tab 0: "全部"
-        {
-            let is_selected = self.selected_tab == 0;
-            let marker = if is_selected { "▸" } else { " " };
-            let style = if is_selected {
-                Style::default()
-                    .fg(theme::TITLE)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(theme::SYSTEM_MSG)
-            };
-            lines.push(Line::from(vec![
-                Span::raw(format!("{} ", marker)),
-                Span::styled("全部", style),
-            ]));
+        if !channels.is_empty() && !agents.is_empty() {
+            lines.push(Line::from(""));
         }
 
-        // Agent tabs
         for (i, agent) in agents.iter().enumerate() {
-            let tab_idx = i + 1;
-            let is_selected = self.selected_tab == tab_idx;
-            let icon = theme::status_icon(&agent.status);
-            let color = theme::status_color(&agent.status);
-
+            let is_selected = selected == Some(NavigationTarget::Agent(i));
+            let is_active = active_dm == Some(agent.name.as_str());
             let marker = if is_selected { "▸" } else { " " };
-            let name_style = if is_selected {
-                Style::default().fg(color).add_modifier(Modifier::BOLD)
+            let color = if is_active {
+                theme::MENTION
             } else {
-                Style::default().fg(color)
+                theme::status_color(&agent.status)
             };
+            let mut name_style = Style::default().fg(color);
+            if is_selected || is_active {
+                name_style = name_style.add_modifier(Modifier::BOLD);
+            }
 
-            // Line 1: marker + icon + name
             lines.push(Line::from(vec![
                 Span::raw(format!("{} ", marker)),
-                Span::styled(format!("{} ", icon), Style::default().fg(color)),
-                Span::styled(agent.name.clone(), name_style),
+                Span::styled(
+                    format!("{} ", theme::status_icon(&agent.status)),
+                    Style::default().fg(color),
+                ),
+                Span::styled(format!("@{}", agent.name), name_style),
+                Span::styled(
+                    if is_active { " [DM]" } else { "" },
+                    Style::default().fg(theme::TIMESTAMP),
+                ),
             ]));
 
-            // Line 2: activity/adapter detail
             if let Some(ref activity) = agent.activity {
                 lines.push(Line::from(Span::styled(
                     format!("    {}", activity),
@@ -277,75 +274,90 @@ mod tests {
     #[test]
     fn new_starts_at_zero() {
         let bar = StatusBar::new();
-        assert_eq!(bar.selected_tab, 0);
-        assert_eq!(bar.selected_channel, 0);
+        assert_eq!(bar.selected_nav, 0);
     }
 
     #[test]
-    fn tab_count_includes_all() {
+    fn nav_count_counts_channels_and_agents() {
+        let channels = make_channels(2);
         let agents = make_agents(3);
-        assert_eq!(StatusBar::tab_count(&agents), 4); // 全部 + 3 agents
-        assert_eq!(StatusBar::tab_count(&[]), 1); // just 全部
+        assert_eq!(StatusBar::nav_count(&channels, &agents), 5);
+        assert_eq!(StatusBar::nav_count(&[], &[]), 0);
     }
 
     #[test]
-    fn select_next_tab_wraps() {
+    fn select_next_item_wraps() {
         let mut bar = StatusBar::new();
+        let channels = make_channels(1);
         let agents = make_agents(2);
-        bar.select_next_tab(&agents); // 0 -> 1
-        assert_eq!(bar.selected_tab, 1);
-        bar.select_next_tab(&agents); // 1 -> 2
-        assert_eq!(bar.selected_tab, 2);
-        bar.select_next_tab(&agents); // 2 -> 0 (wrap)
-        assert_eq!(bar.selected_tab, 0);
+
+        bar.select_next_item(&channels, &agents);
+        assert_eq!(bar.selected_nav, 1);
+        bar.select_next_item(&channels, &agents);
+        assert_eq!(bar.selected_nav, 2);
+        bar.select_next_item(&channels, &agents);
+        assert_eq!(bar.selected_nav, 0);
     }
 
     #[test]
-    fn select_prev_tab_wraps() {
+    fn select_prev_item_wraps() {
         let mut bar = StatusBar::new();
+        let channels = make_channels(1);
         let agents = make_agents(2);
-        bar.select_prev_tab(&agents); // 0 -> 2 (wrap)
-        assert_eq!(bar.selected_tab, 2);
-        bar.select_prev_tab(&agents); // 2 -> 1
-        assert_eq!(bar.selected_tab, 1);
+
+        bar.select_prev_item(&channels, &agents);
+        assert_eq!(bar.selected_nav, 2);
+        bar.select_prev_item(&channels, &agents);
+        assert_eq!(bar.selected_nav, 1);
     }
 
     #[test]
-    fn select_channel_wraps() {
+    fn selected_target_maps_channels_and_agents() {
         let mut bar = StatusBar::new();
         let channels = make_channels(2);
-        bar.select_next_channel(&channels); // 0 -> 1
-        assert_eq!(bar.selected_channel, 1);
-        bar.select_next_channel(&channels); // 1 -> 0
-        assert_eq!(bar.selected_channel, 0);
+        let agents = make_agents(2);
 
-        bar.select_prev_channel(&channels); // 0 -> 1
-        assert_eq!(bar.selected_channel, 1);
+        assert_eq!(
+            bar.selected_target(&channels, &agents),
+            Some(NavigationTarget::Channel(0))
+        );
+
+        bar.selected_nav = 2;
+        assert_eq!(
+            bar.selected_target(&channels, &agents),
+            Some(NavigationTarget::Agent(0))
+        );
     }
 
     #[test]
-    fn current_filter() {
+    fn sync_to_context_prefers_active_dm() {
         let mut bar = StatusBar::new();
+        let channels = make_channels(2);
         let agents = make_agents(2);
-        assert_eq!(bar.current_filter(&agents), None); // tab 0 = all
 
-        bar.selected_tab = 1;
-        assert_eq!(bar.current_filter(&agents), Some("agent-0".to_string()));
+        bar.sync_to_context(&channels, Some("ch1"), &agents, Some("agent-0"));
 
-        bar.selected_tab = 2;
-        assert_eq!(bar.current_filter(&agents), Some("agent-1".to_string()));
+        assert_eq!(bar.selected_nav, channels.len());
+    }
 
-        bar.selected_tab = 99; // out of range
-        assert_eq!(bar.current_filter(&agents), None);
+    #[test]
+    fn sync_to_context_falls_back_to_active_channel() {
+        let mut bar = StatusBar::new();
+        let channels = make_channels(2);
+        let agents = make_agents(2);
+
+        bar.sync_to_context(&channels, Some("ch1"), &agents, None);
+
+        assert_eq!(bar.selected_nav, 1);
     }
 
     #[test]
     fn select_with_zero_total_is_noop() {
         let mut bar = StatusBar::new();
-        bar.select_next_channel(&[]);
-        assert_eq!(bar.selected_channel, 0);
-        bar.select_prev_channel(&[]);
-        assert_eq!(bar.selected_channel, 0);
+        bar.select_next_item(&[], &[]);
+        assert_eq!(bar.selected_nav, 0);
+        bar.select_prev_item(&[], &[]);
+        assert_eq!(bar.selected_nav, 0);
     }
 
     #[test]
@@ -370,7 +382,7 @@ mod tests {
         let bar = StatusBar::new();
         let area = Rect::new(0, 0, 20, 15);
         let mut buf = Buffer::empty(area);
-        bar.render(&[], None, &[], None, area, &mut buf);
+        bar.render(&[], None, &[], None, None, area, &mut buf);
     }
 
     #[test]
@@ -380,6 +392,14 @@ mod tests {
         let agents = make_agents(3);
         let area = Rect::new(0, 0, 24, 20);
         let mut buf = Buffer::empty(area);
-        bar.render(&channels, Some("ch0"), &agents, None, area, &mut buf);
+        bar.render(
+            &channels,
+            Some("ch0"),
+            &agents,
+            Some("agent-1"),
+            Some("nerve-tui"),
+            area,
+            &mut buf,
+        );
     }
 }

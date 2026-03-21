@@ -132,7 +132,8 @@ mod tests {
 
     #[test]
     fn decode_notification() {
-        let json = r#"{"jsonrpc":"2.0","method":"node.update","params":{"nodeId":"n1","name":"alice"}}"#;
+        let json =
+            r#"{"jsonrpc":"2.0","method":"node.update","params":{"nodeId":"n1","name":"alice"}}"#;
         let msg = decode(json).unwrap();
         assert!(msg.is_notification());
         assert!(!msg.is_request());

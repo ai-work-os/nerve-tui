@@ -50,6 +50,7 @@ pub struct DmState {
     pub node_name: String,
     pub messages: Vec<DmMessage>,
     pub streaming: Option<String>,
+    pub is_responding: bool,
 }
 
 // --- Channel ---
@@ -312,10 +313,12 @@ mod tests {
                 },
             ],
             streaming: Some("partial".into()),
+            is_responding: true,
         };
         let json = serde_json::to_value(&state).unwrap();
         assert_eq!(json["node_id"], "n1");
         assert_eq!(json["messages"].as_array().unwrap().len(), 2);
+        assert_eq!(json["is_responding"], true);
 
         let back: DmState = serde_json::from_value(json).unwrap();
         assert_eq!(back, state);

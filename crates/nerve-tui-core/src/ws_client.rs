@@ -119,19 +119,13 @@ impl NerveClient {
             .get("nodeId")
             .and_then(|v| v.as_str())
             .map(String::from);
-        info!(
-            "registered as {} (nodeId: {:?})",
-            name, client.node_id
-        );
+        info!("registered as {} (nodeId: {:?})", name, client.node_id);
 
         Ok((client, event_rx))
     }
 
     /// Create a lightweight client from shared handles (for background tasks).
-    pub fn from_parts(
-        ws_tx: mpsc::UnboundedSender<String>,
-        pending: PendingMap,
-    ) -> Self {
+    pub fn from_parts(ws_tx: mpsc::UnboundedSender<String>, pending: PendingMap) -> Self {
         Self {
             ws_tx,
             pending,
@@ -168,16 +162,22 @@ impl NerveClient {
 
     pub async fn channel_list(&self) -> Result<Vec<ChannelInfo>> {
         let r = self.request("channel.list", json!({})).await?;
-        let channels: Vec<ChannelInfo> = serde_json::from_value(
-            r.get("channels").cloned().unwrap_or(Value::Array(vec![])),
-        )?;
+        let channels: Vec<ChannelInfo> =
+            serde_json::from_value(r.get("channels").cloned().unwrap_or(Value::Array(vec![])))?;
         Ok(channels)
     }
 
-    pub async fn channel_create(&self, name: Option<&str>) -> Result<ChannelInfo> {
+    pub async fn channel_create(
+        &self,
+        name: Option<&str>,
+        cwd: Option<&str>,
+    ) -> Result<ChannelInfo> {
         let mut params = json!({});
         if let Some(n) = name {
             params["name"] = json!(n);
+        }
+        if let Some(c) = cwd {
+            params["cwd"] = json!(c);
         }
         let r = self.request("channel.create", params).await?;
         Ok(serde_json::from_value(r)?)
@@ -211,9 +211,8 @@ impl NerveClient {
             params["limit"] = json!(l);
         }
         let r = self.request("channel.history", params).await?;
-        let msgs: Vec<MessageInfo> = serde_json::from_value(
-            r.get("messages").cloned().unwrap_or(Value::Array(vec![])),
-        )?;
+        let msgs: Vec<MessageInfo> =
+            serde_json::from_value(r.get("messages").cloned().unwrap_or(Value::Array(vec![])))?;
         Ok(msgs)
     }
 
@@ -258,16 +257,22 @@ impl NerveClient {
     }
 
     pub async fn node_prompt(&self, node_id: &str, content: &str) -> Result<PromptResult> {
-        debug!(node_id, content_len = content.len(), "requesting node.prompt");
-        let r = self.request(
-            "node.prompt",
-            json!({ "nodeId": node_id, "content": content }),
-        )
-        .await?;
+        debug!(
+            node_id,
+            content_len = content.len(),
+            "requesting node.prompt"
+        );
+        let r = self
+            .request(
+                "node.prompt",
+                json!({ "nodeId": node_id, "content": content }),
+            )
+            .await?;
         Ok(serde_json::from_value(r)?)
     }
 
     pub async fn node_cancel(&self, node_id: &str) -> Result<()> {
+        debug!(node_id, "requesting node.cancel");
         self.request("node.cancel", json!({ "nodeId": node_id }))
             .await?;
         Ok(())
@@ -355,7 +360,10 @@ fn parse_notification(method: &str, params: Value) -> Option<NerveEvent> {
             let node_id = params.get("nodeId")?.as_str()?.to_string();
             let name = params.get("name")?.as_str()?.to_string();
             let status = params.get("status")?.as_str()?.to_string();
-            let activity = params.get("activity").and_then(|v| v.as_str()).map(String::from);
+            let activity = params
+                .get("activity")
+                .and_then(|v| v.as_str())
+                .map(String::from);
             Some(NerveEvent::NodeStatusChanged {
                 node_id,
                 name,
@@ -389,7 +397,10 @@ mod tests {
         });
         let evt = parse_notification("channel.message", params).unwrap();
         match evt {
-            NerveEvent::ChannelMessage { channel_id, message } => {
+            NerveEvent::ChannelMessage {
+                channel_id,
+                message,
+            } => {
                 assert_eq!(channel_id, "ch1");
                 assert_eq!(message.from, "alice");
                 assert_eq!(message.content, "hello");
@@ -412,7 +423,10 @@ mod tests {
         });
         let evt = parse_notification("channel.mention", params).unwrap();
         match evt {
-            NerveEvent::ChannelMention { channel_id, message } => {
+            NerveEvent::ChannelMention {
+                channel_id,
+                message,
+            } => {
                 assert_eq!(channel_id, "ch1");
                 assert_eq!(message.from, "bob");
             }
@@ -429,7 +443,11 @@ mod tests {
         });
         let evt = parse_notification("channel.nodeJoined", params).unwrap();
         match evt {
-            NerveEvent::NodeJoined { channel_id, node_id, node_name } => {
+            NerveEvent::NodeJoined {
+                channel_id,
+                node_id,
+                node_name,
+            } => {
                 assert_eq!(channel_id, "ch1");
                 assert_eq!(node_id, "n1");
                 assert_eq!(node_name, "alice");
@@ -447,7 +465,11 @@ mod tests {
         });
         let evt = parse_notification("channel.nodeLeft", params).unwrap();
         match evt {
-            NerveEvent::NodeLeft { channel_id, node_id, node_name } => {
+            NerveEvent::NodeLeft {
+                channel_id,
+                node_id,
+                node_name,
+            } => {
                 assert_eq!(channel_id, "ch1");
                 assert_eq!(node_id, "n1");
                 assert_eq!(node_name, "alice");
@@ -468,7 +490,11 @@ mod tests {
         });
         let evt = parse_notification("node.update", params).unwrap();
         match evt {
-            NerveEvent::NodeUpdate { node_id, name, detail } => {
+            NerveEvent::NodeUpdate {
+                node_id,
+                name,
+                detail,
+            } => {
                 assert_eq!(node_id, "n1");
                 assert_eq!(name, "alice");
                 assert!(detail.get("update").is_some());
@@ -494,14 +520,14 @@ mod tests {
         let rpc = decode(raw).unwrap();
         assert!(rpc.is_notification());
 
-        let evt = parse_notification(
-            rpc.method.as_deref().unwrap(),
-            rpc.params.unwrap(),
-        )
-        .unwrap();
+        let evt = parse_notification(rpc.method.as_deref().unwrap(), rpc.params.unwrap()).unwrap();
 
         match evt {
-            NerveEvent::NodeUpdate { node_id, name, detail } => {
+            NerveEvent::NodeUpdate {
+                node_id,
+                name,
+                detail,
+            } => {
                 assert_eq!(node_id, "n1");
                 assert_eq!(name, "alice");
                 assert_eq!(
@@ -527,7 +553,12 @@ mod tests {
         });
         let evt = parse_notification("node.statusChanged", params).unwrap();
         match evt {
-            NerveEvent::NodeStatusChanged { node_id, name, status, activity } => {
+            NerveEvent::NodeStatusChanged {
+                node_id,
+                name,
+                status,
+                activity,
+            } => {
                 assert_eq!(node_id, "n1");
                 assert_eq!(name, "alice");
                 assert_eq!(status, "busy");
@@ -616,6 +647,15 @@ mod tests {
         let rpc = decode(&text).unwrap();
         assert_eq!(rpc.id, Some(Value::Number(id.into())));
         assert_eq!(rpc.method.as_deref(), Some("node.unsubscribe"));
+        assert_eq!(rpc.params, Some(json!({ "nodeId": "node-1" })));
+    }
+
+    #[test]
+    fn cancel_request_encodes_expected_payload() {
+        let (id, text) = encode_request("node.cancel", json!({ "nodeId": "node-1" }));
+        let rpc = decode(&text).unwrap();
+        assert_eq!(rpc.id, Some(Value::Number(id.into())));
+        assert_eq!(rpc.method.as_deref(), Some("node.cancel"));
         assert_eq!(rpc.params, Some(json!({ "nodeId": "node-1" })));
     }
 

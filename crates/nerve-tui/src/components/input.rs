@@ -167,7 +167,8 @@ impl InputBox {
         if let Some(candidate) = self.candidates.get(idx) {
             let word = self.current_word();
             let word_start = self.cursor_pos - word.len();
-            self.text.replace_range(word_start..self.cursor_pos, candidate);
+            self.text
+                .replace_range(word_start..self.cursor_pos, candidate);
             self.cursor_pos = word_start + candidate.len();
         }
     }
@@ -189,6 +190,42 @@ impl InputBox {
             total += (line_w.saturating_sub(1) / w + 1).max(1);
         }
         total.max(1) as u16
+    }
+
+    fn cursor_visual_position(&self, width: u16) -> (u16, u16) {
+        let prompt_w: usize = 2; // "> " or "  "
+        let inner_w = width as usize;
+        let text_before = &self.text[..self.cursor_pos];
+
+        let newline_splits: Vec<&str> = text_before.split('\n').collect();
+        let lines_before = newline_splits.len() - 1;
+        let last_line = newline_splits.last().unwrap_or(&"");
+        let col_w = prompt_w + UnicodeWidthStr::width(*last_line);
+
+        let mut visual_row: usize = 0;
+        for (i, line) in text_before.split('\n').enumerate() {
+            let line_w = prompt_w + UnicodeWidthStr::width(line);
+            if i < lines_before {
+                visual_row += if inner_w > 0 {
+                    (line_w.saturating_sub(1) / inner_w + 1).max(1)
+                } else {
+                    1
+                };
+            } else if inner_w > 0 && col_w >= inner_w {
+                visual_row += col_w / inner_w;
+            }
+        }
+
+        let col = if inner_w > 0 { col_w % inner_w } else { col_w };
+        (col as u16, visual_row as u16)
+    }
+
+    fn scroll_offset_for_height(&self, width: u16, visible_height: u16) -> u16 {
+        if visible_height == 0 {
+            return 0;
+        }
+        let (_, cursor_row) = self.cursor_visual_position(width);
+        cursor_row.saturating_sub(visible_height.saturating_sub(1))
     }
 
     pub fn render(&self, area: Rect, buf: &mut Buffer) {
@@ -221,7 +258,9 @@ impl InputBox {
             }
         }
 
+        let scroll_y = self.scroll_offset_for_height(inner.width, inner.height);
         Paragraph::new(lines)
+            .scroll((scroll_y, 0))
             .wrap(Wrap { trim: false })
             .render(inner, buf);
     }
@@ -266,34 +305,11 @@ impl InputBox {
     pub fn cursor_position(&self, area: Rect) -> (u16, u16) {
         let inner_x = area.x; // no left border (Borders::TOP only)
         let inner_y = area.y + 1; // top border
-        let prompt_w: usize = 2; // "> " or "  "
-        let inner_w = area.width as usize;
-
-        let text_before = &self.text[..self.cursor_pos];
-
-        // Count completed lines (from \n) before cursor
-        let newline_splits: Vec<&str> = text_before.split('\n').collect();
-        let lines_before = newline_splits.len() - 1; // number of \n before cursor
-        let last_line = newline_splits.last().unwrap_or(&"");
-        let col_w = prompt_w + UnicodeWidthStr::width(*last_line);
-
-        // Account for visual wrapping within each line
-        let mut visual_row: usize = 0;
-        for (i, line) in text_before.split('\n').enumerate() {
-            let line_w = prompt_w + UnicodeWidthStr::width(line);
-            if i < lines_before {
-                // Completed lines: count their visual rows (saturating_sub avoids off-by-one when line_w == inner_w)
-                visual_row += if inner_w > 0 { (line_w.saturating_sub(1) / inner_w + 1).max(1) } else { 1 };
-            } else {
-                // Current line: only count wrapped rows
-                if inner_w > 0 && col_w >= inner_w {
-                    visual_row += col_w / inner_w;
-                }
-            }
-        }
-
-        let col = if inner_w > 0 { col_w % inner_w } else { col_w };
-        (inner_x + col as u16, inner_y + visual_row as u16)
+        let inner_width = area.width;
+        let visible_height = area.height.saturating_sub(1);
+        let (col, visual_row) = self.cursor_visual_position(inner_width);
+        let scroll_y = self.scroll_offset_for_height(inner_width, visible_height);
+        (inner_x + col, inner_y + visual_row.saturating_sub(scroll_y))
     }
 }
 
@@ -541,6 +557,23 @@ mod tests {
         assert_eq!(cx, 4);
         // First line takes row 1, second line cursor at row 2
         assert_eq!(cy, 2);
+    }
+
+    #[test]
+    fn cursor_position_scrolls_with_long_content() {
+        let mut input = InputBox::new();
+        input.insert_str("line1\nline2\nline3\nline4");
+        let area = Rect::new(0, 0, 20, 3);
+        let (cx, cy) = input.cursor_position(area);
+        assert_eq!(cx, 7);
+        assert_eq!(cy, 2);
+    }
+
+    #[test]
+    fn scroll_offset_keeps_cursor_visible() {
+        let mut input = InputBox::new();
+        input.insert_str("line1\nline2\nline3\nline4");
+        assert_eq!(input.scroll_offset_for_height(20, 2), 2);
     }
 
     #[test]

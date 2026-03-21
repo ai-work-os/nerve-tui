@@ -32,7 +32,9 @@ pub fn agent_color(name: &str) -> Color {
     if name == "系统" {
         return SYSTEM_MSG;
     }
-    let hash: usize = name.bytes().fold(0usize, |acc, b| acc.wrapping_add(b as usize));
+    let hash: usize = name
+        .bytes()
+        .fold(0usize, |acc, b| acc.wrapping_add(b as usize));
     AGENT_COLORS[hash % AGENT_COLORS.len()]
 }
 
