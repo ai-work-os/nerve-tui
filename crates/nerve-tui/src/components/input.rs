@@ -1,0 +1,564 @@
+use ratatui::buffer::Buffer;
+use ratatui::layout::Rect;
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph, Widget, Wrap};
+use unicode_width::UnicodeWidthStr;
+
+use crate::theme;
+
+pub struct InputBox {
+    pub text: String,
+    pub cursor_pos: usize,
+    // Completion state
+    pub completions: Vec<String>,
+    candidates: Vec<String>,
+    selected: Option<usize>,
+    popup_visible: bool,
+}
+
+impl InputBox {
+    pub fn new() -> Self {
+        Self {
+            text: String::new(),
+            cursor_pos: 0,
+            completions: Vec::new(),
+            candidates: Vec::new(),
+            selected: None,
+            popup_visible: false,
+        }
+    }
+
+    pub fn insert(&mut self, c: char) {
+        self.text.insert(self.cursor_pos, c);
+        self.cursor_pos += c.len_utf8();
+        self.dismiss_popup();
+    }
+
+    pub fn insert_str(&mut self, s: &str) {
+        self.text.insert_str(self.cursor_pos, s);
+        self.cursor_pos += s.len();
+        self.dismiss_popup();
+    }
+
+    pub fn backspace(&mut self) {
+        if self.cursor_pos > 0 {
+            // Find prev char boundary
+            let prev = self.text[..self.cursor_pos]
+                .char_indices()
+                .last()
+                .map(|(i, _)| i)
+                .unwrap_or(0);
+            self.text.drain(prev..self.cursor_pos);
+            self.cursor_pos = prev;
+        }
+        self.dismiss_popup();
+    }
+
+    pub fn delete(&mut self) {
+        if self.cursor_pos < self.text.len() {
+            let next = self.cursor_pos
+                + self.text[self.cursor_pos..]
+                    .chars()
+                    .next()
+                    .map(|c| c.len_utf8())
+                    .unwrap_or(0);
+            self.text.drain(self.cursor_pos..next);
+        }
+    }
+
+    pub fn move_left(&mut self) {
+        if self.cursor_pos > 0 {
+            self.cursor_pos = self.text[..self.cursor_pos]
+                .char_indices()
+                .last()
+                .map(|(i, _)| i)
+                .unwrap_or(0);
+        }
+    }
+
+    pub fn move_right(&mut self) {
+        if self.cursor_pos < self.text.len() {
+            self.cursor_pos += self.text[self.cursor_pos..]
+                .chars()
+                .next()
+                .map(|c| c.len_utf8())
+                .unwrap_or(0);
+        }
+    }
+
+    pub fn move_home(&mut self) {
+        self.cursor_pos = 0;
+    }
+
+    pub fn move_end(&mut self) {
+        self.cursor_pos = self.text.len();
+    }
+
+    pub fn take(&mut self) -> String {
+        self.cursor_pos = 0;
+        self.dismiss_popup();
+        std::mem::take(&mut self.text)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.text.is_empty()
+    }
+
+    pub fn tab(&mut self) {
+        if self.popup_visible && !self.candidates.is_empty() {
+            let next = match self.selected {
+                Some(i) => (i + 1) % self.candidates.len(),
+                None => 0,
+            };
+            self.selected = Some(next);
+            self.apply_candidate(next);
+        } else {
+            self.build_candidates();
+            if self.candidates.len() == 1 {
+                self.selected = Some(0);
+                self.apply_candidate(0);
+                self.dismiss_popup();
+            } else if !self.candidates.is_empty() {
+                self.popup_visible = true;
+                self.selected = Some(0);
+                self.apply_candidate(0);
+            }
+        }
+    }
+
+    pub fn shift_tab(&mut self) {
+        if self.popup_visible && !self.candidates.is_empty() {
+            let prev = match self.selected {
+                Some(0) | None => self.candidates.len() - 1,
+                Some(i) => i - 1,
+            };
+            self.selected = Some(prev);
+            self.apply_candidate(prev);
+        }
+    }
+
+    pub fn dismiss_popup(&mut self) {
+        self.popup_visible = false;
+        self.candidates.clear();
+        self.selected = None;
+    }
+
+    fn build_candidates(&mut self) {
+        let word = self.current_word().to_lowercase();
+        self.candidates = self
+            .completions
+            .iter()
+            .filter(|c| c.to_lowercase().starts_with(&word))
+            .cloned()
+            .collect();
+    }
+
+    fn current_word(&self) -> String {
+        let before = &self.text[..self.cursor_pos];
+        before
+            .rsplit(|c: char| c.is_whitespace())
+            .next()
+            .unwrap_or("")
+            .to_string()
+    }
+
+    fn apply_candidate(&mut self, idx: usize) {
+        if let Some(candidate) = self.candidates.get(idx) {
+            let word = self.current_word();
+            let word_start = self.cursor_pos - word.len();
+            self.text.replace_range(word_start..self.cursor_pos, candidate);
+            self.cursor_pos = word_start + candidate.len();
+        }
+    }
+
+    /// Number of visual lines the input takes at given width.
+    pub fn visual_line_count(&self, width: u16) -> u16 {
+        if width <= 2 {
+            return 1;
+        }
+        let w = width as usize; // inner width
+        let text_lines: Vec<&str> = if self.text.contains('\n') {
+            self.text.split('\n').collect()
+        } else {
+            vec![&self.text]
+        };
+        let mut total: usize = 0;
+        for (_i, line) in text_lines.iter().enumerate() {
+            let line_w = 2 + UnicodeWidthStr::width(*line); // prompt "> " or "  "
+            total += (line_w.saturating_sub(1) / w + 1).max(1);
+        }
+        total.max(1) as u16
+    }
+
+    pub fn render(&self, area: Rect, buf: &mut Buffer) {
+        let block = Block::default()
+            .borders(Borders::TOP)
+            .border_style(Style::default().fg(theme::BORDER))
+            .title(" Input ")
+            .title_style(Style::default().fg(theme::TITLE));
+
+        let inner = block.inner(area);
+        block.render(area, buf);
+
+        // Build lines: first line has prompt "> ", continuation lines don't
+        let mut lines: Vec<Line> = Vec::new();
+        let text_lines: Vec<&str> = if self.text.contains('\n') {
+            self.text.split('\n').collect()
+        } else {
+            vec![&self.text]
+        };
+
+        for (i, tl) in text_lines.iter().enumerate() {
+            if i == 0 {
+                let prompt = Span::styled("> ", Style::default().fg(Color::DarkGray));
+                let text = Span::raw(tl.to_string());
+                lines.push(Line::from(vec![prompt, text]));
+            } else {
+                let prompt = Span::styled("  ", Style::default().fg(Color::DarkGray));
+                let text = Span::raw(tl.to_string());
+                lines.push(Line::from(vec![prompt, text]));
+            }
+        }
+
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .render(inner, buf);
+    }
+
+    pub fn render_popup(&self, input_area: Rect, buf: &mut Buffer) {
+        if !self.popup_visible || self.candidates.is_empty() {
+            return;
+        }
+        let max_show = 6.min(self.candidates.len());
+        let width = self
+            .candidates
+            .iter()
+            .map(|c| UnicodeWidthStr::width(c.as_str()))
+            .max()
+            .unwrap_or(10) as u16
+            + 4;
+
+        let height = max_show as u16;
+        // Position popup above input
+        let x = input_area.x + 2;
+        let y = input_area.y.saturating_sub(height);
+        let popup = Rect::new(x, y, width.min(input_area.width), height);
+
+        Clear.render(popup, buf);
+        for (i, candidate) in self.candidates.iter().take(max_show).enumerate() {
+            let style = if self.selected == Some(i) {
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::White)
+            };
+            let row = popup.y + i as u16;
+            if row < popup.y + popup.height {
+                buf.set_string(popup.x + 1, row, candidate, style);
+            }
+        }
+    }
+
+    /// Get cursor screen position.
+    pub fn cursor_position(&self, area: Rect) -> (u16, u16) {
+        let inner_x = area.x; // no left border (Borders::TOP only)
+        let inner_y = area.y + 1; // top border
+        let prompt_w: usize = 2; // "> " or "  "
+        let inner_w = area.width as usize;
+
+        let text_before = &self.text[..self.cursor_pos];
+
+        // Count completed lines (from \n) before cursor
+        let newline_splits: Vec<&str> = text_before.split('\n').collect();
+        let lines_before = newline_splits.len() - 1; // number of \n before cursor
+        let last_line = newline_splits.last().unwrap_or(&"");
+        let col_w = prompt_w + UnicodeWidthStr::width(*last_line);
+
+        // Account for visual wrapping within each line
+        let mut visual_row: usize = 0;
+        for (i, line) in text_before.split('\n').enumerate() {
+            let line_w = prompt_w + UnicodeWidthStr::width(line);
+            if i < lines_before {
+                // Completed lines: count their visual rows (saturating_sub avoids off-by-one when line_w == inner_w)
+                visual_row += if inner_w > 0 { (line_w.saturating_sub(1) / inner_w + 1).max(1) } else { 1 };
+            } else {
+                // Current line: only count wrapped rows
+                if inner_w > 0 && col_w >= inner_w {
+                    visual_row += col_w / inner_w;
+                }
+            }
+        }
+
+        let col = if inner_w > 0 { col_w % inner_w } else { col_w };
+        (inner_x + col as u16, inner_y + visual_row as u16)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn new_is_empty() {
+        let input = InputBox::new();
+        assert!(input.is_empty());
+        assert_eq!(input.cursor_pos, 0);
+    }
+
+    #[test]
+    fn insert_and_take() {
+        let mut input = InputBox::new();
+        input.insert('h');
+        input.insert('i');
+        assert_eq!(input.text, "hi");
+        assert_eq!(input.cursor_pos, 2);
+
+        let text = input.take();
+        assert_eq!(text, "hi");
+        assert!(input.is_empty());
+        assert_eq!(input.cursor_pos, 0);
+    }
+
+    #[test]
+    fn insert_str() {
+        let mut input = InputBox::new();
+        input.insert_str("hello world");
+        assert_eq!(input.text, "hello world");
+        assert_eq!(input.cursor_pos, 11);
+    }
+
+    #[test]
+    fn backspace() {
+        let mut input = InputBox::new();
+        input.insert_str("abc");
+        input.backspace();
+        assert_eq!(input.text, "ab");
+        assert_eq!(input.cursor_pos, 2);
+    }
+
+    #[test]
+    fn backspace_at_start_is_noop() {
+        let mut input = InputBox::new();
+        input.backspace();
+        assert!(input.is_empty());
+    }
+
+    #[test]
+    fn delete_at_cursor() {
+        let mut input = InputBox::new();
+        input.insert_str("abc");
+        input.move_home();
+        input.delete();
+        assert_eq!(input.text, "bc");
+        assert_eq!(input.cursor_pos, 0);
+    }
+
+    #[test]
+    fn delete_at_end_is_noop() {
+        let mut input = InputBox::new();
+        input.insert_str("abc");
+        input.delete();
+        assert_eq!(input.text, "abc");
+    }
+
+    #[test]
+    fn cursor_movement() {
+        let mut input = InputBox::new();
+        input.insert_str("hello");
+
+        input.move_home();
+        assert_eq!(input.cursor_pos, 0);
+
+        input.move_end();
+        assert_eq!(input.cursor_pos, 5);
+
+        input.move_left();
+        assert_eq!(input.cursor_pos, 4);
+
+        input.move_right();
+        assert_eq!(input.cursor_pos, 5);
+
+        // Right at end is noop
+        input.move_right();
+        assert_eq!(input.cursor_pos, 5);
+
+        // Left at start is noop
+        input.move_home();
+        input.move_left();
+        assert_eq!(input.cursor_pos, 0);
+    }
+
+    #[test]
+    fn insert_in_middle() {
+        let mut input = InputBox::new();
+        input.insert_str("ac");
+        input.move_left(); // cursor at 1
+        input.insert('b');
+        assert_eq!(input.text, "abc");
+        assert_eq!(input.cursor_pos, 2); // after 'b'
+    }
+
+    #[test]
+    fn backspace_multibyte() {
+        let mut input = InputBox::new();
+        input.insert_str("你好");
+        input.backspace();
+        assert_eq!(input.text, "你");
+    }
+
+    #[test]
+    fn tab_completion_single_match() {
+        let mut input = InputBox::new();
+        input.completions = vec!["/create".into(), "/help".into(), "/list".into()];
+        input.insert_str("/cr");
+        input.tab();
+        assert_eq!(input.text, "/create");
+    }
+
+    #[test]
+    fn tab_completion_multiple_matches_cycles() {
+        let mut input = InputBox::new();
+        input.completions = vec!["/create".into(), "/cancel".into(), "/close".into()];
+        input.insert_str("/c");
+        input.tab(); // Opens popup, selects first
+        let first = input.text.clone();
+        input.tab(); // Cycle to second
+        let second = input.text.clone();
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn tab_no_match_is_noop() {
+        let mut input = InputBox::new();
+        input.completions = vec!["/create".into()];
+        input.insert_str("xyz");
+        input.tab();
+        assert_eq!(input.text, "xyz");
+    }
+
+    #[test]
+    fn shift_tab_cycles_backward() {
+        let mut input = InputBox::new();
+        input.completions = vec!["@alice".into(), "@bob".into(), "@charlie".into()];
+        input.insert_str("@");
+        input.tab(); // first match
+        let first = input.text.clone();
+        input.shift_tab(); // wraps to last
+        let last = input.text.clone();
+        assert_ne!(first, last);
+    }
+
+    #[test]
+    fn visual_line_count() {
+        let mut input = InputBox::new();
+        assert_eq!(input.visual_line_count(80), 1);
+
+        input.insert_str("a".repeat(100).as_str());
+        assert!(input.visual_line_count(80) >= 2);
+
+        // Narrow width
+        assert_eq!(input.visual_line_count(2), 1); // edge case
+        assert_eq!(input.visual_line_count(1), 1); // edge case
+    }
+
+    #[test]
+    fn command_detection() {
+        let mut input = InputBox::new();
+        input.insert_str("/add claude alice");
+        let text = input.take();
+        assert!(text.starts_with('/'));
+
+        input.insert_str("@alice hello");
+        let text = input.take();
+        assert!(text.starts_with('@'));
+
+        input.insert_str("plain message");
+        let text = input.take();
+        assert!(!text.starts_with('/'));
+        assert!(!text.starts_with('@'));
+    }
+
+    #[test]
+    fn cursor_position_no_left_border() {
+        let input = InputBox::new();
+        let area = Rect::new(0, 0, 80, 3);
+        let (cx, cy) = input.cursor_position(area);
+        // Empty text: cursor at prompt end (x=0 + 2 prompt = 2), y=1 (top border)
+        assert_eq!(cx, 2);
+        assert_eq!(cy, 1);
+    }
+
+    #[test]
+    fn cursor_position_with_text() {
+        let mut input = InputBox::new();
+        input.insert_str("hello");
+        let area = Rect::new(0, 0, 80, 3);
+        let (cx, cy) = input.cursor_position(area);
+        // "hello" is 5 chars wide + 2 prompt = col 7
+        assert_eq!(cx, 7);
+        assert_eq!(cy, 1);
+    }
+
+    #[test]
+    fn cursor_position_with_cjk() {
+        let mut input = InputBox::new();
+        input.insert_str("你好"); // each CJK char is 2 columns wide
+        let area = Rect::new(0, 0, 80, 3);
+        let (cx, cy) = input.cursor_position(area);
+        // 2 CJK chars × 2 width + 2 prompt = 6
+        assert_eq!(cx, 6);
+        assert_eq!(cy, 1);
+    }
+
+    #[test]
+    fn insert_newline() {
+        let mut input = InputBox::new();
+        input.insert_str("line1");
+        input.insert('\n');
+        input.insert_str("line2");
+        assert_eq!(input.text, "line1\nline2");
+        assert_eq!(input.cursor_pos, 11);
+    }
+
+    #[test]
+    fn visual_line_count_multiline() {
+        let mut input = InputBox::new();
+        input.insert_str("line1\nline2\nline3");
+        // 3 logical lines → at least 3 visual lines
+        assert!(input.visual_line_count(80) >= 3);
+    }
+
+    #[test]
+    fn cursor_position_multiline() {
+        let mut input = InputBox::new();
+        input.insert_str("line1\nab");
+        let area = Rect::new(0, 0, 80, 5);
+        let (cx, cy) = input.cursor_position(area);
+        // Second line: prompt "  " (2) + "ab" (2) = col 4
+        assert_eq!(cx, 4);
+        // First line takes row 1, second line cursor at row 2
+        assert_eq!(cy, 2);
+    }
+
+    #[test]
+    fn visual_line_count_exact_fit() {
+        // Text that exactly fills one line (prompt 2 + text 78 = 80 = width)
+        let mut input = InputBox::new();
+        input.insert_str(&"a".repeat(78));
+        // Should be 1 line, not 2
+        assert_eq!(input.visual_line_count(80), 1);
+    }
+
+    #[test]
+    fn visual_line_count_cjk_exact_fit() {
+        // CJK: each char is 2 columns. prompt 2 + 39 CJK chars × 2 = 80 = width
+        let mut input = InputBox::new();
+        let cjk: String = std::iter::repeat('你').take(39).collect();
+        input.insert_str(&cjk);
+        // Should be 1 line, not 2
+        assert_eq!(input.visual_line_count(80), 1);
+    }
+}

@@ -1,0 +1,20 @@
+[package]
+name = "nerve-tui-bin"
+version = "0.1.0"
+edition.workspace = true
+
+[[bin]]
+name = "nerve-tui"
+path = "src/main.rs"
+
+[dependencies]
+nerve-tui-protocol.workspace = true
+nerve-tui-core.workspace = true
+nerve-tui.workspace = true
+tokio.workspace = true
+clap.workspace = true
+tracing.workspace = true
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
+crossterm.workspace = true
+ratatui.workspace = true
+anyhow.workspace = true
