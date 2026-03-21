@@ -538,4 +538,51 @@ mod tests {
         assert!(text.contains("hello"));
         assert!(text.contains("chunk1 chunk2 chunk3"));
     }
+
+    #[test]
+    fn dm_replay_flush_on_user_message() {
+        // Simulates replay: user_msg → chunks → user_msg → chunks
+        // Each user_message should flush preceding agent chunks
+        let mut view = MessagesView::new();
+        view.enter_dm("agent-1");
+
+        // Turn 1: user message
+        view.push_dm(&make_dm("user", "question 1"));
+
+        // Turn 1: agent chunks (no start/end)
+        view.streaming.push(("agent-1".to_string(), "answer 1".to_string()));
+
+        // Turn 2: new user_message arrives — flush agent streaming first
+        let agent_content = view.streaming.iter().find(|(n, _)| n == "agent-1").map(|(_, c)| c.clone());
+        if let Some(content) = agent_content {
+            if !content.is_empty() {
+                view.push_dm(&make_dm("assistant", &content));
+            }
+        }
+        view.streaming.retain(|(n, _)| n != "agent-1");
+        view.push_dm(&make_dm("user", "question 2"));
+
+        // Turn 2: agent chunks
+        view.streaming.push(("agent-1".to_string(), "answer 2".to_string()));
+
+        // Final flush (idle)
+        let agent_content = view.streaming.iter().find(|(n, _)| n == "agent-1").map(|(_, c)| c.clone());
+        if let Some(content) = agent_content {
+            if !content.is_empty() {
+                view.push_dm(&make_dm("assistant", &content));
+            }
+        }
+        view.streaming.retain(|(n, _)| n != "agent-1");
+
+        // Should have 4 messages in correct order
+        assert_eq!(view.dm_lines.len(), 4);
+        assert_eq!(view.dm_lines[0].from, "user");
+        assert_eq!(view.dm_lines[0].content, "question 1");
+        assert_eq!(view.dm_lines[1].from, "assistant");
+        assert_eq!(view.dm_lines[1].content, "answer 1");
+        assert_eq!(view.dm_lines[2].from, "user");
+        assert_eq!(view.dm_lines[2].content, "question 2");
+        assert_eq!(view.dm_lines[3].from, "assistant");
+        assert_eq!(view.dm_lines[3].content, "answer 2");
+    }
 }

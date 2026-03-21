@@ -749,6 +749,10 @@ impl App {
                 Some("user_message") => {
                     // Replay of user's prompt (from subscribe buffer)
                     if in_dm {
+                        // Flush any pending agent streaming as a complete message
+                        // (replay has no idle/end signals between turns)
+                        self.flush_streaming_as_dm(node_id, name);
+
                         let text = update
                             .get("content")
                             .and_then(|c| c.get("text"))
