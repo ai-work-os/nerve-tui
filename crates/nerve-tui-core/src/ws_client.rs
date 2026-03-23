@@ -160,8 +160,12 @@ impl NerveClient {
 
     // --- Convenience methods ---
 
-    pub async fn channel_list(&self) -> Result<Vec<ChannelInfo>> {
-        let r = self.request("channel.list", json!({})).await?;
+    pub async fn channel_list(&self, cwd: Option<&str>) -> Result<Vec<ChannelInfo>> {
+        let mut params = json!({});
+        if let Some(c) = cwd {
+            params["cwd"] = json!(c);
+        }
+        let r = self.request("channel.list", params).await?;
         let channels: Vec<ChannelInfo> =
             serde_json::from_value(r.get("channels").cloned().unwrap_or(Value::Array(vec![])))?;
         Ok(channels)
@@ -216,16 +220,20 @@ impl NerveClient {
         Ok(msgs)
     }
 
-    pub async fn node_list(&self) -> Result<Vec<NodeInfo>> {
-        let r = self.request("node.list", json!({})).await?;
+    pub async fn node_list(&self, cwd: Option<&str>) -> Result<Vec<NodeInfo>> {
+        let mut params = json!({});
+        if let Some(c) = cwd {
+            params["cwd"] = json!(c);
+        }
+        let r = self.request("node.list", params).await?;
         let nodes: Vec<NodeInfo> =
             serde_json::from_value(r.get("nodes").cloned().unwrap_or(Value::Array(vec![])))?;
         Ok(nodes)
     }
 
-    pub async fn find_process_nodes(&self) -> Result<Vec<NodeInfo>> {
+    pub async fn find_process_nodes(&self, cwd: Option<&str>) -> Result<Vec<NodeInfo>> {
         debug!("requesting process nodes from node.list");
-        let nodes = self.node_list().await?;
+        let nodes = self.node_list(cwd).await?;
         Ok(nodes
             .into_iter()
             .filter(|node| node.transport == "stdio")
@@ -290,6 +298,24 @@ impl NerveClient {
         self.request("node.unsubscribe", json!({ "nodeId": node_id }))
             .await?;
         Ok(())
+    }
+
+    pub async fn channel_list_archived(&self, cwd: Option<&str>) -> Result<Vec<Value>> {
+        let mut params = json!({});
+        if let Some(c) = cwd {
+            params["cwd"] = json!(c);
+        }
+        let r = self.request("channel.listArchived", params).await?;
+        let channels: Vec<Value> =
+            serde_json::from_value(r.get("channels").cloned().unwrap_or(Value::Array(vec![])))?;
+        Ok(channels)
+    }
+
+    pub async fn channel_restore(&self, channel_id: &str) -> Result<ChannelInfo> {
+        let r = self
+            .request("channel.restore", json!({ "channelId": channel_id }))
+            .await?;
+        Ok(serde_json::from_value(r)?)
     }
 
     pub async fn channel_add_node(
@@ -370,6 +396,27 @@ fn parse_notification(method: &str, params: Value) -> Option<NerveEvent> {
                 status,
                 activity,
             })
+        }
+        "node.stopped" => {
+            let node_id = params.get("nodeId")?.as_str()?.to_string();
+            let name = params.get("name")?.as_str()?.to_string();
+            Some(NerveEvent::NodeStopped { node_id, name })
+        }
+        "channel.created" => {
+            let channel_id = params.get("channelId")?.as_str()?.to_string();
+            let name = params
+                .get("name")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            Some(NerveEvent::ChannelCreated { channel_id, name })
+        }
+        "channel.closed" => {
+            let channel_id = params.get("channelId")?.as_str()?.to_string();
+            let name = params
+                .get("name")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            Some(NerveEvent::ChannelClosed { channel_id, name })
         }
         _ => {
             warn!("unknown notification: {}", method);
@@ -657,6 +704,66 @@ mod tests {
         assert_eq!(rpc.id, Some(Value::Number(id.into())));
         assert_eq!(rpc.method.as_deref(), Some("node.cancel"));
         assert_eq!(rpc.params, Some(json!({ "nodeId": "node-1" })));
+    }
+
+    #[test]
+    fn parse_channel_created() {
+        let params = json!({
+            "channelId": "ch-new",
+            "name": "my-channel",
+            "cwd": "/tmp",
+        });
+        let evt = parse_notification("channel.created", params).unwrap();
+        match evt {
+            NerveEvent::ChannelCreated { channel_id, name } => {
+                assert_eq!(channel_id, "ch-new");
+                assert_eq!(name.as_deref(), Some("my-channel"));
+            }
+            _ => panic!("expected ChannelCreated"),
+        }
+    }
+
+    #[test]
+    fn parse_channel_created_no_name() {
+        let params = json!({ "channelId": "ch-noname", "cwd": "/tmp" });
+        let evt = parse_notification("channel.created", params).unwrap();
+        match evt {
+            NerveEvent::ChannelCreated { channel_id, name } => {
+                assert_eq!(channel_id, "ch-noname");
+                assert!(name.is_none());
+            }
+            _ => panic!("expected ChannelCreated"),
+        }
+    }
+
+    #[test]
+    fn parse_channel_closed() {
+        let params = json!({
+            "channelId": "ch-old",
+            "name": "old-channel",
+            "cwd": "/tmp",
+        });
+        let evt = parse_notification("channel.closed", params).unwrap();
+        match evt {
+            NerveEvent::ChannelClosed { channel_id, name } => {
+                assert_eq!(channel_id, "ch-old");
+                assert_eq!(name.as_deref(), Some("old-channel"));
+            }
+            _ => panic!("expected ChannelClosed"),
+        }
+    }
+
+    #[test]
+    fn parse_channel_closed_no_name() {
+        let params = json!({ "channelId": "ch-unnamed", "cwd": "/tmp" });
+        let evt = parse_notification("channel.closed", params).unwrap();
+        match evt {
+            NerveEvent::ChannelClosed { channel_id, name } => {
+                assert_eq!(channel_id, "ch-unnamed");
+                assert!(name.is_none());
+            }
+            _ => panic!("expected ChannelClosed"),
+        }
     }
 
     #[test]

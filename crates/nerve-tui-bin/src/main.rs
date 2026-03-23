@@ -3,12 +3,10 @@ use clap::Parser;
 use crossterm::{
     event::{
         DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-        KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
     },
     execute,
     terminal::{
-        disable_raw_mode, enable_raw_mode, supports_keyboard_enhancement, EnterAlternateScreen,
-        LeaveAlternateScreen,
+        disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
     },
 };
 use ratatui::backend::CrosstermBackend;
@@ -49,58 +47,67 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
     let url = format!("ws://{}", cli.server);
-    let project = cli.project.as_ref().map(|path| {
-        let project_name = Path::new(path)
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or(path);
-        info!("using project {} ({})", project_name, path);
-        path.clone()
+    let project_raw = cli.project.unwrap_or_else(|| {
+        std::env::current_dir()
+            .expect("cannot get current directory")
+            .to_string_lossy()
+            .into_owned()
     });
+    let project_name = Path::new(&project_raw)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(&project_raw);
+    info!("using project {} ({})", project_name, project_raw);
+    let project = Some(project_raw);
 
     // Connect to nerve
     let (client, event_rx) = NerveClient::connect(&url, &cli.name).await?;
     info!("connected to nerve at {}", url);
 
+    // Install panic hook to restore terminal on panic
+    let default_panic = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = execute!(
+            io::stdout(),
+            LeaveAlternateScreen,
+            DisableMouseCapture,
+            DisableBracketedPaste
+        );
+        let _ = disable_raw_mode();
+        let _ = execute!(io::stdout(), crossterm::cursor::Show);
+        default_panic(info);
+    }));
+
     // Setup terminal
     enable_raw_mode()?;
-    let mut stdout = io::stdout();
-    let keyboard_enhanced = supports_keyboard_enhancement().unwrap_or(false);
-    if keyboard_enhanced {
+
+    // Run setup + app inside closure so ? won't skip cleanup
+    let result = async {
+        let mut stdout = io::stdout();
         execute!(
             stdout,
-            PushKeyboardEnhancementFlags(
-                KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
-                    | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
-            )
+            EnterAlternateScreen,
+            EnableMouseCapture,
+            EnableBracketedPaste
         )?;
-    }
-    execute!(
-        stdout,
-        EnterAlternateScreen,
-        EnableMouseCapture,
-        EnableBracketedPaste
-    )?;
-    let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend)?;
+        let backend = CrosstermBackend::new(stdout);
+        let mut terminal = Terminal::new(backend)?;
 
-    // Run app
-    let mut app = App::new_with_project(client, event_rx, project);
-    app.init().await?;
-    let result = app.run(&mut terminal).await;
-
-    // Restore terminal
-    disable_raw_mode()?;
-    if keyboard_enhanced {
-        execute!(terminal.backend_mut(), PopKeyboardEnhancementFlags)?;
+        let mut app = App::new_with_project(client, event_rx, project);
+        app.init().await?;
+        app.run(&mut terminal).await
     }
-    execute!(
-        terminal.backend_mut(),
+    .await;
+
+    // Restore terminal (always runs, even if setup/init/run failed)
+    let _ = execute!(
+        io::stdout(),
         LeaveAlternateScreen,
         DisableMouseCapture,
         DisableBracketedPaste
-    )?;
-    terminal.show_cursor()?;
+    );
+    let _ = disable_raw_mode();
+    let _ = execute!(io::stdout(), crossterm::cursor::Show);
 
     result
 }

@@ -10,10 +10,10 @@ pub const TIMESTAMP: Color = Color::DarkGray;
 pub const CHANNEL_ACTIVE: Color = Color::Cyan;
 pub const CHANNEL_INACTIVE: Color = Color::DarkGray;
 
-pub const STATUS_IDLE: Color = Color::DarkGray;
+pub const STATUS_IDLE: Color = Color::White;
 pub const STATUS_STREAMING: Color = Color::Green;
 pub const STATUS_CONNECTING: Color = Color::Yellow;
-pub const STATUS_DISCONNECTED: Color = Color::Red;
+pub const STATUS_DISCONNECTED: Color = Color::DarkGray;
 pub const STATUS_BUSY: Color = Color::Green;
 pub const STATUS_ERROR: Color = Color::Red;
 
@@ -40,12 +40,12 @@ pub fn agent_color(name: &str) -> Color {
 
 pub fn status_icon(status: &str) -> &'static str {
     match status {
-        "idle" => "○",
-        "busy" => "●",
+        "idle" => "◉",
+        "busy" | "streaming" => "●",
         "connecting" => "◌",
-        "error" => "✗",
-        "stopped" => "✗",
-        _ => "?",
+        "error" => "○",
+        "stopped" => "○",
+        _ => "○",
     }
 }
 

@@ -4,6 +4,7 @@ use futures_util::StreamExt;
 use nerve_tui_core::NerveClient;
 use nerve_tui_protocol::*;
 use ratatui::Frame;
+use serde_json::Value;
 use std::path::Path;
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
@@ -30,9 +31,15 @@ pub struct App {
     active_dm: Option<DmState>,
     project_path: Option<String>,
     project_name: Option<String>,
+    /// When false (default), only show channels/agents for project_path
+    global_mode: bool,
+    /// Sidebar visibility toggle (Ctrl+B)
+    sidebar_visible: bool,
     /// Channel for background task errors (e.g. prompt failures)
     error_tx: mpsc::UnboundedSender<String>,
     error_rx: mpsc::UnboundedReceiver<String>,
+    /// Cached archived channels from last /restore call
+    archived_channels: Vec<Value>,
 }
 
 impl App {
@@ -46,6 +53,12 @@ impl App {
         project_path: Option<String>,
     ) -> Self {
         let (error_tx, error_rx) = mpsc::unbounded_channel();
+        // Canonicalize project_path to normalize trailing slashes, `.`, `..`
+        let project_path = project_path.map(|p| {
+            std::fs::canonicalize(&p)
+                .map(|c| c.to_string_lossy().into_owned())
+                .unwrap_or(p)
+        });
         let project_name = project_path
             .as_deref()
             .and_then(Self::project_name_from_path);
@@ -62,8 +75,20 @@ impl App {
             active_dm: None,
             project_path,
             project_name,
+            global_mode: false,
+            sidebar_visible: true,
             error_tx,
             error_rx,
+            archived_channels: Vec::new(),
+        }
+    }
+
+    /// Returns the cwd filter for API calls: project_path in project mode, None in global mode.
+    fn cwd_filter(&self) -> Option<&str> {
+        if self.global_mode {
+            None
+        } else {
+            self.project_path.as_deref()
         }
     }
 
@@ -85,12 +110,22 @@ impl App {
 
     /// Initialize: fetch channels, nodes, join first channel if exists.
     pub async fn init(&mut self) -> Result<()> {
-        self.refresh_channels().await;
         self.refresh_agents().await;
+        self.refresh_channels().await;
 
-        // Auto-join first channel
-        if let Some(ch) = self.channels.first() {
-            let ch_id = ch.id.clone();
+        // Validate active_channel is in the current filtered list, fallback if not
+        let should_join = if let Some(ref ch_id) = self.active_channel {
+            if self.channels.iter().any(|c| c.id == *ch_id) {
+                None // already valid
+            } else {
+                self.active_channel = None;
+                self.channels.first().map(|c| c.id.clone())
+            }
+        } else {
+            self.channels.first().map(|c| c.id.clone())
+        };
+
+        if let Some(ch_id) = should_join {
             self.join_channel(&ch_id).await;
         }
 
@@ -139,19 +174,24 @@ impl App {
 
     fn render(&mut self, frame: &mut Frame) {
         let area = frame.area();
-        let input_lines = self.input.visual_line_count(area.width.saturating_sub(22)) + 1;
-        let layout = AppLayout::new(area, input_lines);
+        let sidebar_w: u16 = if self.sidebar_visible { 20 } else { 0 };
+        let main_w = area.width.saturating_sub(sidebar_w);
+        let input_lines = self.input.visual_line_count(main_w.saturating_sub(2)) + 2;
+        let layout = AppLayout::with_sidebar(area, input_lines, self.sidebar_visible);
 
-        // Sidebar: channels + agents
-        self.status_bar.render(
-            &self.channels,
-            self.active_channel.as_deref(),
-            &self.agents,
-            self.active_dm.as_ref().map(|dm| dm.node_name.as_str()),
-            self.project_name.as_deref(),
-            layout.sidebar,
-            frame.buffer_mut(),
-        );
+        // Sidebar: channels + agents (skip when hidden)
+        if self.sidebar_visible {
+            self.status_bar.render(
+                &self.channels,
+                self.active_channel.as_deref(),
+                &self.agents,
+                self.active_dm.as_ref().map(|dm| dm.node_name.as_str()),
+                self.project_name.as_deref(),
+                self.global_mode,
+                layout.sidebar,
+                frame.buffer_mut(),
+            );
+        }
 
         // Messages
         self.messages.render(layout.messages, frame.buffer_mut());
@@ -167,10 +207,14 @@ impl App {
 
     async fn handle_key(&mut self, key: KeyEvent) {
         match key.code {
-            // Quit
+            // Ctrl+C: cancel active DM response if agent is responding
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.should_quit = true;
+                if self.active_dm.as_ref().is_some_and(|dm| dm.is_responding) {
+                    self.cancel_active_dm().await;
+                }
             }
+
+            // Quit
             KeyCode::Char('q') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.should_quit = true;
             }
@@ -186,13 +230,6 @@ impl App {
             // Ctrl+O: insert newline (universal fallback, no protocol needed)
             KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.input.insert('\n');
-            }
-
-            // Ctrl+X: cancel the active DM response (only when agent is responding)
-            KeyCode::Char('x') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                if self.active_dm.as_ref().is_some_and(|dm| dm.is_responding) {
-                    self.cancel_active_dm().await;
-                }
             }
 
             // Submit or confirm sidebar selection
@@ -218,17 +255,55 @@ impl App {
             // Scroll messages
             KeyCode::PageUp => self.messages.scroll_up(20),
             KeyCode::PageDown => self.messages.scroll_down(20),
-            KeyCode::Char('k') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.messages.scroll_up(1);
-            }
             KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.messages.scroll_down(1);
             }
-            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.messages.scroll_up(10);
-            }
             KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.messages.scroll_down(10);
+            }
+
+            // Emacs keybindings (line-aware for multiline input)
+            KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.input.move_line_start();
+            }
+            KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.input.move_line_end();
+            }
+            KeyCode::Char('k') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.input.kill_to_line_end();
+            }
+            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.input.kill_to_line_start();
+            }
+
+            // Toggle sidebar
+            KeyCode::Char('b') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.sidebar_visible = !self.sidebar_visible;
+            }
+
+            // Ctrl+G: toggle global/project mode
+            KeyCode::Char('g') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.global_mode = !self.global_mode;
+                let mode = if self.global_mode { "全局" } else { "项目" };
+                self.messages.push_system(&format!("切换到{}模式", mode));
+                self.refresh_agents().await;
+                self.refresh_channels().await;
+                // Validate active channel still visible
+                if let Some(ref ch_id) = self.active_channel {
+                    if !self.channels.iter().any(|c| c.id == *ch_id) {
+                        self.active_channel = None;
+                        if let Some(ch) = self.channels.first() {
+                            let ch_id = ch.id.clone();
+                            self.join_channel(&ch_id).await;
+                        }
+                    }
+                }
+                // Validate active DM agent still visible
+                if let Some(ref dm) = self.active_dm {
+                    if !self.agents.iter().any(|a| a.name == dm.node_name) {
+                        self.exit_dm().await;
+                    }
+                }
             }
 
             // Unified navigation list
@@ -326,7 +401,7 @@ impl App {
                     "dm send blocked for {}: agent still responding",
                     dm.node_name
                 );
-                self.push_contextual_system("agent 正在回复，先等待完成或 Ctrl+X 取消");
+                self.push_contextual_system("agent 正在回复，先等待完成或 Ctrl+C 取消");
                 return;
             }
 
@@ -517,7 +592,7 @@ impl App {
                 if let Some(ch_id) = parts.get(1) {
                     self.join_channel(ch_id).await;
                 } else {
-                    let channels = self.client.channel_list().await.unwrap_or_default();
+                    let channels = self.client.channel_list(self.cwd_filter()).await.unwrap_or_default();
                     if let Some(ch) = channels.first() {
                         let ch_id = ch.id.clone();
                         self.join_channel(&ch_id).await;
@@ -635,6 +710,99 @@ impl App {
                 }
             }
 
+            "/restore" => {
+                if let Some(arg) = parts.get(1) {
+                    // /restore <number> or /restore <channelId>
+                    let channel_id = if let Ok(idx) = arg.parse::<usize>() {
+                        if idx == 0 {
+                            None
+                        } else {
+                            self.archived_channels
+                                .get(idx - 1)
+                                .and_then(|ch| ch.get("id").and_then(|v| v.as_str()))
+                                .map(String::from)
+                        }
+                    } else {
+                        Some(arg.to_string())
+                    };
+                    if let Some(ch_id) = channel_id {
+                        match self.client.channel_restore(&ch_id).await {
+                            Ok(ch) => {
+                                let restored_id = ch.id.clone();
+                                let name = ch.name.as_deref().unwrap_or(&restored_id);
+                                self.messages
+                                    .push_system(&format!("频道已恢复: {}", name));
+                                self.archived_channels.clear();
+                                self.refresh_channels().await;
+                                self.join_channel(&restored_id).await;
+                            }
+                            Err(e) => self.messages.push_system(&format!("恢复失败: {}", e)),
+                        }
+                    } else {
+                        self.messages.push_system("无效序号，先用 /restore 查看列表");
+                    }
+                } else {
+                    // /restore with no args: list archived channels
+                    match self.client.channel_list_archived(self.cwd_filter()).await {
+                        Ok(channels) => {
+                            if channels.is_empty() {
+                                self.archived_channels.clear();
+                                self.messages.push_system("没有归档频道");
+                            } else {
+                                self.messages.push_system("归档频道:");
+                                for (i, ch) in channels.iter().enumerate() {
+                                    let id = ch
+                                        .get("id")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("?");
+                                    let name = ch
+                                        .get("name")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("");
+                                    let display = if name.is_empty() {
+                                        id.to_string()
+                                    } else {
+                                        format!("{} ({})", name, id)
+                                    };
+                                    // Show agents info
+                                    let agents_str = if let Some(agents) =
+                                        ch.get("agents").and_then(|v| v.as_array())
+                                    {
+                                        let names: Vec<&str> = agents
+                                            .iter()
+                                            .filter_map(|a| {
+                                                a.get("name").and_then(|v| v.as_str())
+                                            })
+                                            .collect();
+                                        if names.is_empty() {
+                                            String::new()
+                                        } else {
+                                            format!(" [{}]", names.join(", "))
+                                        }
+                                    } else {
+                                        String::new()
+                                    };
+                                    self.messages.push_system(&format!(
+                                        "  {}. {}{}",
+                                        i + 1,
+                                        display,
+                                        agents_str
+                                    ));
+                                }
+                                self.messages
+                                    .push_system("用 /restore <序号> 恢复频道");
+                                self.archived_channels = channels;
+                            }
+                        }
+                        Err(e) => {
+                            self.archived_channels.clear();
+                            self.messages
+                                .push_system(&format!("获取归档列表失败: {}", e));
+                        }
+                    }
+                }
+            }
+
             "/help" => {
                 self.messages.push_system("命令:");
                 self.messages
@@ -652,19 +820,24 @@ impl App {
                 self.messages
                     .push_system("  /list                 列出 agents");
                 self.messages
+                    .push_system("  /restore [n]          恢复归档频道");
+                self.messages
                     .push_system("  /dm <name>            与 agent 1v1 对话");
                 self.messages
                     .push_system("  /back                 退出 DM 回频道");
                 self.messages.push_system("  /help                 帮助");
                 self.messages.push_system("快捷键:");
-                self.messages
-                    .push_system("  Ctrl+N/P  选中导航列表上一项/下一项");
-                self.messages
-                    .push_system("  Enter/Tab 确认：切频道或进入DM");
-                self.messages.push_system("  Ctrl+X    中断当前 DM 回复");
-                self.messages
-                    .push_system("  Esc       DM回复中=取消，否则退出DM");
-                self.messages.push_system("  Ctrl+C/Q  退出");
+                self.messages.push_system("  Enter       发送消息 / 确认选择");
+                self.messages.push_system("  Tab         补全 / 确认选择");
+                self.messages.push_system("  Ctrl+O      输入框换行");
+                self.messages.push_system("  Ctrl+C      中断当前 DM 回复");
+                self.messages.push_system("  Esc         DM回复中=取消，否则退出DM");
+                self.messages.push_system("  Ctrl+N/P    侧边栏导航 下/上");
+                self.messages.push_system("  Ctrl+J/K    滚动消息 下/上（1行）");
+                self.messages.push_system("  Ctrl+D/U    滚动消息 下/上（10行）");
+                self.messages.push_system("  PgDn/PgUp   翻页（20行）");
+                self.messages.push_system("  Ctrl+G      切换全局/项目模式");
+                self.messages.push_system("  Ctrl+Q      退出");
             }
 
             "/quit" | "/q" => {
@@ -731,7 +904,6 @@ impl App {
                     agent.status = status.clone();
                     agent.activity = activity;
                 }
-
                 // When agent goes idle, flush any pending streaming buffer as DM message
                 if status == "idle" {
                     self.flush_streaming_as_dm(&node_id, &name);
@@ -740,6 +912,67 @@ impl App {
                         dm_state.is_responding = true;
                     }
                 }
+            }
+
+            NerveEvent::ChannelCreated {
+                channel_id, name, ..
+            } => {
+                // Refresh first so we can check if this channel is in our filtered view
+                self.refresh_channels().await;
+                if self.channels.iter().any(|c| c.id == channel_id) {
+                    let label = name.as_deref().unwrap_or("unnamed");
+                    self.messages
+                        .push_system(&format!("频道 {} 已创建", label));
+                }
+            }
+
+            NerveEvent::ChannelClosed {
+                channel_id, name, ..
+            } => {
+                // Check if the closed channel was visible before refresh
+                let was_visible = self.channels.iter().any(|c| c.id == channel_id);
+                let was_active =
+                    self.active_channel.as_deref() == Some(channel_id.as_str());
+
+                self.refresh_channels().await;
+
+                if was_visible {
+                    let label = name.as_deref().unwrap_or("unnamed");
+                    self.messages
+                        .push_system(&format!("频道 {} 已关闭", label));
+                }
+
+                // If the closed channel was active, fall back
+                if was_active {
+                    self.active_channel = None;
+                    if let Some(ch) = self.channels.first() {
+                        let ch_id = ch.id.clone();
+                        self.join_channel(&ch_id).await;
+                    }
+                    self.sync_navigation_selection();
+                }
+            }
+
+            NerveEvent::NodeStopped { node_id, name } => {
+                // If we're in a DM with this node, flush streaming and exit DM
+                self.flush_streaming_as_dm(&node_id, &name);
+                if self
+                    .active_dm
+                    .as_ref()
+                    .map_or(false, |dm| dm.node_id == node_id)
+                {
+                    self.active_dm = None;
+                    self.messages.exit_dm();
+                    self.messages
+                        .push_system(&format!("{} 已停止", name));
+                } else if self.agents.iter().any(|a| a.node_id == node_id) {
+                    self.messages
+                        .push_system(&format!("{} 已停止", name));
+                }
+                // Remove from agents list immediately
+                self.agents.retain(|a| a.node_id != node_id);
+                self.update_completions();
+                self.sync_navigation_selection();
             }
 
             NerveEvent::Disconnected => {
@@ -971,14 +1204,24 @@ impl App {
     }
 
     async fn refresh_channels(&mut self) {
-        match self.client.channel_list().await {
+        match self.client.channel_list(self.cwd_filter()).await {
             Ok(list) => {
                 self.channels = list
                     .into_iter()
-                    .map(|ch| ChannelDisplay {
-                        id: ch.id,
-                        name: ch.name,
-                        node_count: ch.nodes.len(),
+                    .map(|ch| {
+                        let members: Vec<MemberDisplay> = ch
+                            .nodes
+                            .values()
+                            .map(|node_id| MemberDisplay {
+                                node_id: node_id.clone(),
+                            })
+                            .collect();
+                        ChannelDisplay {
+                            id: ch.id,
+                            name: ch.name,
+                            node_count: ch.nodes.len(),
+                            members,
+                        }
                     })
                     .collect();
                 self.sync_navigation_selection();
@@ -988,7 +1231,7 @@ impl App {
     }
 
     async fn refresh_agents(&mut self) {
-        match self.client.node_list().await {
+        match self.client.node_list(self.cwd_filter()).await {
             Ok(nodes) => {
                 self.agents = nodes
                     .into_iter()
@@ -1020,6 +1263,7 @@ impl App {
             "/dm".into(),
             "/back".into(),
             "/help".into(),
+            "/restore".into(),
             "/quit".into(),
         ];
         for agent in &self.agents {
@@ -1150,11 +1394,13 @@ mod tests {
                 id: "ch1".into(),
                 name: Some("main".into()),
                 node_count: 2,
+                members: Vec::new(),
             },
             ChannelDisplay {
                 id: "ch2".into(),
                 name: Some("ops".into()),
                 node_count: 1,
+                members: Vec::new(),
             },
         ];
         app.agents = vec![AgentDisplay {
@@ -1178,6 +1424,7 @@ mod tests {
             id: "ch1".into(),
             name: Some("main".into()),
             node_count: 2,
+            members: Vec::new(),
         }];
         app.agents = vec![
             AgentDisplay {
@@ -1207,5 +1454,90 @@ mod tests {
         app.sync_navigation_selection();
 
         assert_eq!(app.status_bar.selected_nav, 2);
+    }
+
+    #[tokio::test]
+    async fn channel_closed_clears_active_channel() {
+        let mut app = make_app();
+        app.channels = vec![
+            ChannelDisplay {
+                id: "ch1".into(),
+                name: Some("main".into()),
+                node_count: 2,
+                members: Vec::new(),
+            },
+            ChannelDisplay {
+                id: "ch2".into(),
+                name: Some("ops".into()),
+                node_count: 1,
+                members: Vec::new(),
+            },
+        ];
+        app.active_channel = Some("ch1".into());
+
+        // Simulate ChannelClosed for active channel
+        app.handle_nerve_event(NerveEvent::ChannelClosed {
+            channel_id: "ch1".into(),
+            name: Some("main".into()),
+        })
+        .await;
+
+        // active_channel should be cleared (refresh_channels returns empty since mock client)
+        assert!(app.active_channel.is_none());
+    }
+
+    #[tokio::test]
+    async fn channel_closed_other_channel_keeps_active() {
+        let mut app = make_app();
+        app.channels = vec![
+            ChannelDisplay {
+                id: "ch1".into(),
+                name: Some("main".into()),
+                node_count: 2,
+                members: Vec::new(),
+            },
+            ChannelDisplay {
+                id: "ch2".into(),
+                name: Some("ops".into()),
+                node_count: 1,
+                members: Vec::new(),
+            },
+        ];
+        app.active_channel = Some("ch1".into());
+
+        // Closing ch2 should NOT affect active_channel
+        app.handle_nerve_event(NerveEvent::ChannelClosed {
+            channel_id: "ch2".into(),
+            name: Some("ops".into()),
+        })
+        .await;
+
+        assert_eq!(app.active_channel.as_deref(), Some("ch1"));
+    }
+
+    #[test]
+    fn cwd_filter_respects_global_mode() {
+        let (ws_tx, _ws_rx) = mpsc::unbounded_channel::<String>();
+        let pending = Arc::new(Mutex::new(HashMap::new()));
+        let client = NerveClient::from_parts(ws_tx, pending);
+        let (_event_tx, event_rx) = mpsc::unbounded_channel();
+        let mut app = App::new_with_project(client, event_rx, Some("/tmp/project".into()));
+
+        // Default: project mode
+        assert_eq!(app.cwd_filter(), Some("/tmp/project"));
+
+        // Global mode
+        app.global_mode = true;
+        assert!(app.cwd_filter().is_none());
+
+        // Back to project mode
+        app.global_mode = false;
+        assert_eq!(app.cwd_filter(), Some("/tmp/project"));
+    }
+
+    #[test]
+    fn cwd_filter_none_without_project_path() {
+        let app = make_app();
+        assert!(app.cwd_filter().is_none());
     }
 }

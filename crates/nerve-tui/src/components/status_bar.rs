@@ -16,10 +16,16 @@ pub struct AgentDisplay {
 }
 
 #[derive(Debug, Clone)]
+pub struct MemberDisplay {
+    pub node_id: String,
+}
+
+#[derive(Debug, Clone)]
 pub struct ChannelDisplay {
     pub id: String,
     pub name: Option<String>,
     pub node_count: usize,
+    pub members: Vec<MemberDisplay>,
 }
 
 impl ChannelDisplay {
@@ -118,6 +124,7 @@ impl StatusBar {
         agents: &[AgentDisplay],
         active_dm: Option<&str>,
         project_name: Option<&str>,
+        global_mode: bool,
         area: Rect,
         buf: &mut Buffer,
     ) {
@@ -136,7 +143,13 @@ impl StatusBar {
                 .add_modifier(Modifier::BOLD),
         )));
 
-        if let Some(project) = project_name {
+        if global_mode {
+            lines.push(Line::from(Span::styled(
+                "全局模式",
+                Style::default().fg(theme::MENTION),
+            )));
+            lines.push(Line::from(""));
+        } else if let Some(project) = project_name {
             lines.push(Line::from(vec![
                 Span::styled("项目 ", Style::default().fg(theme::TIMESTAMP)),
                 Span::styled(
@@ -187,14 +200,36 @@ impl StatusBar {
                 display.to_string()
             };
 
+            let busy_count = ch.members.iter().filter(|m| {
+                agents.iter().any(|a| a.node_id == m.node_id && a.status == "busy")
+            }).count();
+            let count_text = if busy_count > 0 {
+                format!(" ({}/{}busy)", ch.node_count, busy_count)
+            } else {
+                format!(" ({})", ch.node_count)
+            };
             lines.push(Line::from(vec![
                 Span::raw(format!("{} ", marker)),
                 Span::styled(format!("#{}", truncated), name_style),
-                Span::styled(
-                    format!(" ({})", ch.node_count),
-                    Style::default().fg(theme::TIMESTAMP),
-                ),
+                Span::styled(count_text, Style::default().fg(theme::TIMESTAMP)),
             ]));
+            // Show members under active/selected channel
+            if is_active || is_selected {
+                for member in &ch.members {
+                    let agent = agents.iter().find(|a| a.node_id == member.node_id);
+                    let status = agent.map(|a| a.status.as_str()).unwrap_or("idle");
+                    let name = agent.map(|a| a.name.as_str()).unwrap_or("?");
+                    let icon = theme::status_icon(status);
+                    let color = theme::status_color(status);
+                    lines.push(Line::from(vec![
+                        Span::raw("    "),
+                        Span::styled(
+                            format!("{} {}", icon, name),
+                            Style::default().fg(color),
+                        ),
+                    ]));
+                }
+            }
         }
 
         if !channels.is_empty() && !agents.is_empty() {
@@ -267,6 +302,7 @@ mod tests {
                 id: format!("ch{}", i),
                 name: Some(format!("channel-{}", i)),
                 node_count: i + 1,
+                members: Vec::new(),
             })
             .collect()
     }
@@ -366,6 +402,7 @@ mod tests {
             id: "ch1".into(),
             name: Some("main".into()),
             node_count: 2,
+            members: Vec::new(),
         };
         assert_eq!(ch_named.display_name(), "main");
 
@@ -373,6 +410,7 @@ mod tests {
             id: "ch-abc-123".into(),
             name: None,
             node_count: 0,
+            members: Vec::new(),
         };
         assert_eq!(ch_unnamed.display_name(), "ch-abc-123");
     }
@@ -382,7 +420,7 @@ mod tests {
         let bar = StatusBar::new();
         let area = Rect::new(0, 0, 20, 15);
         let mut buf = Buffer::empty(area);
-        bar.render(&[], None, &[], None, None, area, &mut buf);
+        bar.render(&[], None, &[], None, None, false, area, &mut buf);
     }
 
     #[test]
@@ -398,8 +436,50 @@ mod tests {
             &agents,
             Some("agent-1"),
             Some("nerve-tui"),
+            false,
             area,
             &mut buf,
         );
+    }
+
+    #[test]
+    fn channel_members_render_no_panic() {
+        let bar = StatusBar::new();
+        let channels = vec![ChannelDisplay {
+            id: "ch0".into(),
+            name: Some("main".into()),
+            node_count: 2,
+            members: vec![
+                MemberDisplay { node_id: "n0".into() },
+                MemberDisplay { node_id: "n1".into() },
+            ],
+        }];
+        let agents = make_agents(1);
+        let area = Rect::new(0, 0, 30, 20);
+        let mut buf = Buffer::empty(area);
+        bar.render(&channels, Some("ch0"), &agents, None, None, false, area, &mut buf);
+    }
+
+    #[test]
+    fn channel_busy_count_display() {
+        let ch = ChannelDisplay {
+            id: "ch1".into(),
+            name: Some("test".into()),
+            node_count: 3,
+            members: vec![
+                MemberDisplay { node_id: "n1".into() },
+                MemberDisplay { node_id: "n2".into() },
+                MemberDisplay { node_id: "n3".into() },
+            ],
+        };
+        let agents = vec![
+            AgentDisplay { name: "a".into(), status: "idle".into(), activity: None, adapter: None, node_id: "n1".into() },
+            AgentDisplay { name: "b".into(), status: "busy".into(), activity: None, adapter: None, node_id: "n2".into() },
+            AgentDisplay { name: "c".into(), status: "busy".into(), activity: None, adapter: None, node_id: "n3".into() },
+        ];
+        let busy = ch.members.iter().filter(|m| {
+            agents.iter().any(|a| a.node_id == m.node_id && a.status == "busy")
+        }).count();
+        assert_eq!(busy, 2);
     }
 }

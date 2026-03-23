@@ -120,6 +120,21 @@ pub enum NerveEvent {
         status: String,
         activity: Option<String>,
     },
+    /// A new channel was created
+    ChannelCreated {
+        channel_id: String,
+        name: Option<String>,
+    },
+    /// A channel was closed
+    ChannelClosed {
+        channel_id: String,
+        name: Option<String>,
+    },
+    /// Agent process stopped (crash or explicit stop)
+    NodeStopped {
+        node_id: String,
+        name: String,
+    },
     /// WS connection lost
     Disconnected,
 }
@@ -133,6 +148,9 @@ impl NerveEvent {
             NerveEvent::NodeLeft { .. } => "NodeLeft",
             NerveEvent::NodeUpdate { .. } => "NodeUpdate",
             NerveEvent::NodeStatusChanged { .. } => "NodeStatusChanged",
+            NerveEvent::ChannelCreated { .. } => "ChannelCreated",
+            NerveEvent::ChannelClosed { .. } => "ChannelClosed",
+            NerveEvent::NodeStopped { .. } => "NodeStopped",
             NerveEvent::Disconnected => "Disconnected",
         }
     }

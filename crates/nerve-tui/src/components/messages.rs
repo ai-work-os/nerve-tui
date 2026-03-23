@@ -7,6 +7,7 @@ use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Widget, Wrap};
+use unicode_width::UnicodeWidthStr;
 
 struct MessageLine {
     from: String,
@@ -31,6 +32,8 @@ pub struct MessagesView {
     /// DM mode: if Some, render DM messages instead of channel messages
     dm_view: Option<DmView>,
     dm_lines: Vec<MessageLine>,
+    /// True when new messages arrived while user is scrolled up
+    has_new_messages: bool,
 }
 
 impl MessagesView {
@@ -44,6 +47,7 @@ impl MessagesView {
             filter: None,
             dm_view: None,
             dm_lines: Vec::new(),
+            has_new_messages: false,
         }
     }
 
@@ -55,6 +59,8 @@ impl MessagesView {
         });
         if self.auto_scroll {
             self.snap_to_bottom();
+        } else {
+            self.has_new_messages = true;
         }
     }
 
@@ -66,11 +72,14 @@ impl MessagesView {
         });
         if self.auto_scroll {
             self.snap_to_bottom();
+        } else {
+            self.has_new_messages = true;
         }
     }
 
     pub fn scroll_down(&mut self, n: u16) {
         self.scroll_offset = self.scroll_offset.saturating_add(n);
+        // Will be clamped in render; if clamped to bottom, auto_scroll re-enabled there
         self.auto_scroll = false;
     }
 
@@ -81,6 +90,7 @@ impl MessagesView {
 
     pub fn snap_to_bottom(&mut self) {
         self.auto_scroll = true;
+        self.has_new_messages = false;
         // scroll_offset will be recalculated in render
         self.scroll_offset = u16::MAX;
     }
@@ -88,6 +98,7 @@ impl MessagesView {
     pub fn clear(&mut self) {
         self.lines.clear();
         self.scroll_offset = 0;
+        self.has_new_messages = false;
     }
 
     // --- DM mode ---
@@ -104,12 +115,14 @@ impl MessagesView {
         self.streaming.clear();
         self.scroll_offset = 0;
         self.auto_scroll = true;
+        self.has_new_messages = false;
     }
 
     pub fn exit_dm(&mut self) {
         self.dm_view = None;
         self.dm_lines.clear();
         self.streaming.clear();
+        self.has_new_messages = false;
     }
 
     pub fn push_dm(&mut self, msg: &DmMessage) {
@@ -120,6 +133,8 @@ impl MessagesView {
         });
         if self.auto_scroll {
             self.snap_to_bottom();
+        } else {
+            self.has_new_messages = true;
         }
     }
 
@@ -141,23 +156,56 @@ impl MessagesView {
         block.render(area, buf);
 
         let text_lines = self.build_text(inner.width);
-        let total = text_lines.len() as u16;
+        // Estimate visual lines after soft-wrap (use u32 to avoid overflow)
+        let width = inner.width.max(1) as usize;
+        let total_visual_u32: u32 = text_lines
+            .iter()
+            .map(|line| {
+                let line_width: usize = line.spans.iter().map(|s| UnicodeWidthStr::width(s.content.as_ref())).sum();
+                if line_width == 0 {
+                    1u32
+                } else {
+                    ((line_width + width - 1) / width) as u32
+                }
+            })
+            .sum();
+        let total_visual = total_visual_u32.min(u16::MAX as u32) as u16;
+        let max_offset = total_visual.saturating_sub(self.visible_height);
 
         if self.auto_scroll {
-            self.scroll_offset = total.saturating_sub(self.visible_height);
+            self.scroll_offset = max_offset;
         } else {
-            self.scroll_offset = self
-                .scroll_offset
-                .min(total.saturating_sub(self.visible_height));
+            self.scroll_offset = self.scroll_offset.min(max_offset);
+            // Re-enable auto_scroll if user scrolled back to bottom
+            if self.scroll_offset >= max_offset {
+                self.auto_scroll = true;
+                self.has_new_messages = false;
+            }
         }
 
         let para = Paragraph::new(text_lines)
             .scroll((self.scroll_offset, 0))
             .wrap(Wrap { trim: false });
         para.render(inner, buf);
+
+        // "New messages" indicator when scrolled up
+        if self.has_new_messages && !self.auto_scroll && inner.height > 0 {
+            let indicator = "↓ 新消息";
+            let iw = UnicodeWidthStr::width(indicator) as u16;
+            let x = inner.x + inner.width.saturating_sub(iw + 1);
+            let y = inner.y + inner.height - 1;
+            buf.set_string(
+                x,
+                y,
+                indicator,
+                Style::default()
+                    .fg(theme::MENTION)
+                    .add_modifier(Modifier::BOLD),
+            );
+        }
     }
 
-    fn build_text(&self, _width: u16) -> Vec<Line<'static>> {
+    fn build_text(&self, width: u16) -> Vec<Line<'static>> {
         let mut out: Vec<Line<'static>> = Vec::new();
 
         let source = if self.dm_view.is_some() {
@@ -181,7 +229,21 @@ impl MessagesView {
                 out.push(Line::from(""));
             }
 
-            // Header: name  HH:MM:SS
+            // In DM mode, detect channel-origin prefix "[channel: xxx] from: yyy"
+            let (channel_origin, base_content) = if self.dm_view.is_some() {
+                extract_channel_origin(&msg.content)
+            } else {
+                (None, msg.content.clone())
+            };
+
+            // Parse routing: extract first @mention as target (channel mode only)
+            let (target, display_content) = if self.dm_view.is_some() {
+                (None, base_content)
+            } else {
+                extract_route_target(&base_content)
+            };
+
+            // Header: from → target  HH:MM:SS  or  from  HH:MM:SS
             let time_str = format_time(msg.timestamp);
             let name_color = theme::agent_color(&msg.from);
             let name_style = if msg.from == "系统" {
@@ -190,15 +252,31 @@ impl MessagesView {
                 Style::default().fg(name_color).add_modifier(Modifier::BOLD)
             };
 
-            out.push(Line::from(vec![
-                Span::styled(msg.from.clone(), name_style),
-                Span::raw("  "),
-                Span::styled(time_str, Style::default().fg(theme::TIMESTAMP)),
-            ]));
+            let mut header = vec![Span::styled(msg.from.clone(), name_style)];
+            if let Some(ref t) = target {
+                let target_color = theme::agent_color(t);
+                header.push(Span::styled(
+                    " → ",
+                    Style::default().fg(theme::TIMESTAMP),
+                ));
+                header.push(Span::styled(
+                    t.clone(),
+                    Style::default().fg(target_color).add_modifier(Modifier::BOLD),
+                ));
+            }
+            // Show channel origin tag in DM mode
+            if let Some(ref origin) = channel_origin {
+                header.push(Span::styled(
+                    format!("  [来自 #{} @{}]", origin.channel, origin.from),
+                    Style::default().fg(theme::SYSTEM_MSG),
+                ));
+            }
+            header.push(Span::raw("  "));
+            header.push(Span::styled(time_str, Style::default().fg(theme::TIMESTAMP)));
+            out.push(Line::from(header));
 
-            // Content lines
-            for line in msg.content.lines() {
-                // Highlight @mentions
+            // Content lines (with @target prefix stripped)
+            for line in display_content.lines() {
                 let spans = highlight_mentions(line);
                 out.push(Line::from(spans));
             }
@@ -216,17 +294,53 @@ impl MessagesView {
                 ),
                 Span::styled(" ▌", Style::default().fg(theme::MENTION)),
             ]));
-            // Show last few lines of streaming content
-            let preview: String = content
-                .lines()
-                .rev()
-                .take(3)
-                .collect::<Vec<_>>()
-                .into_iter()
-                .rev()
-                .collect::<Vec<_>>()
-                .join("\n");
-            for line in preview.lines() {
+            // Show trailing streaming lines (capped to avoid perf issues with very long output)
+            let max_preview = if width > 0 { self.visible_height.max(20) as usize } else { 20 };
+            let w = width.max(1) as usize;
+            let all_lines: Vec<&str> = content.lines().collect();
+            // Count visual lines (accounting for CJK wide chars wrapping)
+            let mut visual_count = 0usize;
+            let mut start = all_lines.len();
+            // Index of a line that needs tail-truncation, and how many visual lines to keep
+            let mut truncate_first: Option<(usize, usize)> = None;
+            for (i, line) in all_lines.iter().enumerate().rev() {
+                let lw = UnicodeWidthStr::width(*line);
+                let vl = if lw == 0 { 1 } else { (lw + w - 1) / w };
+                visual_count += vl;
+                if visual_count > max_preview {
+                    // This line pushed us over. Keep the tail portion that fits.
+                    let keep_vl = vl.saturating_sub(visual_count - max_preview);
+                    if keep_vl > 0 {
+                        start = i;
+                        truncate_first = Some((i, keep_vl));
+                    } else {
+                        start = i + 1;
+                    }
+                    break;
+                }
+                start = i;
+            }
+            if start > 0 {
+                out.push(Line::from(Span::styled(
+                    format!("  … {} 行已省略", start),
+                    Style::default().fg(theme::SYSTEM_MSG),
+                )));
+            }
+            for (idx, line) in all_lines[start..].iter().enumerate() {
+                let actual_idx = start + idx;
+                if let Some((trunc_idx, keep_vl)) = truncate_first {
+                    if actual_idx == trunc_idx {
+                        // Tail-truncate: keep last keep_vl * w display-width chars
+                        // Reserve space for the "…" prefix (1 column wide)
+                        let keep_width = (keep_vl * w).saturating_sub(1);
+                        let truncated = tail_by_width(line, keep_width);
+                        out.push(Line::from(Span::styled(
+                            format!("…{}", truncated),
+                            Style::default().fg(theme::AGENT_MSG),
+                        )));
+                        continue;
+                    }
+                }
                 out.push(Line::from(Span::styled(
                     line.to_string(),
                     Style::default().fg(theme::AGENT_MSG),
@@ -236,6 +350,56 @@ impl MessagesView {
 
         out
     }
+}
+
+struct ChannelOrigin {
+    channel: String,
+    from: String,
+}
+
+/// Extract channel origin from DM content prefixed with "[channel: xxx] from: yyy\n\n..."
+/// Returns (Some(origin), remaining_content) or (None, original_content)
+fn extract_channel_origin(content: &str) -> (Option<ChannelOrigin>, String) {
+    let trimmed = content.trim_start();
+    if !trimmed.starts_with("[channel:") {
+        return (None, content.to_string());
+    }
+    // Find the end of header block (double newline)
+    if let Some(pos) = trimmed.find("\n\n") {
+        let header = &trimmed[..pos];
+        let rest = trimmed[pos + 2..].to_string();
+        // Parse "[channel: xxx] from: yyy"
+        let channel = header
+            .strip_prefix("[channel:")
+            .and_then(|s| s.find(']').map(|i| s[..i].trim().to_string()));
+        let from = header
+            .find("from:")
+            .map(|i| header[i + 5..].trim().to_string());
+        if let (Some(ch), Some(f)) = (channel, from) {
+            return (Some(ChannelOrigin { channel: ch, from: f }), rest);
+        }
+    }
+    (None, content.to_string())
+}
+
+/// Extract the first @mention as route target, return (target, content_without_prefix).
+/// "@bob hello world" → (Some("bob"), "hello world")
+/// "no mention here"  → (None, "no mention here")
+fn extract_route_target(content: &str) -> (Option<String>, String) {
+    let trimmed = content.trim_start();
+    if !trimmed.starts_with('@') {
+        return (None, content.to_string());
+    }
+    let after_at = &trimmed[1..];
+    let end = after_at
+        .find(|c: char| !c.is_alphanumeric() && c != '_' && c != '-' && c != '.')
+        .unwrap_or(after_at.len());
+    if end == 0 {
+        return (None, content.to_string());
+    }
+    let target = after_at[..end].to_string();
+    let rest = after_at[end..].trim_start().to_string();
+    (Some(target), rest)
 }
 
 fn format_time(ts: f64) -> String {
@@ -284,6 +448,20 @@ pub(crate) fn highlight_mentions(text: &str) -> Vec<Span<'static>> {
         spans.push(Span::raw(text.to_string()));
     }
     spans
+}
+
+/// Return the tail of `s` whose display width fits within `max_width`.
+fn tail_by_width(s: &str, max_width: usize) -> &str {
+    use unicode_width::UnicodeWidthChar;
+    let mut width = 0usize;
+    for (i, c) in s.char_indices().rev() {
+        let cw = UnicodeWidthChar::width(c).unwrap_or(0);
+        if width + cw > max_width {
+            return &s[i + c.len_utf8()..];
+        }
+        width += cw;
+    }
+    s
 }
 
 #[cfg(test)]
@@ -584,6 +762,58 @@ mod tests {
     }
 
     #[test]
+    fn extract_route_with_mention() {
+        let (target, content) = extract_route_target("@bob hello world");
+        assert_eq!(target, Some("bob".to_string()));
+        assert_eq!(content, "hello world");
+    }
+
+    #[test]
+    fn extract_route_no_mention() {
+        let (target, content) = extract_route_target("just a message");
+        assert_eq!(target, None);
+        assert_eq!(content, "just a message");
+    }
+
+    #[test]
+    fn extract_route_mention_with_dash() {
+        let (target, content) = extract_route_target("@agent-1 do this");
+        assert_eq!(target, Some("agent-1".to_string()));
+        assert_eq!(content, "do this");
+    }
+
+    #[test]
+    fn extract_route_only_mention() {
+        let (target, content) = extract_route_target("@bob");
+        assert_eq!(target, Some("bob".to_string()));
+        assert_eq!(content, "");
+    }
+
+    #[test]
+    fn extract_route_mention_mid_text() {
+        // @mention not at start — no route extraction
+        let (target, content) = extract_route_target("hello @bob world");
+        assert_eq!(target, None);
+        assert_eq!(content, "hello @bob world");
+    }
+
+    #[test]
+    fn route_display_in_build_text() {
+        let mut view = MessagesView::new();
+        view.push(&make_msg("alice", "@bob check this"), true);
+        let lines = view.build_text(80);
+        // Header should contain "alice" and "bob" (route arrow)
+        let header: String = lines[0].spans.iter().map(|s| s.content.to_string()).collect();
+        assert!(header.contains("alice"), "header has sender");
+        assert!(header.contains("→"), "header has arrow");
+        assert!(header.contains("bob"), "header has target");
+        // Content should NOT start with @bob
+        let content: String = lines[1].spans.iter().map(|s| s.content.to_string()).collect();
+        assert!(!content.starts_with("@bob"), "content stripped @mention prefix");
+        assert!(content.contains("check this"), "content preserved");
+    }
+
+    #[test]
     fn dm_replay_flush_on_user_message() {
         // Simulates replay: user_msg → chunks → user_msg → chunks
         // Each user_message should flush preceding agent chunks
@@ -638,5 +868,98 @@ mod tests {
         assert_eq!(view.dm_lines[2].content, "question 2");
         assert_eq!(view.dm_lines[3].from, "assistant");
         assert_eq!(view.dm_lines[3].content, "answer 2");
+    }
+
+    #[test]
+    fn extract_channel_origin_with_prefix() {
+        let (origin, rest) =
+            extract_channel_origin("[channel: ch_abc] from: alice\n\n@agent do something");
+        assert!(origin.is_some());
+        let o = origin.unwrap();
+        assert_eq!(o.channel, "ch_abc");
+        assert_eq!(o.from, "alice");
+        assert_eq!(rest, "@agent do something");
+    }
+
+    #[test]
+    fn extract_channel_origin_no_prefix() {
+        let (origin, rest) = extract_channel_origin("just a normal message");
+        assert!(origin.is_none());
+        assert_eq!(rest, "just a normal message");
+    }
+
+    #[test]
+    fn dm_channel_origin_shows_tag() {
+        let mut view = MessagesView::new();
+        view.enter_dm("agent-1");
+        view.push_dm(&make_dm(
+            "user",
+            "[channel: ch_123] from: main\n\n@agent-1 fix this bug",
+        ));
+        let lines = view.build_text(80);
+        let header: String = lines[0]
+            .spans
+            .iter()
+            .map(|s| s.content.to_string())
+            .collect();
+        assert!(header.contains("来自"), "header shows channel origin tag");
+        assert!(header.contains("ch_123"), "header contains channel id");
+        assert!(header.contains("main"), "header contains sender name");
+        // Content should NOT contain the [channel:...] prefix
+        let content: String = lines[1..]
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
+            .collect();
+        assert!(
+            !content.contains("[channel:"),
+            "content stripped channel prefix"
+        );
+        assert!(content.contains("fix this bug"), "content preserved");
+    }
+
+    #[test]
+    fn dm_normal_message_no_tag() {
+        let mut view = MessagesView::new();
+        view.enter_dm("agent-1");
+        view.push_dm(&make_dm("user", "hello there"));
+        let lines = view.build_text(80);
+        let header: String = lines[0]
+            .spans
+            .iter()
+            .map(|s| s.content.to_string())
+            .collect();
+        assert!(!header.contains("来自"), "normal DM has no channel tag");
+    }
+
+    #[test]
+    fn streaming_preview_shows_more_than_3_lines() {
+        let mut view = MessagesView::new();
+        view.visible_height = 20;
+        let long_content = (0..10).map(|i| format!("line {}", i)).collect::<Vec<_>>().join("\n");
+        view.streaming.push(("agent".to_string(), long_content));
+        let lines = view.build_text(80);
+        // Should contain all 10 lines (not just last 3)
+        let text: String = lines.iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
+            .collect();
+        assert!(text.contains("line 0"), "should show first line");
+        assert!(text.contains("line 9"), "should show last line");
+    }
+
+    #[test]
+    fn streaming_preview_caps_at_visible_height() {
+        let mut view = MessagesView::new();
+        view.visible_height = 5;
+        let long_content = (0..50).map(|i| format!("line {}", i)).collect::<Vec<_>>().join("\n");
+        view.streaming.push(("agent".to_string(), long_content));
+        let lines = view.build_text(80);
+        let text: String = lines.iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
+            .collect();
+        // Should NOT show line 0 (capped to last visible_height lines)
+        assert!(!text.contains("line 0"), "should cap early lines");
+        assert!(text.contains("line 49"), "should show last line");
+        // Should show "已省略" indicator
+        assert!(text.contains("已省略"), "should show truncation indicator");
     }
 }

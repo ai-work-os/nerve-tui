@@ -9,6 +9,7 @@ use crate::theme;
 
 pub struct InputBox {
     pub text: String,
+    /// Cursor position as character index (not byte index)
     pub cursor_pos: usize,
     // Completion state
     pub completions: Vec<String>,
@@ -29,61 +30,62 @@ impl InputBox {
         }
     }
 
+    /// Convert character index to byte index for String operations.
+    fn byte_index(&self) -> usize {
+        self.text
+            .char_indices()
+            .map(|(i, _)| i)
+            .nth(self.cursor_pos)
+            .unwrap_or(self.text.len())
+    }
+
     pub fn insert(&mut self, c: char) {
-        self.text.insert(self.cursor_pos, c);
-        self.cursor_pos += c.len_utf8();
+        let idx = self.byte_index();
+        self.text.insert(idx, c);
+        self.cursor_pos += 1;
         self.dismiss_popup();
     }
 
     pub fn insert_str(&mut self, s: &str) {
-        self.text.insert_str(self.cursor_pos, s);
-        self.cursor_pos += s.len();
+        let idx = self.byte_index();
+        self.text.insert_str(idx, s);
+        self.cursor_pos += s.chars().count();
         self.dismiss_popup();
     }
 
     pub fn backspace(&mut self) {
         if self.cursor_pos > 0 {
-            // Find prev char boundary
-            let prev = self.text[..self.cursor_pos]
-                .char_indices()
-                .last()
-                .map(|(i, _)| i)
+            self.cursor_pos -= 1;
+            let idx = self.byte_index();
+            let ch_len = self.text[idx..]
+                .chars()
+                .next()
+                .map(|c| c.len_utf8())
                 .unwrap_or(0);
-            self.text.drain(prev..self.cursor_pos);
-            self.cursor_pos = prev;
+            self.text.drain(idx..idx + ch_len);
         }
         self.dismiss_popup();
     }
 
     pub fn delete(&mut self) {
-        if self.cursor_pos < self.text.len() {
-            let next = self.cursor_pos
-                + self.text[self.cursor_pos..]
-                    .chars()
-                    .next()
-                    .map(|c| c.len_utf8())
-                    .unwrap_or(0);
-            self.text.drain(self.cursor_pos..next);
-        }
-    }
-
-    pub fn move_left(&mut self) {
-        if self.cursor_pos > 0 {
-            self.cursor_pos = self.text[..self.cursor_pos]
-                .char_indices()
-                .last()
-                .map(|(i, _)| i)
-                .unwrap_or(0);
-        }
-    }
-
-    pub fn move_right(&mut self) {
-        if self.cursor_pos < self.text.len() {
-            self.cursor_pos += self.text[self.cursor_pos..]
+        let idx = self.byte_index();
+        if idx < self.text.len() {
+            let ch_len = self.text[idx..]
                 .chars()
                 .next()
                 .map(|c| c.len_utf8())
                 .unwrap_or(0);
+            self.text.drain(idx..idx + ch_len);
+        }
+    }
+
+    pub fn move_left(&mut self) {
+        self.cursor_pos = self.cursor_pos.saturating_sub(1);
+    }
+
+    pub fn move_right(&mut self) {
+        if self.cursor_pos < self.text.chars().count() {
+            self.cursor_pos += 1;
         }
     }
 
@@ -92,7 +94,54 @@ impl InputBox {
     }
 
     pub fn move_end(&mut self) {
-        self.cursor_pos = self.text.len();
+        self.cursor_pos = self.text.chars().count();
+    }
+
+    /// Move to start of current line (Ctrl+A)
+    pub fn move_line_start(&mut self) {
+        let byte_idx = self.byte_index();
+        let before = &self.text[..byte_idx];
+        if let Some(nl_pos) = before.rfind('\n') {
+            self.cursor_pos = self.text[..nl_pos + 1].chars().count();
+        } else {
+            self.cursor_pos = 0;
+        }
+    }
+
+    /// Move to end of current line (Ctrl+E)
+    pub fn move_line_end(&mut self) {
+        let byte_idx = self.byte_index();
+        let after = &self.text[byte_idx..];
+        if let Some(nl_pos) = after.find('\n') {
+            self.cursor_pos = self.text[..byte_idx + nl_pos].chars().count();
+        } else {
+            self.cursor_pos = self.text.chars().count();
+        }
+    }
+
+    /// Kill from cursor to end of current line (Ctrl+K)
+    pub fn kill_to_line_end(&mut self) {
+        let byte_idx = self.byte_index();
+        let after = &self.text[byte_idx..];
+        if let Some(nl_pos) = after.find('\n') {
+            self.text.drain(byte_idx..byte_idx + nl_pos);
+        } else {
+            self.text.truncate(byte_idx);
+        }
+    }
+
+    /// Kill from start of current line to cursor (Ctrl+U)
+    pub fn kill_to_line_start(&mut self) {
+        let byte_idx = self.byte_index();
+        let before = &self.text[..byte_idx];
+        let line_start_byte = if let Some(nl_pos) = before.rfind('\n') {
+            nl_pos + 1
+        } else {
+            0
+        };
+        let chars_removed = self.text[line_start_byte..byte_idx].chars().count();
+        self.text.drain(line_start_byte..byte_idx);
+        self.cursor_pos -= chars_removed;
     }
 
     pub fn take(&mut self) -> String {
@@ -155,7 +204,7 @@ impl InputBox {
     }
 
     fn current_word(&self) -> String {
-        let before = &self.text[..self.cursor_pos];
+        let before = &self.text[..self.byte_index()];
         before
             .rsplit(|c: char| c.is_whitespace())
             .next()
@@ -166,10 +215,12 @@ impl InputBox {
     fn apply_candidate(&mut self, idx: usize) {
         if let Some(candidate) = self.candidates.get(idx) {
             let word = self.current_word();
-            let word_start = self.cursor_pos - word.len();
+            let byte_idx = self.byte_index();
+            let word_byte_start = byte_idx - word.len();
+            let word_char_count = word.chars().count();
             self.text
-                .replace_range(word_start..self.cursor_pos, candidate);
-            self.cursor_pos = word_start + candidate.len();
+                .replace_range(word_byte_start..byte_idx, candidate);
+            self.cursor_pos = self.cursor_pos - word_char_count + candidate.chars().count();
         }
     }
 
@@ -195,7 +246,7 @@ impl InputBox {
     fn cursor_visual_position(&self, width: u16) -> (u16, u16) {
         let prompt_w: usize = 2; // "> " or "  "
         let inner_w = width as usize;
-        let text_before = &self.text[..self.cursor_pos];
+        let text_before = &self.text[..self.byte_index()];
 
         let newline_splits: Vec<&str> = text_before.split('\n').collect();
         let lines_before = newline_splits.len() - 1;
@@ -230,7 +281,7 @@ impl InputBox {
 
     pub fn render(&self, area: Rect, buf: &mut Buffer) {
         let block = Block::default()
-            .borders(Borders::TOP)
+            .borders(Borders::ALL)
             .border_style(Style::default().fg(theme::BORDER))
             .title(" Input ")
             .title_style(Style::default().fg(theme::TITLE));
@@ -303,10 +354,10 @@ impl InputBox {
 
     /// Get cursor screen position.
     pub fn cursor_position(&self, area: Rect) -> (u16, u16) {
-        let inner_x = area.x; // no left border (Borders::TOP only)
+        let inner_x = area.x + 1; // left border
         let inner_y = area.y + 1; // top border
-        let inner_width = area.width;
-        let visible_height = area.height.saturating_sub(1);
+        let inner_width = area.width.saturating_sub(2); // left + right borders
+        let visible_height = area.height.saturating_sub(2); // top + bottom borders
         let (col, visual_row) = self.cursor_visual_position(inner_width);
         let scroll_y = self.scroll_offset_for_height(inner_width, visible_height);
         (inner_x + col, inner_y + visual_row.saturating_sub(scroll_y))
@@ -498,12 +549,12 @@ mod tests {
     }
 
     #[test]
-    fn cursor_position_no_left_border() {
+    fn cursor_position_with_border() {
         let input = InputBox::new();
-        let area = Rect::new(0, 0, 80, 3);
+        let area = Rect::new(0, 0, 80, 5);
         let (cx, cy) = input.cursor_position(area);
-        // Empty text: cursor at prompt end (x=0 + 2 prompt = 2), y=1 (top border)
-        assert_eq!(cx, 2);
+        // Empty text: cursor at left border (1) + prompt (2) = 3, y=1 (top border)
+        assert_eq!(cx, 3);
         assert_eq!(cy, 1);
     }
 
@@ -511,10 +562,10 @@ mod tests {
     fn cursor_position_with_text() {
         let mut input = InputBox::new();
         input.insert_str("hello");
-        let area = Rect::new(0, 0, 80, 3);
+        let area = Rect::new(0, 0, 80, 5);
         let (cx, cy) = input.cursor_position(area);
-        // "hello" is 5 chars wide + 2 prompt = col 7
-        assert_eq!(cx, 7);
+        // left border (1) + prompt (2) + "hello" (5) = 8
+        assert_eq!(cx, 8);
         assert_eq!(cy, 1);
     }
 
@@ -522,10 +573,10 @@ mod tests {
     fn cursor_position_with_cjk() {
         let mut input = InputBox::new();
         input.insert_str("你好"); // each CJK char is 2 columns wide
-        let area = Rect::new(0, 0, 80, 3);
+        let area = Rect::new(0, 0, 80, 5);
         let (cx, cy) = input.cursor_position(area);
-        // 2 CJK chars × 2 width + 2 prompt = 6
-        assert_eq!(cx, 6);
+        // left border (1) + prompt (2) + 2 CJK × 2 = 7
+        assert_eq!(cx, 7);
         assert_eq!(cy, 1);
     }
 
@@ -551,10 +602,10 @@ mod tests {
     fn cursor_position_multiline() {
         let mut input = InputBox::new();
         input.insert_str("line1\nab");
-        let area = Rect::new(0, 0, 80, 5);
+        let area = Rect::new(0, 0, 80, 7);
         let (cx, cy) = input.cursor_position(area);
-        // Second line: prompt "  " (2) + "ab" (2) = col 4
-        assert_eq!(cx, 4);
+        // Second line: left border (1) + prompt "  " (2) + "ab" (2) = col 5
+        assert_eq!(cx, 5);
         // First line takes row 1, second line cursor at row 2
         assert_eq!(cy, 2);
     }
@@ -563,10 +614,11 @@ mod tests {
     fn cursor_position_scrolls_with_long_content() {
         let mut input = InputBox::new();
         input.insert_str("line1\nline2\nline3\nline4");
-        let area = Rect::new(0, 0, 20, 3);
+        let area = Rect::new(0, 0, 20, 5);
         let (cx, cy) = input.cursor_position(area);
-        assert_eq!(cx, 7);
-        assert_eq!(cy, 2);
+        // left border (1) + prompt (2) + "line4" (5) = 8, scrolled to fit in 3 content rows
+        assert_eq!(cx, 8);
+        assert_eq!(cy, 3);
     }
 
     #[test]
