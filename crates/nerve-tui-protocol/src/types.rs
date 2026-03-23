@@ -135,6 +135,7 @@ pub enum NerveEvent {
         node_id: String,
         name: String,
         adapter: Option<String>,
+        transport: Option<String>,
     },
     /// Agent process stopped (crash or explicit stop)
     NodeStopped {

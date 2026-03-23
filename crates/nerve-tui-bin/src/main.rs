@@ -3,6 +3,7 @@ use clap::Parser;
 use crossterm::{
     event::{
         DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+        KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
     },
     execute,
     terminal::{
@@ -13,7 +14,24 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 use std::io;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tracing::info;
+
+static KEYBOARD_ENHANCED: AtomicBool = AtomicBool::new(false);
+
+fn restore_terminal() {
+    if KEYBOARD_ENHANCED.load(Ordering::Relaxed) {
+        let _ = execute!(io::stdout(), PopKeyboardEnhancementFlags);
+    }
+    let _ = execute!(
+        io::stdout(),
+        LeaveAlternateScreen,
+        DisableMouseCapture,
+        DisableBracketedPaste
+    );
+    let _ = disable_raw_mode();
+    let _ = execute!(io::stdout(), crossterm::cursor::Show);
+}
 
 use nerve_tui::app::App;
 use nerve_tui_core::NerveClient;
@@ -67,19 +85,32 @@ async fn main() -> Result<()> {
     // Install panic hook to restore terminal on panic
     let default_panic = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        let _ = execute!(
-            io::stdout(),
-            LeaveAlternateScreen,
-            DisableMouseCapture,
-            DisableBracketedPaste
-        );
-        let _ = disable_raw_mode();
-        let _ = execute!(io::stdout(), crossterm::cursor::Show);
+        restore_terminal();
         default_panic(info);
     }));
 
     // Setup terminal
     enable_raw_mode()?;
+
+    // Enable kitty keyboard protocol for Shift+Enter detection (if terminal supports it)
+    if crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false) {
+        let _ = execute!(
+            io::stdout(),
+            PushKeyboardEnhancementFlags(
+                KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                    | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
+            )
+        );
+        KEYBOARD_ENHANCED.store(true, Ordering::Relaxed);
+    }
+
+    // Handle SIGINT (e.g. external kill -2) to restore terminal before exit
+    tokio::spawn(async {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            restore_terminal();
+            std::process::exit(130); // 128 + SIGINT(2)
+        }
+    });
 
     // Run setup + app inside closure so ? won't skip cleanup
     let result = async {
@@ -100,14 +131,7 @@ async fn main() -> Result<()> {
     .await;
 
     // Restore terminal (always runs, even if setup/init/run failed)
-    let _ = execute!(
-        io::stdout(),
-        LeaveAlternateScreen,
-        DisableMouseCapture,
-        DisableBracketedPaste
-    );
-    let _ = disable_raw_mode();
-    let _ = execute!(io::stdout(), crossterm::cursor::Show);
+    restore_terminal();
 
     result
 }

@@ -306,26 +306,34 @@ impl App {
                 }
             }
 
-            // Unified navigation list
+            // Ctrl+N/P: navigate popup candidates when visible, otherwise sidebar
             KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.status_bar
-                    .select_next_item(&self.channels, &self.agents);
+                if self.input.is_popup_visible() {
+                    self.input.select_next();
+                } else {
+                    self.status_bar
+                        .select_next_item(&self.channels, &self.agents);
+                }
             }
             KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.status_bar
-                    .select_prev_item(&self.channels, &self.agents);
+                if self.input.is_popup_visible() {
+                    self.input.select_prev();
+                } else {
+                    self.status_bar
+                        .select_prev_item(&self.channels, &self.agents);
+                }
             }
 
-            // Esc: exit DM or dismiss popup
+            // Esc: dismiss popup first, then exit DM
             KeyCode::Esc => {
-                if self.active_dm.is_some() {
+                if self.input.is_popup_visible() {
+                    self.input.dismiss_popup();
+                } else if self.active_dm.is_some() {
                     if self.active_dm.as_ref().is_some_and(|dm| dm.is_responding) {
                         self.cancel_active_dm().await;
                     } else {
                         self.exit_dm().await;
                     }
-                } else {
-                    self.input.dismiss_popup();
                 }
             }
 
@@ -953,12 +961,19 @@ impl App {
                 }
             }
 
-            NerveEvent::NodeRegistered { ref name, .. } => {
-                if self.active_dm.is_none() {
-                    self.messages
-                        .push_system(&format!("{} 已注册", name));
+            NerveEvent::NodeRegistered {
+                ref name,
+                ref transport,
+                ..
+            } => {
+                let is_agent = transport.as_deref() == Some("stdio");
+                if is_agent {
+                    if self.active_dm.is_none() {
+                        self.messages
+                            .push_system(&format!("{} 已注册", name));
+                    }
+                    self.refresh_agents().await;
                 }
-                self.refresh_agents().await;
             }
 
             NerveEvent::NodeStopped { node_id, name } => {

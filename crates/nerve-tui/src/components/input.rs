@@ -3,7 +3,7 @@ use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph, Widget, Wrap};
-use unicode_width::UnicodeWidthStr;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::theme;
 
@@ -43,14 +43,14 @@ impl InputBox {
         let idx = self.byte_index();
         self.text.insert(idx, c);
         self.cursor_pos += 1;
-        self.dismiss_popup();
+        self.auto_complete();
     }
 
     pub fn insert_str(&mut self, s: &str) {
         let idx = self.byte_index();
         self.text.insert_str(idx, s);
         self.cursor_pos += s.chars().count();
-        self.dismiss_popup();
+        self.auto_complete();
     }
 
     pub fn backspace(&mut self) {
@@ -64,7 +64,7 @@ impl InputBox {
                 .unwrap_or(0);
             self.text.drain(idx..idx + ch_len);
         }
-        self.dismiss_popup();
+        self.auto_complete();
     }
 
     pub fn delete(&mut self) {
@@ -154,43 +154,88 @@ impl InputBox {
         self.text.is_empty()
     }
 
+    /// Confirm the current (or first) candidate: apply, append space, close popup.
     pub fn tab(&mut self) {
+        if self.popup_visible && !self.candidates.is_empty() {
+            let idx = self.selected.unwrap_or(0);
+            self.apply_candidate(idx);
+            // Append trailing space for ergonomics
+            let byte_idx = self.byte_index();
+            if byte_idx >= self.text.len()
+                || !self.text[byte_idx..].starts_with(' ')
+            {
+                self.text.insert(byte_idx, ' ');
+                self.cursor_pos += 1;
+            }
+            self.dismiss_popup();
+        } else {
+            // No popup: build candidates and confirm immediately
+            self.build_candidates();
+            if !self.candidates.is_empty() {
+                self.apply_candidate(0);
+                let byte_idx = self.byte_index();
+                if byte_idx >= self.text.len()
+                    || !self.text[byte_idx..].starts_with(' ')
+                {
+                    self.text.insert(byte_idx, ' ');
+                    self.cursor_pos += 1;
+                }
+            }
+            self.dismiss_popup();
+        }
+    }
+
+    /// Move selection down in the popup (no confirm).
+    pub fn select_next(&mut self) {
         if self.popup_visible && !self.candidates.is_empty() {
             let next = match self.selected {
                 Some(i) => (i + 1) % self.candidates.len(),
                 None => 0,
             };
             self.selected = Some(next);
-            self.apply_candidate(next);
-        } else {
-            self.build_candidates();
-            if self.candidates.len() == 1 {
-                self.selected = Some(0);
-                self.apply_candidate(0);
-                self.dismiss_popup();
-            } else if !self.candidates.is_empty() {
-                self.popup_visible = true;
-                self.selected = Some(0);
-                self.apply_candidate(0);
-            }
         }
     }
 
-    pub fn shift_tab(&mut self) {
+    /// Move selection up in the popup (no confirm).
+    pub fn select_prev(&mut self) {
         if self.popup_visible && !self.candidates.is_empty() {
             let prev = match self.selected {
                 Some(0) | None => self.candidates.len() - 1,
                 Some(i) => i - 1,
             };
             self.selected = Some(prev);
-            self.apply_candidate(prev);
         }
+    }
+
+    /// Shift+Tab: move selection up (alias for select_prev).
+    pub fn shift_tab(&mut self) {
+        self.select_prev();
+    }
+
+    pub fn is_popup_visible(&self) -> bool {
+        self.popup_visible
     }
 
     pub fn dismiss_popup(&mut self) {
         self.popup_visible = false;
         self.candidates.clear();
         self.selected = None;
+    }
+
+    /// Auto-show completion popup when typing `/` or `@` prefixed words.
+    fn auto_complete(&mut self) {
+        let word = self.current_word();
+        if word.starts_with('/') || word.starts_with('@') {
+            self.build_candidates();
+            if self.candidates.is_empty() {
+                self.dismiss_popup();
+            } else {
+                self.popup_visible = true;
+                self.selected = None;
+            }
+        } else {
+            self.dismiss_popup();
+        }
     }
 
     fn build_candidates(&mut self) {
@@ -229,16 +274,27 @@ impl InputBox {
         if width <= 2 {
             return 1;
         }
-        let w = width as usize; // inner width
+        let w = width as usize;
+        let prompt_w: usize = 2;
         let text_lines: Vec<&str> = if self.text.contains('\n') {
             self.text.split('\n').collect()
         } else {
             vec![&self.text]
         };
         let mut total: usize = 0;
-        for (_i, line) in text_lines.iter().enumerate() {
-            let line_w = 2 + UnicodeWidthStr::width(*line); // prompt "> " or "  "
-            total += (line_w.saturating_sub(1) / w + 1).max(1);
+        for line in text_lines.iter() {
+            let mut col = prompt_w;
+            let mut rows = 1usize;
+            for ch in line.chars() {
+                let cw = UnicodeWidthChar::width(ch).unwrap_or(0);
+                if col + cw > w {
+                    rows += 1;
+                    col = cw;
+                } else {
+                    col += cw;
+                }
+            }
+            total += rows;
         }
         total.max(1) as u16
     }
@@ -246,28 +302,34 @@ impl InputBox {
     fn cursor_visual_position(&self, width: u16) -> (u16, u16) {
         let prompt_w: usize = 2; // "> " or "  "
         let inner_w = width as usize;
+        if inner_w == 0 {
+            return (0, 0);
+        }
         let text_before = &self.text[..self.byte_index()];
 
-        let newline_splits: Vec<&str> = text_before.split('\n').collect();
-        let lines_before = newline_splits.len() - 1;
-        let last_line = newline_splits.last().unwrap_or(&"");
-        let col_w = prompt_w + UnicodeWidthStr::width(*last_line);
-
         let mut visual_row: usize = 0;
+        let mut col: usize = 0;
+
         for (i, line) in text_before.split('\n').enumerate() {
-            let line_w = prompt_w + UnicodeWidthStr::width(line);
-            if i < lines_before {
-                visual_row += if inner_w > 0 {
-                    (line_w.saturating_sub(1) / inner_w + 1).max(1)
+            if i > 0 {
+                // Newline: move to next row
+                visual_row += 1;
+            }
+            // Each line starts with prompt (2 cols)
+            col = prompt_w;
+            // Walk characters, wrapping when a char doesn't fit
+            for ch in line.chars() {
+                let cw = UnicodeWidthChar::width(ch).unwrap_or(0);
+                if col + cw > inner_w {
+                    // Char doesn't fit on current line, wrap
+                    visual_row += 1;
+                    col = cw;
                 } else {
-                    1
-                };
-            } else if inner_w > 0 && col_w >= inner_w {
-                visual_row += col_w / inner_w;
+                    col += cw;
+                }
             }
         }
 
-        let col = if inner_w > 0 { col_w % inner_w } else { col_w };
         (col as u16, visual_row as u16)
     }
 
@@ -483,19 +545,19 @@ mod tests {
         input.completions = vec!["/create".into(), "/help".into(), "/list".into()];
         input.insert_str("/cr");
         input.tab();
-        assert_eq!(input.text, "/create");
+        assert_eq!(input.text, "/create "); // Tab confirms with trailing space
     }
 
     #[test]
-    fn tab_completion_multiple_matches_cycles() {
+    fn tab_completion_multiple_matches_confirms_first() {
         let mut input = InputBox::new();
         input.completions = vec!["/create".into(), "/cancel".into(), "/close".into()];
         input.insert_str("/c");
-        input.tab(); // Opens popup, selects first
-        let first = input.text.clone();
-        input.tab(); // Cycle to second
-        let second = input.text.clone();
-        assert_ne!(first, second);
+        // auto_complete already showed popup
+        assert!(input.is_popup_visible());
+        input.tab(); // Confirms first candidate and closes popup
+        assert!(input.text.starts_with("/c")); // Applied a candidate
+        assert!(!input.is_popup_visible()); // Popup closed
     }
 
     #[test]
@@ -508,15 +570,29 @@ mod tests {
     }
 
     #[test]
-    fn shift_tab_cycles_backward() {
+    fn shift_tab_navigates_selection() {
         let mut input = InputBox::new();
         input.completions = vec!["@alice".into(), "@bob".into(), "@charlie".into()];
         input.insert_str("@");
-        input.tab(); // first match
-        let first = input.text.clone();
-        input.shift_tab(); // wraps to last
-        let last = input.text.clone();
-        assert_ne!(first, last);
+        // auto_complete opens popup with no selection
+        assert!(input.is_popup_visible());
+        input.shift_tab(); // wraps to last candidate
+        // shift_tab only navigates, doesn't apply
+        assert_eq!(input.text, "@"); // text unchanged
+        assert!(input.is_popup_visible()); // popup still open
+    }
+
+    #[test]
+    fn ctrl_n_p_navigates_then_tab_confirms() {
+        let mut input = InputBox::new();
+        input.completions = vec!["@alice".into(), "@bob".into(), "@charlie".into()];
+        input.insert_str("@");
+        // auto_complete opens popup
+        input.select_next(); // select @alice (idx 0)
+        input.select_next(); // select @bob (idx 1)
+        input.tab(); // confirm @bob
+        assert_eq!(input.text, "@bob ");
+        assert!(!input.is_popup_visible());
     }
 
     #[test]

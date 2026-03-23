@@ -404,10 +404,15 @@ fn parse_notification(method: &str, params: Value) -> Option<NerveEvent> {
                 .get("adapter")
                 .and_then(|v| v.as_str())
                 .map(String::from);
+            let transport = params
+                .get("transport")
+                .and_then(|v| v.as_str())
+                .map(String::from);
             Some(NerveEvent::NodeRegistered {
                 node_id,
                 name,
                 adapter,
+                transport,
             })
         }
         "node.stopped" => {
