@@ -6,7 +6,7 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph, Widget, Wrap};
+use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Widget, Wrap};
 use unicode_width::UnicodeWidthStr;
 
 struct MessageLine {
@@ -88,6 +88,16 @@ impl MessagesView {
         self.auto_scroll = false;
     }
 
+    pub fn page_up(&mut self) {
+        let page = self.visible_height.max(1);
+        self.scroll_up(page);
+    }
+
+    pub fn page_down(&mut self) {
+        let page = self.visible_height.max(1);
+        self.scroll_down(page);
+    }
+
     pub fn snap_to_bottom(&mut self) {
         self.auto_scroll = true;
         self.has_new_messages = false;
@@ -147,9 +157,10 @@ impl MessagesView {
 
         let block = Block::default()
             .borders(Borders::LEFT)
+            .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(theme::BORDER))
             .title(title)
-            .title_style(Style::default().fg(theme::TITLE));
+            .title_style(Style::default().fg(theme::BORDER));
 
         let inner = block.inner(area);
         self.visible_height = inner.height;

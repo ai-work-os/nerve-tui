@@ -2,7 +2,7 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph, Widget};
+use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Widget};
 
 use crate::theme;
 
@@ -130,6 +130,7 @@ impl StatusBar {
     ) {
         let block = Block::default()
             .borders(Borders::RIGHT)
+            .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(theme::BORDER));
 
         let inner = block.inner(area);

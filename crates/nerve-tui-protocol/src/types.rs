@@ -130,6 +130,12 @@ pub enum NerveEvent {
         channel_id: String,
         name: Option<String>,
     },
+    /// A new node was registered (spawned or connected)
+    NodeRegistered {
+        node_id: String,
+        name: String,
+        adapter: Option<String>,
+    },
     /// Agent process stopped (crash or explicit stop)
     NodeStopped {
         node_id: String,
@@ -150,6 +156,7 @@ impl NerveEvent {
             NerveEvent::NodeStatusChanged { .. } => "NodeStatusChanged",
             NerveEvent::ChannelCreated { .. } => "ChannelCreated",
             NerveEvent::ChannelClosed { .. } => "ChannelClosed",
+            NerveEvent::NodeRegistered { .. } => "NodeRegistered",
             NerveEvent::NodeStopped { .. } => "NodeStopped",
             NerveEvent::Disconnected => "Disconnected",
         }

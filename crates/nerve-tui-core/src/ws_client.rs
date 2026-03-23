@@ -397,6 +397,19 @@ fn parse_notification(method: &str, params: Value) -> Option<NerveEvent> {
                 activity,
             })
         }
+        "node.registered" => {
+            let node_id = params.get("nodeId")?.as_str()?.to_string();
+            let name = params.get("name")?.as_str()?.to_string();
+            let adapter = params
+                .get("adapter")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            Some(NerveEvent::NodeRegistered {
+                node_id,
+                name,
+                adapter,
+            })
+        }
         "node.stopped" => {
             let node_id = params.get("nodeId")?.as_str()?.to_string();
             let name = params.get("name")?.as_str()?.to_string();

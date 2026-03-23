@@ -253,8 +253,8 @@ impl App {
             KeyCode::BackTab => self.input.shift_tab(),
 
             // Scroll messages
-            KeyCode::PageUp => self.messages.scroll_up(20),
-            KeyCode::PageDown => self.messages.scroll_down(20),
+            KeyCode::PageUp => self.messages.page_up(),
+            KeyCode::PageDown => self.messages.page_down(),
             KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.messages.scroll_down(1);
             }
@@ -951,6 +951,14 @@ impl App {
                     }
                     self.sync_navigation_selection();
                 }
+            }
+
+            NerveEvent::NodeRegistered { ref name, .. } => {
+                if self.active_dm.is_none() {
+                    self.messages
+                        .push_system(&format!("{} 已注册", name));
+                }
+                self.refresh_agents().await;
             }
 
             NerveEvent::NodeStopped { node_id, name } => {

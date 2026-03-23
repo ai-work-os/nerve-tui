@@ -2,7 +2,7 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph, Widget, Wrap};
+use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph, Widget, Wrap};
 use unicode_width::UnicodeWidthStr;
 
 use crate::theme;
@@ -282,9 +282,10 @@ impl InputBox {
     pub fn render(&self, area: Rect, buf: &mut Buffer) {
         let block = Block::default()
             .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(theme::BORDER))
             .title(" Input ")
-            .title_style(Style::default().fg(theme::TITLE));
+            .title_style(Style::default().fg(theme::BORDER));
 
         let inner = block.inner(area);
         block.render(area, buf);
