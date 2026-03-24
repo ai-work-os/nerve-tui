@@ -12,7 +12,7 @@ use crossterm::{
 };
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
-use std::io;
+use std::io::{self, Write as _};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tracing::info;
@@ -20,17 +20,19 @@ use tracing::info;
 static KEYBOARD_ENHANCED: AtomicBool = AtomicBool::new(false);
 
 fn restore_terminal() {
+    let mut stdout = io::stdout();
     if KEYBOARD_ENHANCED.load(Ordering::Relaxed) {
-        let _ = execute!(io::stdout(), PopKeyboardEnhancementFlags);
+        let _ = execute!(stdout, PopKeyboardEnhancementFlags);
     }
     let _ = execute!(
-        io::stdout(),
+        stdout,
         LeaveAlternateScreen,
         DisableMouseCapture,
         DisableBracketedPaste
     );
     let _ = disable_raw_mode();
-    let _ = execute!(io::stdout(), crossterm::cursor::Show);
+    let _ = execute!(stdout, crossterm::cursor::Show);
+    let _ = stdout.flush();
 }
 
 use nerve_tui::app::App;
@@ -117,15 +119,16 @@ async fn main() -> Result<()> {
     let is_kitty = std::env::var("TERM").map_or(false, |t| t.contains("kitty"))
         || std::env::var("KITTY_WINDOW_ID").is_ok();
     if is_kitty || crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false) {
-        let _ = execute!(
+        if execute!(
             io::stdout(),
             PushKeyboardEnhancementFlags(
                 KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
-                    | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
-                    | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES
             )
-        );
-        KEYBOARD_ENHANCED.store(true, Ordering::Relaxed);
+        )
+        .is_ok()
+        {
+            KEYBOARD_ENHANCED.store(true, Ordering::Relaxed);
+        }
     }
 
     // Handle SIGINT (e.g. external kill -2) to restore terminal before exit

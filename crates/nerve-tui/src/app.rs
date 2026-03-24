@@ -153,7 +153,7 @@ impl App {
         terminal: &mut ratatui::Terminal<impl ratatui::backend::Backend>,
     ) -> Result<()> {
         let mut event_stream = crossterm::event::EventStream::new();
-        let mut redraw_interval = tokio::time::interval(tokio::time::Duration::from_millis(100));
+        let mut redraw_interval = tokio::time::interval(tokio::time::Duration::from_millis(33));
 
         loop {
             terminal.draw(|frame| self.render(frame))?;
@@ -307,6 +307,22 @@ impl App {
                         SplitFocus::Dm => SplitFocus::Channel,
                         SplitFocus::Channel => SplitFocus::Dm,
                     };
+                }
+            }
+
+            // Scroll messages: Up/Down arrow keys (nvim-friendly, no modifier needed)
+            KeyCode::Up if key.modifiers.is_empty() => {
+                if self.split_view && self.split_focus == SplitFocus::Channel {
+                    self.channel_panel_state.scroll_up(1);
+                } else {
+                    self.messages.scroll_up(1);
+                }
+            }
+            KeyCode::Down if key.modifiers.is_empty() => {
+                if self.split_view && self.split_focus == SplitFocus::Channel {
+                    self.channel_panel_state.scroll_down(1);
+                } else {
+                    self.messages.scroll_down(1);
                 }
             }
 
@@ -975,6 +991,8 @@ impl App {
                 self.messages
                     .push_system("  /compact              压缩 DM 上下文");
                 self.messages
+                    .push_system("  /split                切换分屏(DM+频道)");
+                self.messages
                     .push_system("  /dm <name>            与 agent 1v1 对话");
                 self.messages
                     .push_system("  /back                 退出 DM 回频道");
@@ -993,6 +1011,24 @@ impl App {
                 self.messages.push_system("  Ctrl+Q      退出");
             }
 
+            "/split" => {
+                if self.active_dm.is_some() {
+                    if self.active_channel.is_some() {
+                        self.split_view = !self.split_view;
+                        if self.split_view {
+                            self.split_focus = SplitFocus::Dm;
+                            self.channel_panel_state.snap_to_bottom();
+                        } else {
+                            self.split_focus = SplitFocus::Dm;
+                        }
+                    } else {
+                        self.push_contextual_system("需要先加入频道才能分屏");
+                    }
+                } else {
+                    self.push_contextual_system("需要先进入 DM 才能分屏");
+                }
+            }
+
             "/quit" | "/q" => {
                 self.should_quit = true;
             }
@@ -1008,10 +1044,8 @@ impl App {
 
         match event {
             NerveEvent::ChannelMessage { message, .. } => {
-                if self.active_dm.is_none() {
-                    let is_agent = self.agents.iter().any(|a| a.name == message.from);
-                    self.messages.push(&message, is_agent);
-                }
+                let is_agent = self.agents.iter().any(|a| a.name == message.from);
+                self.messages.push(&message, is_agent);
             }
 
             NerveEvent::ChannelMention { message, .. } => {
@@ -1494,6 +1528,7 @@ impl App {
             "/restore".into(),
             "/clear".into(),
             "/compact".into(),
+            "/split".into(),
             "/quit".into(),
         ];
         for agent in &self.agents {
