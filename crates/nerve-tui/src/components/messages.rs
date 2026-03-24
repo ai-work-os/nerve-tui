@@ -397,6 +397,11 @@ impl MessagesView {
             }
         }
 
+        // Trailing padding so the last message isn't clipped at the panel edge
+        if !out.is_empty() {
+            out.push(Line::from(""));
+        }
+
         out
     }
 }

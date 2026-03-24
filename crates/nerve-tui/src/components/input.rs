@@ -428,6 +428,12 @@ impl InputBox {
         }
 
         let scroll_y = self.scroll_offset_for_height(inner.width, inner.height);
+        if lines.len() > 3 {
+            tracing::info!(
+                "INPUT_RENDER: lines={} inner_h={} inner_w={} scroll_y={} text_len={}",
+                lines.len(), inner.height, inner.width, scroll_y, self.text.len()
+            );
+        }
         Paragraph::new(lines)
             .scroll((scroll_y, 0))
             .wrap(Wrap { trim: false })

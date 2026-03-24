@@ -3,6 +3,8 @@ use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers, MouseEvent, Mouse
 use futures_util::StreamExt;
 use nerve_tui_core::NerveClient;
 use nerve_tui_protocol::*;
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::Span;
 use ratatui::Frame;
 use serde_json::Value;
 use std::collections::HashSet;
@@ -241,6 +243,18 @@ impl App {
         // Input
         self.input.render(layout.input, frame.buffer_mut());
         self.input.render_popup(layout.input, frame.buffer_mut());
+
+        // DM status indicator on input box border
+        if let Some(ref dm) = self.active_dm {
+            let status = if dm.is_responding {
+                Span::styled(" 回复中... ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
+            } else {
+                Span::styled(" 就绪 ", Style::default().fg(Color::Green))
+            };
+            let x = layout.input.right().saturating_sub(status.width() as u16 + 2);
+            let y = layout.input.y;
+            frame.buffer_mut().set_span(x, y, &status, status.width() as u16);
+        }
 
         // Cursor
         let (cx, cy) = self.input.cursor_position(layout.input);
@@ -545,6 +559,12 @@ impl App {
                 dm.node_name,
                 &text[..text.len().min(50)]
             );
+
+            // Flush any remaining streaming content before adding user message,
+            // so user message appears after the agent's reply, not before streaming tail.
+            let node_id_ref = dm.node_id.clone();
+            let node_name_ref = dm.node_name.clone();
+            self.flush_streaming_as_dm(&node_id_ref, &node_name_ref);
 
             // Add user message locally immediately
             let user_msg = DmMessage {

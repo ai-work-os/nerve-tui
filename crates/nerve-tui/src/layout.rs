@@ -33,7 +33,7 @@ impl AppLayout {
         split_view: bool,
     ) -> Self {
         let sidebar_width: u16 = if sidebar_visible { 20 } else { 0 };
-        let max_input_height = 7.min(area.height / 3); // 5 content lines + 2 borders
+        let max_input_height = 12.min(area.height / 3); // 10 content lines + 2 borders
         let input_height = input_lines.clamp(3, max_input_height.max(3));
 
         // Split horizontally: sidebar | main
@@ -90,10 +90,10 @@ mod tests {
     }
 
     #[test]
-    fn input_height_is_capped_to_seven_rows() {
+    fn input_height_is_capped_to_ten_rows() {
         let area = Rect::new(0, 0, 120, 30);
         let layout = AppLayout::new(area, 20);
-        assert_eq!(layout.input.height, 7); // 5 content + 2 borders
+        assert_eq!(layout.input.height, 10); // area.height/3 = 10
     }
 
     #[test]
