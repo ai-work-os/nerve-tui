@@ -52,6 +52,8 @@ pub struct App {
     split_view: bool,
     split_focus: SplitFocus,
     channel_panel_state: ChannelPanelState,
+    /// Cached x-coordinate where the channel panel starts (for mouse hit-testing in split view).
+    last_channel_panel_x: Option<u16>,
 }
 
 impl App {
@@ -95,6 +97,7 @@ impl App {
             split_view: false,
             split_focus: SplitFocus::Dm,
             channel_panel_state: ChannelPanelState::new(),
+            last_channel_panel_x: None,
         }
     }
 
@@ -212,6 +215,7 @@ impl App {
         self.messages.render(layout.messages, frame.buffer_mut());
 
         // Channel panel (right side of split view)
+        self.last_channel_panel_x = layout.channel_panel.map(|r| r.x);
         if let Some(panel_area) = layout.channel_panel {
             let channel_name = self
                 .channels
@@ -310,16 +314,20 @@ impl App {
                 }
             }
 
-            // Scroll messages: Up/Down arrow keys (nvim-friendly, no modifier needed)
+            // Up/Down: navigate within multi-line input, or scroll messages
             KeyCode::Up if key.modifiers.is_empty() => {
-                if self.split_view && self.split_focus == SplitFocus::Channel {
+                if self.input.is_multiline() && self.input.move_up() {
+                    // Moved cursor up within input
+                } else if self.split_view && self.split_focus == SplitFocus::Channel {
                     self.channel_panel_state.scroll_up(1);
                 } else {
                     self.messages.scroll_up(1);
                 }
             }
             KeyCode::Down if key.modifiers.is_empty() => {
-                if self.split_view && self.split_focus == SplitFocus::Channel {
+                if self.input.is_multiline() && self.input.move_down() {
+                    // Moved cursor down within input
+                } else if self.split_view && self.split_focus == SplitFocus::Channel {
                     self.channel_panel_state.scroll_down(1);
                 } else {
                     self.messages.scroll_down(1);
@@ -448,14 +456,14 @@ impl App {
     fn handle_mouse(&mut self, mouse: MouseEvent) {
         match mouse.kind {
             MouseEventKind::ScrollUp => {
-                if self.split_view && self.split_focus == SplitFocus::Channel {
+                if self.split_view && self.is_mouse_in_channel_panel(mouse.column) {
                     self.channel_panel_state.scroll_up(3);
                 } else {
                     self.messages.scroll_up(3);
                 }
             }
             MouseEventKind::ScrollDown => {
-                if self.split_view && self.split_focus == SplitFocus::Channel {
+                if self.split_view && self.is_mouse_in_channel_panel(mouse.column) {
                     self.channel_panel_state.scroll_down(3);
                 } else {
                     self.messages.scroll_down(3);
@@ -463,6 +471,12 @@ impl App {
             }
             _ => {}
         }
+    }
+
+    /// Check if mouse column falls within the channel panel (right half of split view).
+    fn is_mouse_in_channel_panel(&self, column: u16) -> bool {
+        self.last_channel_panel_x
+            .is_some_and(|panel_x| column >= panel_x)
     }
 
     fn sync_navigation_selection(&mut self) {

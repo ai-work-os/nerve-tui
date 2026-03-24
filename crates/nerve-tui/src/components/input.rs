@@ -108,6 +108,61 @@ impl InputBox {
         }
     }
 
+    /// Move cursor up one line, preserving column position.
+    pub fn move_up(&mut self) -> bool {
+        let byte_idx = self.byte_index();
+        let before = &self.text[..byte_idx];
+        // Find start of current line
+        let cur_line_start = before.rfind('\n').map(|p| p + 1).unwrap_or(0);
+        if cur_line_start == 0 {
+            return false; // already on first line
+        }
+        // Column offset (in chars) within current line
+        let col = self.text[cur_line_start..byte_idx].chars().count();
+        // Find start of previous line
+        let prev_line_start = self.text[..cur_line_start - 1]
+            .rfind('\n')
+            .map(|p| p + 1)
+            .unwrap_or(0);
+        let prev_line_end = cur_line_start - 1; // position of '\n'
+        let prev_line_len = self.text[prev_line_start..prev_line_end].chars().count();
+        let target_col = col.min(prev_line_len);
+        self.cursor_pos = self.text[..prev_line_start].chars().count() + target_col;
+        true
+    }
+
+    /// Move cursor down one line, preserving column position.
+    pub fn move_down(&mut self) -> bool {
+        let byte_idx = self.byte_index();
+        let before = &self.text[..byte_idx];
+        // Find start of current line
+        let cur_line_start = before.rfind('\n').map(|p| p + 1).unwrap_or(0);
+        // Column offset within current line
+        let col = self.text[cur_line_start..byte_idx].chars().count();
+        // Find end of current line (position of next '\n')
+        let after = &self.text[byte_idx..];
+        let next_nl = after.find('\n');
+        if next_nl.is_none() {
+            return false; // already on last line
+        }
+        let next_line_start_byte = byte_idx + next_nl.unwrap() + 1;
+        let next_line_end_byte = self.text[next_line_start_byte..]
+            .find('\n')
+            .map(|p| next_line_start_byte + p)
+            .unwrap_or(self.text.len());
+        let next_line_len = self.text[next_line_start_byte..next_line_end_byte]
+            .chars()
+            .count();
+        let target_col = col.min(next_line_len);
+        self.cursor_pos = self.text[..next_line_start_byte].chars().count() + target_col;
+        true
+    }
+
+    /// Returns true if the text contains multiple lines.
+    pub fn is_multiline(&self) -> bool {
+        self.text.contains('\n')
+    }
+
     /// Move to end of current line (Ctrl+E)
     pub fn move_line_end(&mut self) {
         let byte_idx = self.byte_index();
