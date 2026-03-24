@@ -1082,9 +1082,22 @@ impl App {
         debug!("nerve event: {}", event.kind());
 
         match event {
-            NerveEvent::ChannelMessage { message, .. } => {
-                let is_agent = self.agents.iter().any(|a| a.name == message.from);
-                self.messages.push(&message, is_agent);
+            NerveEvent::ChannelMessage {
+                channel_id,
+                message,
+            } => {
+                let is_active = self.active_channel.as_deref() == Some(&channel_id);
+                if is_active {
+                    let is_agent = self.agents.iter().any(|a| a.name == message.from);
+                    self.messages.push(&message, is_agent);
+                } else {
+                    // Cache message for non-active channel + bump unread
+                    self.messages.push_to_channel(&channel_id, &message);
+                    // Update sidebar unread badge
+                    if let Some(ch) = self.channels.iter_mut().find(|c| c.id == channel_id) {
+                        ch.unread = self.messages.unread_count(&channel_id);
+                    }
+                }
             }
 
             NerveEvent::ChannelMention { message, .. } => {
@@ -1507,23 +1520,37 @@ impl App {
     }
 
     async fn join_channel(&mut self, channel_id: &str) {
+        // Save current channel messages to cache before switching
+        if let Some(ref old_id) = self.active_channel.clone() {
+            if old_id != channel_id {
+                self.messages.save_channel(old_id);
+            }
+        }
+
         match self.client.channel_join(channel_id).await {
             Ok(_) => {
                 self.active_channel = Some(channel_id.to_string());
-                self.messages.clear();
-                self.messages
-                    .push_system(&format!("已加入频道: {}", channel_id));
                 self.sync_navigation_selection();
 
-                // Load history
-                match self.client.channel_history(channel_id, Some(50)).await {
-                    Ok(msgs) => {
-                        for msg in &msgs {
-                            let is_agent = self.agents.iter().any(|a| a.name == msg.from);
-                            self.messages.push(msg, is_agent);
+                // Try to load from cache first
+                if self.messages.load_channel(channel_id) {
+                    self.messages
+                        .push_system(&format!("已切换频道: {}", channel_id));
+                } else {
+                    // No cache — fetch from server
+                    self.messages.clear();
+                    self.messages
+                        .push_system(&format!("已加入频道: {}", channel_id));
+                    match self.client.channel_history(channel_id, Some(50)).await {
+                        Ok(msgs) => {
+                            for msg in &msgs {
+                                let is_agent =
+                                    self.agents.iter().any(|a| a.name == msg.from);
+                                self.messages.push(msg, is_agent);
+                            }
                         }
+                        Err(e) => warn!("load history failed: {}", e),
                     }
-                    Err(e) => warn!("load history failed: {}", e),
                 }
 
                 // Refresh agents for this channel
@@ -1548,11 +1575,13 @@ impl App {
                                 node_id: node_id.clone(),
                             })
                             .collect();
+                        let unread = self.messages.unread_count(&ch.id);
                         ChannelDisplay {
                             id: ch.id,
                             name: ch.name,
                             node_count: ch.nodes.len(),
                             members,
+                            unread,
                         }
                     })
                     .collect();
@@ -1730,12 +1759,14 @@ mod tests {
                 name: Some("main".into()),
                 node_count: 2,
                 members: Vec::new(),
+                unread: 0,
             },
             ChannelDisplay {
                 id: "ch2".into(),
                 name: Some("ops".into()),
                 node_count: 1,
                 members: Vec::new(),
+                unread: 0,
             },
         ];
         app.agents = vec![AgentDisplay {
@@ -1760,6 +1791,7 @@ mod tests {
             name: Some("main".into()),
             node_count: 2,
             members: Vec::new(),
+            unread: 0,
         }];
         app.agents = vec![
             AgentDisplay {
@@ -1800,12 +1832,14 @@ mod tests {
                 name: Some("main".into()),
                 node_count: 2,
                 members: Vec::new(),
+                unread: 0,
             },
             ChannelDisplay {
                 id: "ch2".into(),
                 name: Some("ops".into()),
                 node_count: 1,
                 members: Vec::new(),
+                unread: 0,
             },
         ];
         app.active_channel = Some("ch1".into());
@@ -1830,12 +1864,14 @@ mod tests {
                 name: Some("main".into()),
                 node_count: 2,
                 members: Vec::new(),
+                unread: 0,
             },
             ChannelDisplay {
                 id: "ch2".into(),
                 name: Some("ops".into()),
                 node_count: 1,
                 members: Vec::new(),
+                unread: 0,
             },
         ];
         app.active_channel = Some("ch1".into());

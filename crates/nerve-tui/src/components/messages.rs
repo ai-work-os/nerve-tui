@@ -9,6 +9,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Widget, Wrap};
 use serde_json::Value;
 use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
+use std::collections::HashMap;
 use unicode_width::UnicodeWidthStr;
 
 struct MessageLine {
@@ -36,6 +37,10 @@ pub struct MessagesView {
     dm_lines: Vec<MessageLine>,
     /// True when new messages arrived while user is scrolled up
     has_new_messages: bool,
+    /// Channel message cache: channel_id -> messages
+    channel_cache: HashMap<String, Vec<MessageLine>>,
+    /// Unread count per channel
+    channel_unread: HashMap<String, usize>,
 }
 
 impl MessagesView {
@@ -50,6 +55,8 @@ impl MessagesView {
             dm_view: None,
             dm_lines: Vec::new(),
             has_new_messages: false,
+            channel_cache: HashMap::new(),
+            channel_unread: HashMap::new(),
         }
     }
 
@@ -77,6 +84,54 @@ impl MessagesView {
         } else {
             self.has_new_messages = true;
         }
+    }
+
+    // --- Channel cache ---
+
+    /// Save current channel messages to cache.
+    pub fn save_channel(&mut self, channel_id: &str) {
+        if !self.lines.is_empty() {
+            self.channel_cache
+                .insert(channel_id.to_string(), std::mem::take(&mut self.lines));
+        }
+    }
+
+    /// Load channel messages from cache. Returns true if cache hit.
+    pub fn load_channel(&mut self, channel_id: &str) -> bool {
+        if let Some(cached) = self.channel_cache.remove(channel_id) {
+            self.lines = cached;
+            self.scroll_offset = 0;
+            self.auto_scroll = true;
+            self.has_new_messages = false;
+            self.channel_unread.remove(channel_id);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Push a message to a non-active channel's cache and increment unread.
+    pub fn push_to_channel(&mut self, channel_id: &str, msg: &MessageInfo) {
+        let cache = self
+            .channel_cache
+            .entry(channel_id.to_string())
+            .or_default();
+        cache.push(MessageLine {
+            from: msg.from.clone(),
+            content: msg.content.clone(),
+            timestamp: msg.timestamp,
+        });
+        *self.channel_unread.entry(channel_id.to_string()).or_insert(0) += 1;
+    }
+
+    /// Get unread count for a channel.
+    pub fn unread_count(&self, channel_id: &str) -> usize {
+        self.channel_unread.get(channel_id).copied().unwrap_or(0)
+    }
+
+    /// Clear unread count for a channel.
+    pub fn clear_unread(&mut self, channel_id: &str) {
+        self.channel_unread.remove(channel_id);
     }
 
     pub fn scroll_down(&mut self, n: u16) {

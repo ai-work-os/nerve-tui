@@ -1,6 +1,6 @@
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Widget};
 
@@ -26,6 +26,7 @@ pub struct ChannelDisplay {
     pub name: Option<String>,
     pub node_count: usize,
     pub members: Vec<MemberDisplay>,
+    pub unread: usize,
 }
 
 impl ChannelDisplay {
@@ -209,11 +210,21 @@ impl StatusBar {
             } else {
                 format!(" ({})", ch.node_count)
             };
-            lines.push(Line::from(vec![
+            let mut spans = vec![
                 Span::raw(format!("{} ", marker)),
                 Span::styled(format!("#{}", truncated), name_style),
                 Span::styled(count_text, Style::default().fg(theme::TIMESTAMP)),
-            ]));
+            ];
+            if ch.unread > 0 {
+                spans.push(Span::styled(
+                    format!(" {}", ch.unread),
+                    Style::default()
+                        .fg(Color::White)
+                        .bg(Color::Red)
+                        .add_modifier(Modifier::BOLD),
+                ));
+            }
+            lines.push(Line::from(spans));
             // Show members under active/selected channel
             if is_active || is_selected {
                 for member in &ch.members {
@@ -304,6 +315,7 @@ mod tests {
                 name: Some(format!("channel-{}", i)),
                 node_count: i + 1,
                 members: Vec::new(),
+                unread: 0,
             })
             .collect()
     }
@@ -404,6 +416,7 @@ mod tests {
             name: Some("main".into()),
             node_count: 2,
             members: Vec::new(),
+            unread: 0,
         };
         assert_eq!(ch_named.display_name(), "main");
 
@@ -412,6 +425,7 @@ mod tests {
             name: None,
             node_count: 0,
             members: Vec::new(),
+            unread: 0,
         };
         assert_eq!(ch_unnamed.display_name(), "ch-abc-123");
     }
@@ -454,6 +468,7 @@ mod tests {
                 MemberDisplay { node_id: "n0".into() },
                 MemberDisplay { node_id: "n1".into() },
             ],
+            unread: 0,
         }];
         let agents = make_agents(1);
         let area = Rect::new(0, 0, 30, 20);
@@ -472,6 +487,7 @@ mod tests {
                 MemberDisplay { node_id: "n2".into() },
                 MemberDisplay { node_id: "n3".into() },
             ],
+            unread: 0,
         };
         let agents = vec![
             AgentDisplay { name: "a".into(), status: "idle".into(), activity: None, adapter: None, node_id: "n1".into() },
