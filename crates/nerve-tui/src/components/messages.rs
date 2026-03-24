@@ -8,6 +8,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Widget, Wrap};
 use serde_json::Value;
+use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
 use unicode_width::UnicodeWidthStr;
 
 struct MessageLine {
@@ -151,7 +152,8 @@ impl MessagesView {
             content: msg.content.clone(),
             timestamp: msg.timestamp as f64,
         });
-        if self.auto_scroll {
+        // Always snap to bottom when user sends a message
+        if msg.role == "user" || self.auto_scroll {
             self.snap_to_bottom();
         } else {
             self.has_new_messages = true;
@@ -373,20 +375,25 @@ impl MessagesView {
                     Style::default().fg(theme::SYSTEM_MSG),
                 )));
             }
-            for (idx, line) in all_lines[start..].iter().enumerate() {
-                let actual_idx = start + idx;
-                if let Some((trunc_idx, keep_vl)) = truncate_first {
-                    if actual_idx == trunc_idx {
-                        let keep_width = (keep_vl * w).saturating_sub(1);
-                        let truncated = tail_by_width(line, keep_width);
-                        out.push(Line::from(Span::styled(
-                            format!("…{}", truncated),
-                            Style::default().fg(theme::AGENT_MSG),
-                        )));
-                        continue;
-                    }
+            // Render the visible streaming lines with markdown
+            let mut first_line_truncated = false;
+            if let Some((trunc_idx, keep_vl)) = truncate_first {
+                if trunc_idx == start {
+                    let keep_width = (keep_vl * w).saturating_sub(1);
+                    let truncated = tail_by_width(&all_lines[start], keep_width);
+                    out.push(Line::from(Span::styled(
+                        format!("…{}", truncated),
+                        Style::default().fg(theme::AGENT_MSG),
+                    )));
+                    first_line_truncated = true;
                 }
-                out.push(Line::from(style_streaming_line(line)));
+            }
+            let md_start = if first_line_truncated { start + 1 } else { start };
+            if md_start < all_lines.len() {
+                let md_text: String = all_lines[md_start..].join("\n");
+                let mut md_lines: Vec<Line<'static>> = Vec::new();
+                render_markdown_lines(&md_text, &mut md_lines);
+                out.extend(md_lines);
             }
         }
 
@@ -851,7 +858,7 @@ fn try_render_tool_result(content: &str) -> Option<Vec<Line<'static>>> {
     Some(lines)
 }
 
-/// Render content lines with tool_call/tool_result detection.
+/// Render content lines with tool_call/tool_result detection and markdown support.
 fn render_content_lines(content: &str, out: &mut Vec<Line<'static>>) {
     if let Some(tool_lines) = try_render_tool_call(content) {
         out.extend(tool_lines);
@@ -861,69 +868,167 @@ fn render_content_lines(content: &str, out: &mut Vec<Line<'static>>) {
         out.extend(result_lines);
         return;
     }
-    for line in content.lines() {
-        out.push(Line::from(style_streaming_line(line)));
+    render_markdown_lines(content, out);
+}
+
+/// Parse markdown content and produce styled ratatui Lines.
+fn render_markdown_lines(content: &str, out: &mut Vec<Line<'static>>) {
+    let opts = Options::ENABLE_STRIKETHROUGH;
+    let parser = Parser::new_ext(content, opts);
+
+    let mut current_spans: Vec<Span<'static>> = Vec::new();
+    let mut in_code_block = false;
+    let mut is_heading = false;
+    let mut bold = false;
+    let mut italic = false;
+    let mut list_item_pending = false;
+
+    for event in parser {
+        match event {
+            Event::Start(Tag::CodeBlock(_)) => {
+                // Flush current line
+                if !current_spans.is_empty() {
+                    out.push(Line::from(std::mem::take(&mut current_spans)));
+                }
+                out.push(Line::from(Span::styled(
+                    "───".to_string(),
+                    Style::default().fg(Color::DarkGray),
+                )));
+                in_code_block = true;
+            }
+            Event::End(TagEnd::CodeBlock) => {
+                // Flush last code line
+                if !current_spans.is_empty() {
+                    out.push(Line::from(std::mem::take(&mut current_spans)));
+                }
+                out.push(Line::from(Span::styled(
+                    "───".to_string(),
+                    Style::default().fg(Color::DarkGray),
+                )));
+                in_code_block = false;
+            }
+            Event::Start(Tag::Heading { .. }) => {
+                if !current_spans.is_empty() {
+                    out.push(Line::from(std::mem::take(&mut current_spans)));
+                }
+                is_heading = true;
+            }
+            Event::End(TagEnd::Heading(_)) => {
+                // Flush heading line with style
+                let text: String = current_spans
+                    .iter()
+                    .map(|s| s.content.to_string())
+                    .collect();
+                current_spans.clear();
+                out.push(Line::from(Span::styled(
+                    text,
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                )));
+                is_heading = false;
+            }
+            Event::Start(Tag::Paragraph) => {
+                // Add blank line between paragraphs (if we already have output)
+                if !current_spans.is_empty() {
+                    out.push(Line::from(std::mem::take(&mut current_spans)));
+                }
+                if !out.is_empty() && !in_code_block {
+                    out.push(Line::from(""));
+                }
+            }
+            Event::End(TagEnd::Paragraph) => {
+                if !current_spans.is_empty() {
+                    out.push(Line::from(std::mem::take(&mut current_spans)));
+                }
+            }
+            Event::Start(Tag::List(_)) => {}
+            Event::End(TagEnd::List(_)) => {}
+            Event::Start(Tag::Item) => {
+                if !current_spans.is_empty() {
+                    out.push(Line::from(std::mem::take(&mut current_spans)));
+                }
+                list_item_pending = true;
+            }
+            Event::End(TagEnd::Item) => {
+                if !current_spans.is_empty() {
+                    out.push(Line::from(std::mem::take(&mut current_spans)));
+                }
+            }
+            Event::Start(Tag::Strong) => {
+                bold = true;
+            }
+            Event::End(TagEnd::Strong) => {
+                bold = false;
+            }
+            Event::Start(Tag::Emphasis) => {
+                italic = true;
+            }
+            Event::End(TagEnd::Emphasis) => {
+                italic = false;
+            }
+            Event::Code(text) => {
+                current_spans.push(Span::styled(
+                    text.to_string(),
+                    Style::default().fg(Color::Yellow),
+                ));
+            }
+            Event::Text(text) => {
+                if in_code_block {
+                    // Code block: split by newlines, each as its own line
+                    let lines: Vec<&str> = text.split('\n').collect();
+                    for (i, line) in lines.iter().enumerate() {
+                        if i > 0 {
+                            // Flush previous code line
+                            out.push(Line::from(std::mem::take(&mut current_spans)));
+                        }
+                        current_spans.push(Span::styled(
+                            line.to_string(),
+                            Style::default().fg(Color::DarkGray),
+                        ));
+                    }
+                } else if is_heading {
+                    current_spans.push(Span::raw(text.to_string()));
+                } else {
+                    // Handle list item bullet prefix
+                    if list_item_pending {
+                        current_spans.push(Span::raw("  \u{2022} ".to_string()));
+                        list_item_pending = false;
+                    }
+                    let style = if bold && italic {
+                        Style::default()
+                            .add_modifier(Modifier::BOLD)
+                            .add_modifier(Modifier::ITALIC)
+                    } else if bold {
+                        Style::default().add_modifier(Modifier::BOLD)
+                    } else if italic {
+                        Style::default().add_modifier(Modifier::ITALIC)
+                    } else {
+                        Style::default()
+                    };
+                    // Highlight @mentions within the text
+                    if text.contains('@') && !bold && !italic {
+                        current_spans.extend(highlight_mentions(&text));
+                    } else {
+                        current_spans.push(Span::styled(text.to_string(), style));
+                    }
+                }
+            }
+            Event::SoftBreak => {
+                current_spans.push(Span::raw(" ".to_string()));
+            }
+            Event::HardBreak => {
+                out.push(Line::from(std::mem::take(&mut current_spans)));
+            }
+            _ => {}
+        }
+    }
+    // Flush remaining spans
+    if !current_spans.is_empty() {
+        out.push(Line::from(current_spans));
     }
 }
 
-/// Style a single line, detecting [tool:Name] and [tool_result:marker] markers.
-fn style_streaming_line(line: &str) -> Vec<Span<'static>> {
-    // [tool:ToolName] optional description
-    if line.starts_with("[tool:") {
-        if let Some(end) = line.find(']') {
-            let tool_name = &line[6..end];
-            let desc = line[end + 1..].trim();
-            let mut spans = vec![
-                Span::styled("⚙ ", Style::default().fg(theme::TOOL_LABEL)),
-                Span::styled(
-                    tool_name.to_string(),
-                    Style::default()
-                        .fg(theme::TOOL_NAME)
-                        .add_modifier(Modifier::BOLD),
-                ),
-            ];
-            if !desc.is_empty() {
-                spans.push(Span::styled(
-                    format!(" {}", desc),
-                    Style::default().fg(theme::TOOL_LABEL),
-                ));
-            }
-            return spans;
-        }
-    }
-    // [tool_result:✓] or [tool_result:✗]
-    if line.starts_with("[tool_result:") {
-        let marker = &line[13..line.find(']').unwrap_or(line.len())];
-        let color = if marker.contains('✗') {
-            Color::Red
-        } else {
-            Color::Green
-        };
-        return vec![Span::styled(
-            format!("{} result", marker),
-            Style::default().fg(color).add_modifier(Modifier::BOLD),
-        )];
-    }
-    // Indented tool param/result lines: "  key: value"
-    if line.starts_with("  ") && !line.starts_with("  …") {
-        if let Some(colon_pos) = line.find(": ") {
-            let key = &line[2..colon_pos];
-            // Only treat as key:value if key looks like an identifier (no spaces)
-            if !key.contains(' ') && !key.is_empty() {
-                let val = &line[colon_pos + 2..];
-                return vec![
-                    Span::styled(
-                        format!("  {}: ", key),
-                        Style::default().fg(theme::TOOL_KEY),
-                    ),
-                    Span::styled(val.to_string(), Style::default().fg(theme::TOOL_VALUE)),
-                ];
-            }
-        }
-    }
-    // Fallback
-    highlight_mentions(line)
-}
 
 fn truncate_str(s: &str, max_chars: usize) -> String {
     if s.chars().count() <= max_chars {

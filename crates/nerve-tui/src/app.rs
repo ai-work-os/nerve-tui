@@ -8,7 +8,7 @@ use serde_json::Value;
 use std::collections::HashSet;
 use std::path::Path;
 use tokio::sync::mpsc;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::components::messages::ChannelPanelState;
 use crate::components::*;
@@ -1278,9 +1278,26 @@ impl App {
                             name, update
                         );
                     }
+                    let buf_len_before = self.messages.streaming
+                        .iter()
+                        .find(|(n, _)| n == name)
+                        .map(|(_, c)| c.len())
+                        .unwrap_or(0);
+                    let chunk_preview: String = text.chars().take(20).collect();
+                    info!(
+                        "CHUNK from={} len={} preview={:?} buf_before={}",
+                        name, text.len(), chunk_preview, buf_len_before
+                    );
                     if let Some(entry) = self.messages.streaming.iter_mut().find(|(n, _)| n == name)
                     {
-                        entry.1.push_str(text);
+                        // Dedup: skip if buffer already ends with this exact chunk
+                        if !text.is_empty() && !entry.1.ends_with(text) {
+                            entry.1.push_str(text);
+                        } else if text.is_empty() {
+                            // empty chunk, skip
+                        } else {
+                            debug!("DEDUP: skipping duplicate chunk from {}: {:?}", name, &text[..text.len().min(20)]);
+                        }
                     } else {
                         self.messages
                             .streaming
@@ -1291,6 +1308,14 @@ impl App {
                     // should set is_responding = true.
                 }
                 Some("agent_message_start") => {
+                    let old_buf_len = self.messages.streaming
+                        .iter()
+                        .find(|(n, _)| n == name)
+                        .map(|(_, c)| c.len());
+                    info!(
+                        "MSG_START from={} old_buf={:?}",
+                        name, old_buf_len
+                    );
                     debug!(
                         "agent_message_start from {}, clearing streaming buffer",
                         name
