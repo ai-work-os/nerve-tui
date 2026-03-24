@@ -46,7 +46,7 @@ struct Cli {
     server: String,
 
     /// Node name for registration
-    #[arg(short, long, default_value = "tui")]
+    #[arg(short, long, default_value = "user")]
     name: String,
 
     /// Project working directory for spawned agents and new channels

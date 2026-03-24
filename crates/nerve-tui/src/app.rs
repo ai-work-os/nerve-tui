@@ -5,6 +5,7 @@ use nerve_tui_core::NerveClient;
 use nerve_tui_protocol::*;
 use ratatui::Frame;
 use serde_json::Value;
+use std::collections::HashSet;
 use std::path::Path;
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
@@ -47,6 +48,9 @@ pub struct App {
     error_rx: mpsc::UnboundedReceiver<String>,
     /// Cached archived channels from last /restore call
     archived_channels: Vec<Value>,
+
+    /// Agents whose streaming buffer was already flushed by idle (to avoid double-persist)
+    flushed_agents: HashSet<String>,
 
     // Split view
     split_view: bool,
@@ -94,6 +98,7 @@ impl App {
             error_tx,
             error_rx,
             archived_channels: Vec::new(),
+            flushed_agents: HashSet::new(),
             split_view: false,
             split_focus: SplitFocus::Dm,
             channel_panel_state: ChannelPanelState::new(),
@@ -1226,6 +1231,7 @@ impl App {
             }
         }
         self.messages.streaming.retain(|(n, _)| n != name);
+        self.flushed_agents.insert(name.to_string());
         if let Some(ref mut dm_state) = self.active_dm {
             if dm_state.node_id == node_id {
                 dm_state.is_responding = false;
@@ -1293,8 +1299,13 @@ impl App {
                     self.messages
                         .streaming
                         .push((name.to_string(), String::new()));
+                    self.flushed_agents.remove(name);
                 }
                 Some("agent_message_end") => {
+                    // If idle already flushed this agent's streaming buffer, skip to
+                    // avoid persisting the same message twice.
+                    let already_flushed = self.flushed_agents.remove(name);
+
                     let streaming_content = self
                         .messages
                         .streaming
@@ -1315,15 +1326,15 @@ impl App {
 
                     let final_content = if !streaming_content.is_empty() {
                         streaming_content
-                    } else if !end_content.is_empty() {
+                    } else if !already_flushed && !end_content.is_empty() {
                         end_content.to_string()
                     } else {
                         String::new()
                     };
 
                     debug!(
-                        "agent_message_end from {}: in_dm={} streaming_buf={} end_content={} final={}",
-                        name, in_dm, streaming_len, end_len, final_content.len()
+                        "agent_message_end from {}: in_dm={} streaming_buf={} end_content={} final={} already_flushed={}",
+                        name, in_dm, streaming_len, end_len, final_content.len(), already_flushed
                     );
 
                     if in_dm && !final_content.is_empty() {
@@ -1342,7 +1353,7 @@ impl App {
                             dm_state.messages.push(dm_msg);
                         }
                     } else if in_dm {
-                        debug!("agent_message_end from {} but no content to persist", name);
+                        debug!("agent_message_end from {} but no content to persist (already_flushed={})", name, already_flushed);
                     }
                     // In channel mode: final message arrives via channel.message
                     self.messages.streaming.retain(|(n, _)| n != name);
