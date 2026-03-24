@@ -723,4 +723,67 @@ mod tests {
         // Should be 1 line, not 2
         assert_eq!(input.visual_line_count(80), 1);
     }
+
+    #[test]
+    fn multiline_ctrl_a_moves_to_current_line_start() {
+        let mut input = InputBox::new();
+        input.insert_str("hello\nworld");
+        // cursor at end (pos 11)
+        input.move_line_start();
+        assert_eq!(input.cursor_pos, 6); // start of "world", not 0
+    }
+
+    #[test]
+    fn multiline_ctrl_e_moves_to_current_line_end() {
+        let mut input = InputBox::new();
+        input.insert_str("hello\nworld");
+        input.cursor_pos = 6; // start of "world"
+        input.move_line_end();
+        assert_eq!(input.cursor_pos, 11); // end of "world"
+
+        // Now test on first line
+        input.cursor_pos = 2; // in "hello"
+        input.move_line_end();
+        assert_eq!(input.cursor_pos, 5); // end of "hello", before \n
+    }
+
+    #[test]
+    fn multiline_ctrl_k_kills_to_current_line_end() {
+        let mut input = InputBox::new();
+        input.insert_str("hello\nworld");
+        input.cursor_pos = 8; // at 'r' in "world"
+        input.kill_to_line_end();
+        assert_eq!(input.text, "hello\nwo");
+        assert_eq!(input.cursor_pos, 8);
+    }
+
+    #[test]
+    fn multiline_ctrl_k_stops_at_newline() {
+        let mut input = InputBox::new();
+        input.insert_str("hello\nworld");
+        input.cursor_pos = 2; // at 'l' in "hello"
+        input.kill_to_line_end();
+        assert_eq!(input.text, "he\nworld");
+        assert_eq!(input.cursor_pos, 2);
+    }
+
+    #[test]
+    fn multiline_ctrl_u_kills_to_current_line_start() {
+        let mut input = InputBox::new();
+        input.insert_str("hello\nworld");
+        input.cursor_pos = 8; // at 'r' in "world"
+        input.kill_to_line_start();
+        assert_eq!(input.text, "hello\nrld");
+        assert_eq!(input.cursor_pos, 6);
+    }
+
+    #[test]
+    fn multiline_ctrl_u_on_first_line() {
+        let mut input = InputBox::new();
+        input.insert_str("hello\nworld");
+        input.cursor_pos = 3; // at second 'l' in "hello"
+        input.kill_to_line_start();
+        assert_eq!(input.text, "lo\nworld");
+        assert_eq!(input.cursor_pos, 0);
+    }
 }

@@ -54,14 +54,33 @@ struct Cli {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Log to stderr so it doesn't interfere with TUI
-    tracing_subscriber::fmt()
-        .with_writer(io::stderr)
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "nerve_tui=info,nerve_tui_core=info".into()),
-        )
-        .init();
+    // Log to file (~/.nerve/tui.log) to avoid polluting terminal after exit.
+    // Falls back to sink (no logging) if file cannot be opened.
+    let log_dir = std::env::var("HOME")
+        .map(|h| Path::new(&h).join(".nerve"))
+        .unwrap_or_else(|_| Path::new("/tmp").join(".nerve"));
+    let log_file = std::fs::create_dir_all(&log_dir)
+        .and_then(|_| {
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(log_dir.join("tui.log"))
+        })
+        .ok();
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| "nerve_tui=info,nerve_tui_core=info".into());
+    if let Some(file) = log_file {
+        tracing_subscriber::fmt()
+            .with_writer(std::sync::Mutex::new(file))
+            .with_ansi(false)
+            .with_env_filter(env_filter)
+            .init();
+    } else {
+        tracing_subscriber::fmt()
+            .with_writer(io::sink)
+            .with_env_filter(env_filter)
+            .init();
+    }
 
     let cli = Cli::parse();
     let url = format!("ws://{}", cli.server);
@@ -92,13 +111,18 @@ async fn main() -> Result<()> {
     // Setup terminal
     enable_raw_mode()?;
 
-    // Enable kitty keyboard protocol for Shift+Enter detection (if terminal supports it)
-    if crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false) {
+    // Enable kitty keyboard protocol for Shift+Enter detection.
+    // crossterm's supports_keyboard_enhancement() returns false in kitty terminal,
+    // so detect kitty via TERM/KITTY_WINDOW_ID and force-enable the protocol.
+    let is_kitty = std::env::var("TERM").map_or(false, |t| t.contains("kitty"))
+        || std::env::var("KITTY_WINDOW_ID").is_ok();
+    if is_kitty || crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false) {
         let _ = execute!(
             io::stdout(),
             PushKeyboardEnhancementFlags(
                 KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
                     | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
+                    | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES
             )
         );
         KEYBOARD_ENHANCED.store(true, Ordering::Relaxed);

@@ -318,6 +318,19 @@ impl NerveClient {
         Ok(serde_json::from_value(r)?)
     }
 
+    pub async fn session_clear(&self, node_name: &str) -> Result<Value> {
+        let r = self
+            .request("session.clear", json!({ "nodeName": node_name }))
+            .await?;
+        Ok(r)
+    }
+
+    pub async fn session_compact(&self, node_name: &str) -> Result<()> {
+        self.request("session.compact", json!({ "nodeName": node_name }))
+            .await?;
+        Ok(())
+    }
+
     pub async fn channel_add_node(
         &self,
         channel_id: &str,

@@ -17,6 +17,11 @@ pub const STATUS_DISCONNECTED: Color = Color::DarkGray;
 pub const STATUS_BUSY: Color = Color::Green;
 pub const STATUS_ERROR: Color = Color::Red;
 
+pub const TOOL_NAME: Color = Color::Magenta;
+pub const TOOL_LABEL: Color = Color::DarkGray;
+pub const TOOL_KEY: Color = Color::Yellow;
+pub const TOOL_VALUE: Color = Color::White;
+
 /// Rotating colors for different agents in messages
 const AGENT_COLORS: [Color; 6] = [
     Color::Cyan,

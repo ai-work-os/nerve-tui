@@ -4,9 +4,10 @@ use nerve_tui_protocol::DmMessage;
 use nerve_tui_protocol::MessageInfo;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Widget, Wrap};
+use serde_json::Value;
 use unicode_width::UnicodeWidthStr;
 
 struct MessageLine {
@@ -108,6 +109,15 @@ impl MessagesView {
     pub fn clear(&mut self) {
         self.lines.clear();
         self.scroll_offset = 0;
+        self.has_new_messages = false;
+    }
+
+    /// Clear DM-specific state (dm_lines, streaming, scroll).
+    pub fn clear_dm(&mut self) {
+        self.dm_lines.clear();
+        self.streaming.clear();
+        self.scroll_offset = 0;
+        self.auto_scroll = true;
         self.has_new_messages = false;
     }
 
@@ -254,14 +264,39 @@ impl MessagesView {
                 extract_route_target(&base_content)
             };
 
+            // System messages: single line, no timestamp, styled by content
+            if msg.from == "系统" {
+                let content_lower = display_content.to_lowercase();
+                let style = if content_lower.contains("失败")
+                    || content_lower.contains("error")
+                    || content_lower.contains("错误")
+                {
+                    Style::default()
+                        .fg(Color::Red)
+                        .add_modifier(Modifier::ITALIC)
+                } else if content_lower.contains("已恢复")
+                    || content_lower.contains("成功")
+                    || content_lower.contains("已注册")
+                {
+                    Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(Modifier::ITALIC)
+                } else {
+                    Style::default()
+                        .fg(Color::DarkGray)
+                        .add_modifier(Modifier::ITALIC)
+                };
+                out.push(Line::from(Span::styled(
+                    format!("— {}", display_content),
+                    style,
+                )));
+                continue;
+            }
+
             // Header: from → target  HH:MM:SS  or  from  HH:MM:SS
             let time_str = format_time(msg.timestamp);
             let name_color = theme::agent_color(&msg.from);
-            let name_style = if msg.from == "系统" {
-                Style::default().fg(theme::SYSTEM_MSG)
-            } else {
-                Style::default().fg(name_color).add_modifier(Modifier::BOLD)
-            };
+            let name_style = Style::default().fg(name_color).add_modifier(Modifier::BOLD);
 
             let mut header = vec![Span::styled(msg.from.clone(), name_style)];
             if let Some(ref t) = target {
@@ -286,11 +321,12 @@ impl MessagesView {
             header.push(Span::styled(time_str, Style::default().fg(theme::TIMESTAMP)));
             out.push(Line::from(header));
 
-            // Content lines (with @target prefix stripped)
-            for line in display_content.lines() {
-                let spans = highlight_mentions(line);
-                out.push(Line::from(spans));
-            }
+            // Content lines: render first (tool_call detection on raw content),
+            // then compact blank lines in the rendered output.
+            let mut content_lines: Vec<Line<'static>> = Vec::new();
+            render_content_lines(&display_content, &mut content_lines);
+            compact_rendered_lines(&mut content_lines);
+            out.extend(content_lines);
         }
 
         // Streaming previews
@@ -341,8 +377,6 @@ impl MessagesView {
                 let actual_idx = start + idx;
                 if let Some((trunc_idx, keep_vl)) = truncate_first {
                     if actual_idx == trunc_idx {
-                        // Tail-truncate: keep last keep_vl * w display-width chars
-                        // Reserve space for the "…" prefix (1 column wide)
                         let keep_width = (keep_vl * w).saturating_sub(1);
                         let truncated = tail_by_width(line, keep_width);
                         out.push(Line::from(Span::styled(
@@ -352,11 +386,195 @@ impl MessagesView {
                         continue;
                     }
                 }
-                out.push(Line::from(Span::styled(
-                    line.to_string(),
-                    Style::default().fg(theme::AGENT_MSG),
-                )));
+                out.push(Line::from(style_streaming_line(line)));
             }
+        }
+
+        out
+    }
+}
+
+/// Render the channel messages panel (right side of split view).
+/// Uses external scroll state so the main DM scroll is independent.
+pub struct ChannelPanelState {
+    pub scroll_offset: u16,
+    pub auto_scroll: bool,
+    pub visible_height: u16,
+}
+
+impl ChannelPanelState {
+    pub fn new() -> Self {
+        Self {
+            scroll_offset: u16::MAX,
+            auto_scroll: true,
+            visible_height: 0,
+        }
+    }
+
+    pub fn scroll_down(&mut self, n: u16) {
+        self.scroll_offset = self.scroll_offset.saturating_add(n);
+        self.auto_scroll = false;
+    }
+
+    pub fn scroll_up(&mut self, n: u16) {
+        self.scroll_offset = self.scroll_offset.saturating_sub(n);
+        self.auto_scroll = false;
+    }
+
+    pub fn page_up(&mut self) {
+        let page = self.visible_height.max(1);
+        self.scroll_up(page);
+    }
+
+    pub fn page_down(&mut self) {
+        let page = self.visible_height.max(1);
+        self.scroll_down(page);
+    }
+
+    pub fn snap_to_bottom(&mut self) {
+        self.auto_scroll = true;
+        self.scroll_offset = u16::MAX;
+    }
+}
+
+impl MessagesView {
+    /// Render channel messages in the split-view right panel.
+    pub fn render_channel_panel(
+        &self,
+        channel_name: &str,
+        state: &mut ChannelPanelState,
+        focused: bool,
+        area: Rect,
+        buf: &mut Buffer,
+    ) {
+        let title = format!(" #{} ", channel_name);
+        let border_color = if focused { theme::BORDER } else { theme::TIMESTAMP };
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(border_color))
+            .title(title)
+            .title_style(Style::default().fg(border_color));
+
+        let inner = block.inner(area);
+        state.visible_height = inner.height;
+        block.render(area, buf);
+
+        // Build text from channel lines (self.lines)
+        let text_lines = self.build_channel_text(inner.width);
+
+        let width = inner.width.max(1) as usize;
+        let total_visual_u32: u32 = text_lines
+            .iter()
+            .map(|line| {
+                let line_width: usize = line
+                    .spans
+                    .iter()
+                    .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
+                    .sum();
+                if line_width == 0 {
+                    1u32
+                } else {
+                    ((line_width + width - 1) / width) as u32
+                }
+            })
+            .sum();
+        let total_visual = total_visual_u32.min(u16::MAX as u32) as u16;
+        let max_offset = total_visual.saturating_sub(state.visible_height);
+
+        if state.auto_scroll {
+            state.scroll_offset = max_offset;
+        } else {
+            state.scroll_offset = state.scroll_offset.min(max_offset);
+            if state.scroll_offset >= max_offset {
+                state.auto_scroll = true;
+            }
+        }
+
+        let para = Paragraph::new(text_lines)
+            .scroll((state.scroll_offset, 0))
+            .wrap(Wrap { trim: false });
+        para.render(inner, buf);
+    }
+
+    /// Build text lines from channel messages (for split-view right panel).
+    fn build_channel_text(&self, _width: u16) -> Vec<Line<'static>> {
+        let mut out: Vec<Line<'static>> = Vec::new();
+
+        for (i, msg) in self.lines.iter().enumerate() {
+            // Apply filter if set
+            if let Some(ref f) = self.filter {
+                if msg.from != *f && !msg.content.contains(&format!("@{}", f)) {
+                    continue;
+                }
+            }
+
+            if i > 0 {
+                out.push(Line::from(""));
+            }
+
+            let (target, display_content) = extract_route_target(&msg.content);
+
+            // System messages: single line, styled by content (same as main panel)
+            if msg.from == "系统" {
+                let content_lower = display_content.to_lowercase();
+                let style = if content_lower.contains("失败")
+                    || content_lower.contains("error")
+                    || content_lower.contains("错误")
+                {
+                    Style::default()
+                        .fg(Color::Red)
+                        .add_modifier(Modifier::ITALIC)
+                } else if content_lower.contains("已恢复")
+                    || content_lower.contains("成功")
+                    || content_lower.contains("已注册")
+                {
+                    Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(Modifier::ITALIC)
+                } else {
+                    Style::default()
+                        .fg(Color::DarkGray)
+                        .add_modifier(Modifier::ITALIC)
+                };
+                out.push(Line::from(Span::styled(
+                    format!("— {}", display_content),
+                    style,
+                )));
+                continue;
+            }
+
+            let time_str = format_time(msg.timestamp);
+            let name_color = theme::agent_color(&msg.from);
+            let name_style = Style::default()
+                .fg(name_color)
+                .add_modifier(Modifier::BOLD);
+
+            let mut header = vec![Span::styled(msg.from.clone(), name_style)];
+            if let Some(ref t) = target {
+                let target_color = theme::agent_color(t);
+                header.push(Span::styled(
+                    " → ",
+                    Style::default().fg(theme::TIMESTAMP),
+                ));
+                header.push(Span::styled(
+                    t.clone(),
+                    Style::default()
+                        .fg(target_color)
+                        .add_modifier(Modifier::BOLD),
+                ));
+            }
+            header.push(Span::raw("  "));
+            header.push(Span::styled(
+                time_str,
+                Style::default().fg(theme::TIMESTAMP),
+            ));
+            out.push(Line::from(header));
+
+            let mut content_lines: Vec<Line<'static>> = Vec::new();
+            render_content_lines(&display_content, &mut content_lines);
+            compact_rendered_lines(&mut content_lines);
+            out.extend(content_lines);
         }
 
         out
@@ -461,6 +679,35 @@ pub(crate) fn highlight_mentions(text: &str) -> Vec<Span<'static>> {
     spans
 }
 
+/// Compact consecutive blank lines in rendered output (Vec<Line>).
+/// Collapses runs of empty lines to at most one, and trims trailing blanks.
+fn compact_rendered_lines(lines: &mut Vec<Line<'static>>) {
+    let mut i = 0;
+    let mut prev_blank = false;
+    while i < lines.len() {
+        let is_blank = lines[i].spans.is_empty()
+            || lines[i]
+                .spans
+                .iter()
+                .all(|s| s.content.trim().is_empty());
+        if is_blank && prev_blank {
+            lines.remove(i);
+        } else {
+            prev_blank = is_blank;
+            i += 1;
+        }
+    }
+    // Trim trailing blank lines
+    while lines
+        .last()
+        .map_or(false, |l| {
+            l.spans.is_empty() || l.spans.iter().all(|s| s.content.trim().is_empty())
+        })
+    {
+        lines.pop();
+    }
+}
+
 /// Return the tail of `s` whose display width fits within `max_width`.
 fn tail_by_width(s: &str, max_width: usize) -> &str {
     use unicode_width::UnicodeWidthChar;
@@ -473,6 +720,218 @@ fn tail_by_width(s: &str, max_width: usize) -> &str {
         width += cw;
     }
     s
+}
+
+/// Detect tool_call JSON and render structured lines.
+fn try_render_tool_call(content: &str) -> Option<Vec<Line<'static>>> {
+    let trimmed = content.trim();
+    if !trimmed.starts_with('{') {
+        return None;
+    }
+    let val: Value = serde_json::from_str(trimmed).ok()?;
+    let obj = val.as_object()?;
+
+    let name = obj.get("name").and_then(|v| v.as_str())?;
+    let args = obj.get("arguments").or_else(|| obj.get("input"));
+
+    let mut lines = Vec::new();
+    lines.push(Line::from(vec![
+        Span::styled("  ⚙ ", Style::default().fg(theme::TOOL_LABEL)),
+        Span::styled(
+            name.to_string(),
+            Style::default()
+                .fg(theme::TOOL_NAME)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ]));
+
+    if let Some(args_val) = args {
+        render_args(args_val, &mut lines);
+    }
+
+    Some(lines)
+}
+
+fn render_args(args_val: &Value, lines: &mut Vec<Line<'static>>) {
+    match args_val {
+        Value::Object(map) => {
+            for (k, v) in map {
+                let v_str = match v {
+                    Value::String(s) => truncate_str(s, 120),
+                    _ => truncate_str(&v.to_string(), 120),
+                };
+                lines.push(Line::from(vec![
+                    Span::styled(format!("    {}: ", k), Style::default().fg(theme::TOOL_KEY)),
+                    Span::styled(v_str, Style::default().fg(theme::TOOL_VALUE)),
+                ]));
+            }
+        }
+        Value::String(s) => {
+            if let Ok(Value::Object(map)) = serde_json::from_str::<Value>(s) {
+                for (k, v) in &map {
+                    let v_str = match v {
+                        Value::String(s) => truncate_str(s, 120),
+                        _ => truncate_str(&v.to_string(), 120),
+                    };
+                    lines.push(Line::from(vec![
+                        Span::styled(
+                            format!("    {}: ", k),
+                            Style::default().fg(theme::TOOL_KEY),
+                        ),
+                        Span::styled(v_str, Style::default().fg(theme::TOOL_VALUE)),
+                    ]));
+                }
+            } else {
+                lines.push(Line::from(Span::styled(
+                    format!("    {}", truncate_str(s, 120)),
+                    Style::default().fg(theme::TOOL_VALUE),
+                )));
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Detect tool_result JSON and render as collapsed summary (first 3 lines).
+fn try_render_tool_result(content: &str) -> Option<Vec<Line<'static>>> {
+    let trimmed = content.trim();
+    if !trimmed.starts_with('{') {
+        return None;
+    }
+    let val: Value = serde_json::from_str(trimmed).ok()?;
+    let obj = val.as_object()?;
+
+    let is_result = obj
+        .get("type")
+        .and_then(|v| v.as_str())
+        .map_or(false, |t| t == "tool_result")
+        || obj.contains_key("tool_use_id");
+
+    if !is_result {
+        return None;
+    }
+
+    let mut lines = Vec::new();
+    let result_text = obj
+        .get("content")
+        .and_then(|v| v.as_str())
+        .or_else(|| obj.get("output").and_then(|v| v.as_str()))
+        .unwrap_or("");
+
+    let is_error = obj
+        .get("is_error")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    let (label, label_color) = if is_error {
+        ("  ✗ 结果（错误）", ratatui::style::Color::Red)
+    } else {
+        ("  ✓ 结果", theme::TOOL_LABEL)
+    };
+    lines.push(Line::from(Span::styled(
+        label.to_string(),
+        Style::default().fg(label_color),
+    )));
+
+    let result_lines: Vec<&str> = result_text.lines().collect();
+    let show_count = result_lines.len().min(3);
+    for line in &result_lines[..show_count] {
+        lines.push(Line::from(Span::styled(
+            format!("    {}", truncate_str(line, 120)),
+            Style::default().fg(theme::TOOL_VALUE),
+        )));
+    }
+    if result_lines.len() > 3 {
+        lines.push(Line::from(Span::styled(
+            format!("    … 共 {} 行", result_lines.len()),
+            Style::default().fg(theme::TOOL_LABEL),
+        )));
+    }
+
+    Some(lines)
+}
+
+/// Render content lines with tool_call/tool_result detection.
+fn render_content_lines(content: &str, out: &mut Vec<Line<'static>>) {
+    if let Some(tool_lines) = try_render_tool_call(content) {
+        out.extend(tool_lines);
+        return;
+    }
+    if let Some(result_lines) = try_render_tool_result(content) {
+        out.extend(result_lines);
+        return;
+    }
+    for line in content.lines() {
+        out.push(Line::from(style_streaming_line(line)));
+    }
+}
+
+/// Style a single line, detecting [tool:Name] and [tool_result:marker] markers.
+fn style_streaming_line(line: &str) -> Vec<Span<'static>> {
+    // [tool:ToolName] optional description
+    if line.starts_with("[tool:") {
+        if let Some(end) = line.find(']') {
+            let tool_name = &line[6..end];
+            let desc = line[end + 1..].trim();
+            let mut spans = vec![
+                Span::styled("⚙ ", Style::default().fg(theme::TOOL_LABEL)),
+                Span::styled(
+                    tool_name.to_string(),
+                    Style::default()
+                        .fg(theme::TOOL_NAME)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ];
+            if !desc.is_empty() {
+                spans.push(Span::styled(
+                    format!(" {}", desc),
+                    Style::default().fg(theme::TOOL_LABEL),
+                ));
+            }
+            return spans;
+        }
+    }
+    // [tool_result:✓] or [tool_result:✗]
+    if line.starts_with("[tool_result:") {
+        let marker = &line[13..line.find(']').unwrap_or(line.len())];
+        let color = if marker.contains('✗') {
+            Color::Red
+        } else {
+            Color::Green
+        };
+        return vec![Span::styled(
+            format!("{} result", marker),
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        )];
+    }
+    // Indented tool param/result lines: "  key: value"
+    if line.starts_with("  ") && !line.starts_with("  …") {
+        if let Some(colon_pos) = line.find(": ") {
+            let key = &line[2..colon_pos];
+            // Only treat as key:value if key looks like an identifier (no spaces)
+            if !key.contains(' ') && !key.is_empty() {
+                let val = &line[colon_pos + 2..];
+                return vec![
+                    Span::styled(
+                        format!("  {}: ", key),
+                        Style::default().fg(theme::TOOL_KEY),
+                    ),
+                    Span::styled(val.to_string(), Style::default().fg(theme::TOOL_VALUE)),
+                ];
+            }
+        }
+    }
+    // Fallback
+    highlight_mentions(line)
+}
+
+fn truncate_str(s: &str, max_chars: usize) -> String {
+    if s.chars().count() <= max_chars {
+        s.to_string()
+    } else {
+        let truncated: String = s.chars().take(max_chars).collect();
+        format!("{}…", truncated)
+    }
 }
 
 #[cfg(test)]

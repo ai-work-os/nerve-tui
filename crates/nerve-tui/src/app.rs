@@ -9,8 +9,15 @@ use std::path::Path;
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
+use crate::components::messages::ChannelPanelState;
 use crate::components::*;
 use crate::layout::AppLayout;
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum SplitFocus {
+    Dm,
+    Channel,
+}
 
 pub struct App {
     pub client: NerveClient,
@@ -40,6 +47,11 @@ pub struct App {
     error_rx: mpsc::UnboundedReceiver<String>,
     /// Cached archived channels from last /restore call
     archived_channels: Vec<Value>,
+
+    // Split view
+    split_view: bool,
+    split_focus: SplitFocus,
+    channel_panel_state: ChannelPanelState,
 }
 
 impl App {
@@ -80,6 +92,9 @@ impl App {
             error_tx,
             error_rx,
             archived_channels: Vec::new(),
+            split_view: false,
+            split_focus: SplitFocus::Dm,
+            channel_panel_state: ChannelPanelState::new(),
         }
     }
 
@@ -174,10 +189,10 @@ impl App {
 
     fn render(&mut self, frame: &mut Frame) {
         let area = frame.area();
-        let sidebar_w: u16 = if self.sidebar_visible { 20 } else { 0 };
-        let main_w = area.width.saturating_sub(sidebar_w);
-        let input_lines = self.input.visual_line_count(main_w.saturating_sub(2)) + 2;
-        let layout = AppLayout::with_sidebar(area, input_lines, self.sidebar_visible);
+        let in_split = self.split_view && self.active_dm.is_some();
+        let input_inner_w = AppLayout::input_inner_width(area, self.sidebar_visible, in_split);
+        let input_lines = self.input.visual_line_count(input_inner_w) + 2;
+        let layout = AppLayout::build(area, input_lines, self.sidebar_visible, in_split);
 
         // Sidebar: channels + agents (skip when hidden)
         if self.sidebar_visible {
@@ -193,8 +208,26 @@ impl App {
             );
         }
 
-        // Messages
+        // Messages (DM panel in split mode)
         self.messages.render(layout.messages, frame.buffer_mut());
+
+        // Channel panel (right side of split view)
+        if let Some(panel_area) = layout.channel_panel {
+            let channel_name = self
+                .channels
+                .iter()
+                .find(|c| Some(&c.id) == self.active_channel.as_ref())
+                .map(|c| c.display_name())
+                .unwrap_or("channel");
+            let focused = self.split_focus == SplitFocus::Channel;
+            self.messages.render_channel_panel(
+                &channel_name,
+                &mut self.channel_panel_state,
+                focused,
+                panel_area,
+                frame.buffer_mut(),
+            );
+        }
 
         // Input
         self.input.render(layout.input, frame.buffer_mut());
@@ -252,14 +285,59 @@ impl App {
             }
             KeyCode::BackTab => self.input.shift_tab(),
 
-            // Scroll messages
-            KeyCode::PageUp => self.messages.page_up(),
-            KeyCode::PageDown => self.messages.page_down(),
+            // Split view: Ctrl+S toggle, Ctrl+W switch focus
+            KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if self.active_dm.is_some() {
+                    if self.active_channel.is_some() {
+                        self.split_view = !self.split_view;
+                        if self.split_view {
+                            self.split_focus = SplitFocus::Dm;
+                            self.channel_panel_state.snap_to_bottom();
+                        } else {
+                            self.split_focus = SplitFocus::Dm;
+                        }
+                    } else {
+                        self.messages.push_system("需要先加入频道才能分屏");
+                    }
+                }
+            }
+            KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if self.split_view && self.active_dm.is_some() {
+                    self.split_focus = match self.split_focus {
+                        SplitFocus::Dm => SplitFocus::Channel,
+                        SplitFocus::Channel => SplitFocus::Dm,
+                    };
+                }
+            }
+
+            // Scroll messages (dispatched to focused panel in split mode)
+            KeyCode::PageUp => {
+                if self.split_view && self.split_focus == SplitFocus::Channel {
+                    self.channel_panel_state.page_up();
+                } else {
+                    self.messages.page_up();
+                }
+            }
+            KeyCode::PageDown => {
+                if self.split_view && self.split_focus == SplitFocus::Channel {
+                    self.channel_panel_state.page_down();
+                } else {
+                    self.messages.page_down();
+                }
+            }
             KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.messages.scroll_down(1);
+                if self.split_view && self.split_focus == SplitFocus::Channel {
+                    self.channel_panel_state.scroll_down(1);
+                } else {
+                    self.messages.scroll_down(1);
+                }
             }
             KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.messages.scroll_down(10);
+                if self.split_view && self.split_focus == SplitFocus::Channel {
+                    self.channel_panel_state.scroll_down(10);
+                } else {
+                    self.messages.scroll_down(10);
+                }
             }
 
             // Emacs keybindings (line-aware for multiline input)
@@ -324,10 +402,12 @@ impl App {
                 }
             }
 
-            // Esc: dismiss popup first, then exit DM
+            // Esc: dismiss popup → switch split focus to DM → cancel/exit DM
             KeyCode::Esc => {
                 if self.input.is_popup_visible() {
                     self.input.dismiss_popup();
+                } else if self.split_view && self.split_focus == SplitFocus::Channel {
+                    self.split_focus = SplitFocus::Dm;
                 } else if self.active_dm.is_some() {
                     if self.active_dm.as_ref().is_some_and(|dm| dm.is_responding) {
                         self.cancel_active_dm().await;
@@ -351,8 +431,20 @@ impl App {
 
     fn handle_mouse(&mut self, mouse: MouseEvent) {
         match mouse.kind {
-            MouseEventKind::ScrollUp => self.messages.scroll_up(3),
-            MouseEventKind::ScrollDown => self.messages.scroll_down(3),
+            MouseEventKind::ScrollUp => {
+                if self.split_view && self.split_focus == SplitFocus::Channel {
+                    self.channel_panel_state.scroll_up(3);
+                } else {
+                    self.messages.scroll_up(3);
+                }
+            }
+            MouseEventKind::ScrollDown => {
+                if self.split_view && self.split_focus == SplitFocus::Channel {
+                    self.channel_panel_state.scroll_down(3);
+                } else {
+                    self.messages.scroll_down(3);
+                }
+            }
             _ => {}
         }
     }
@@ -536,6 +628,8 @@ impl App {
                 warn!("unsubscribe failed: {}", e);
             }
             self.messages.exit_dm();
+            self.split_view = false;
+            self.split_focus = SplitFocus::Dm;
             self.sync_navigation_selection();
         }
     }
@@ -577,6 +671,53 @@ impl App {
 
             "/back" => {
                 self.exit_dm().await;
+            }
+
+            "/clear" => {
+                if let Some(ref dm) = self.active_dm {
+                    let node_name = dm.node_name.clone();
+                    match self.client.session_clear(&node_name).await {
+                        Ok(_) => {
+                            self.messages.clear_dm();
+                            if let Some(ref mut dm_state) = self.active_dm {
+                                dm_state.messages.clear();
+                                dm_state.is_responding = false;
+                            }
+                            self.push_contextual_system(&format!(
+                                "/clear — {} session 已清除",
+                                node_name
+                            ));
+                        }
+                        Err(e) => {
+                            self.push_contextual_system(&format!("/clear — 清除失败: {}", e))
+                        }
+                    }
+                } else {
+                    self.push_contextual_system("/clear 仅在 DM 模式下可用");
+                }
+            }
+
+            "/compact" => {
+                if let Some(ref dm) = self.active_dm {
+                    let node_name = dm.node_name.clone();
+                    self.push_contextual_system(&format!(
+                        "/compact — 正在压缩 {} 上下文...",
+                        node_name
+                    ));
+                    match self.client.session_compact(&node_name).await {
+                        Ok(_) => {
+                            self.push_contextual_system(&format!(
+                                "{} 上下文已压缩",
+                                node_name
+                            ));
+                        }
+                        Err(e) => {
+                            self.push_contextual_system(&format!("压缩失败: {}", e))
+                        }
+                    }
+                } else {
+                    self.push_contextual_system("/compact 仅在 DM 模式下可用");
+                }
             }
 
             "/create" => {
@@ -829,6 +970,10 @@ impl App {
                     .push_system("  /list                 列出 agents");
                 self.messages
                     .push_system("  /restore [n]          恢复归档频道");
+                self.messages
+                    .push_system("  /clear                清除 DM session");
+                self.messages
+                    .push_system("  /compact              压缩 DM 上下文");
                 self.messages
                     .push_system("  /dm <name>            与 agent 1v1 对话");
                 self.messages
@@ -1185,6 +1330,66 @@ impl App {
                         }
                     }
                 }
+                Some("tool_call") => {
+                    let tc = update.get("toolCall").or_else(|| update.get("tool_call"));
+                    if let Some(tc) = tc {
+                        let tool_name = tc.get("name").and_then(|v| v.as_str()).unwrap_or("unknown");
+                        let desc = tc.get("description").and_then(|v| v.as_str()).unwrap_or("");
+                        let mut formatted = format!("\n[tool:{}]", tool_name);
+                        if !desc.is_empty() {
+                            formatted.push(' ');
+                            formatted.push_str(desc);
+                        }
+                        if let Some(input) = tc.get("input").and_then(|v| v.as_object()) {
+                            for (key, val) in input {
+                                let val_str = match val.as_str() {
+                                    Some(s) if s.len() > 120 => format!("{}…", &s[..120]),
+                                    Some(s) => s.to_string(),
+                                    None => {
+                                        let j = serde_json::to_string(val).unwrap_or_default();
+                                        if j.len() > 120 { format!("{}…", &j[..120]) } else { j }
+                                    }
+                                };
+                                formatted.push_str(&format!("\n  {}: {}", key, val_str));
+                            }
+                        }
+                        if let Some(entry) = self.messages.streaming.iter_mut().find(|(n, _)| n == name) {
+                            entry.1.push_str(&formatted);
+                        } else {
+                            self.messages.streaming.push((name.to_string(), formatted));
+                        }
+                    }
+                }
+                Some("tool_call_update") => {
+                    let tcu = update.get("toolCallUpdate").or_else(|| update.get("tool_call_update"));
+                    if let Some(tcu) = tcu {
+                        let status = tcu.get("status").and_then(|v| v.as_str()).unwrap_or("");
+                        if status == "completed" || status == "failed" {
+                            let result_val = tcu.get("result")
+                                .or_else(|| tcu.get("output"))
+                                .and_then(|v| v.get("value").or(Some(v)));
+                            let result_text = match result_val {
+                                Some(v) if v.is_string() => v.as_str().unwrap_or("").to_string(),
+                                Some(v) => serde_json::to_string_pretty(v).unwrap_or_default(),
+                                None => String::new(),
+                            };
+                            let marker = if status == "completed" { "✓" } else { "✗" };
+                            let mut formatted = format!("\n[tool_result:{}]", marker);
+                            let lines: Vec<&str> = result_text.lines().collect();
+                            for (i, line) in lines.iter().enumerate() {
+                                if i >= 3 {
+                                    formatted.push_str(&format!("\n  … {} 行已省略", lines.len() - 3));
+                                    break;
+                                }
+                                let display = if line.len() > 150 { &line[..150] } else { line };
+                                formatted.push_str(&format!("\n  {}", display));
+                            }
+                            if let Some(entry) = self.messages.streaming.iter_mut().find(|(n, _)| n == name) {
+                                entry.1.push_str(&formatted);
+                            }
+                        }
+                    }
+                }
                 _ => {
                     debug!("node.update from {} unhandled: {:?}", name, detail);
                 }
@@ -1287,6 +1492,8 @@ impl App {
             "/back".into(),
             "/help".into(),
             "/restore".into(),
+            "/clear".into(),
+            "/compact".into(),
             "/quit".into(),
         ];
         for agent in &self.agents {
