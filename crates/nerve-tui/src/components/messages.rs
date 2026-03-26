@@ -21,6 +21,10 @@ struct MessageLine {
 /// DM mode display state
 pub struct DmView {
     pub agent_name: String,
+    /// Usage label: e.g. "45.2k/200k 23%"
+    pub usage_label: Option<String>,
+    /// Usage percentage (0.0-1.0) for color coding
+    pub usage_ratio: f64,
 }
 
 pub struct MessagesView {
@@ -186,12 +190,30 @@ impl MessagesView {
     pub fn enter_dm(&mut self, agent_name: &str) {
         self.dm_view = Some(DmView {
             agent_name: agent_name.to_string(),
+            usage_label: None,
+            usage_ratio: 0.0,
         });
         self.dm_lines.clear();
         self.streaming.clear();
         self.scroll_offset = 0;
         self.auto_scroll = true;
         self.has_new_messages = false;
+    }
+
+    pub fn update_usage(&mut self, used: f64, size: f64, cost: f64) {
+        if let Some(ref mut dv) = self.dm_view {
+            let ratio = if size > 0.0 { used / size } else { 0.0 };
+            let pct = (ratio * 100.0) as u32;
+            let label = format!(
+                "{}/{} {}% ${:.2}",
+                format_tokens(used),
+                format_tokens(size),
+                pct,
+                cost
+            );
+            dv.usage_label = Some(label);
+            dv.usage_ratio = ratio;
+        }
     }
 
     pub fn exit_dm(&mut self) {
@@ -216,18 +238,33 @@ impl MessagesView {
     }
 
     pub fn render(&mut self, area: Rect, buf: &mut Buffer) {
-        let title = if let Some(ref dv) = self.dm_view {
-            format!(" 与 {} 的对话 ", dv.agent_name)
+        let (title, usage_span) = if let Some(ref dv) = self.dm_view {
+            let t = format!(" 与 {} 的对话 ", dv.agent_name);
+            let u = dv.usage_label.as_ref().map(|label| {
+                let color = if dv.usage_ratio >= 0.9 {
+                    Color::Red
+                } else if dv.usage_ratio >= 0.8 {
+                    Color::Yellow
+                } else {
+                    theme::BORDER
+                };
+                Span::styled(format!(" {} ", label), Style::default().fg(color))
+            });
+            (t, u)
         } else {
-            " Messages ".to_string()
+            (" Messages ".to_string(), None)
         };
 
-        let block = Block::default()
+        let mut block = Block::default()
             .borders(Borders::LEFT)
             .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(theme::BORDER))
             .title(title)
             .title_style(Style::default().fg(theme::BORDER));
+
+        if let Some(usage) = usage_span {
+            block = block.title_top(Line::from(usage).alignment(ratatui::layout::Alignment::Right));
+        }
 
         let inner = block.inner(area);
         self.visible_height = inner.height;
@@ -1096,6 +1133,16 @@ fn truncate_str(s: &str, max_chars: usize) -> String {
     } else {
         let truncated: String = s.chars().take(max_chars).collect();
         format!("{}…", truncated)
+    }
+}
+
+fn format_tokens(n: f64) -> String {
+    if n >= 1_000_000.0 {
+        format!("{:.1}M", n / 1_000_000.0)
+    } else if n >= 1_000.0 {
+        format!("{:.1}k", n / 1_000.0)
+    } else {
+        format!("{}", n as u64)
     }
 }
 

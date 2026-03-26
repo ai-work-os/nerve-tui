@@ -1507,6 +1507,14 @@ impl App {
                         }
                     }
                 }
+                Some("usage_update") => {
+                    let used = update.get("used").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                    let size = update.get("size").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                    let cost = update.get("cost").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                    if in_dm {
+                        self.messages.update_usage(used, size, cost);
+                    }
+                }
                 _ => {
                     debug!("node.update from {} unhandled: {:?}", name, detail);
                 }
