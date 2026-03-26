@@ -811,6 +811,7 @@ mod tests {
                 channels: vec![],
                 created_at: 0.0,
                 last_active_at: 0.0,
+                usage: None,
             },
             NodeInfo {
                 id: "n2".into(),
@@ -823,6 +824,7 @@ mod tests {
                 channels: vec![],
                 created_at: 0.0,
                 last_active_at: 0.0,
+                usage: None,
             },
         ];
 

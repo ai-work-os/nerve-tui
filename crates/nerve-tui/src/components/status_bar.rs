@@ -13,6 +13,7 @@ pub struct AgentDisplay {
     pub activity: Option<String>,
     pub adapter: Option<String>,
     pub node_id: String,
+    pub usage: Option<(f64, f64, f64)>, // (token_used, token_size, cost)
 }
 
 #[derive(Debug, Clone)]
@@ -304,6 +305,7 @@ mod tests {
                 activity: None,
                 adapter: Some("claude".to_string()),
                 node_id: format!("n{}", i),
+                usage: None,
             })
             .collect()
     }
@@ -490,9 +492,9 @@ mod tests {
             unread: 0,
         };
         let agents = vec![
-            AgentDisplay { name: "a".into(), status: "idle".into(), activity: None, adapter: None, node_id: "n1".into() },
-            AgentDisplay { name: "b".into(), status: "busy".into(), activity: None, adapter: None, node_id: "n2".into() },
-            AgentDisplay { name: "c".into(), status: "busy".into(), activity: None, adapter: None, node_id: "n3".into() },
+            AgentDisplay { name: "a".into(), status: "idle".into(), activity: None, adapter: None, node_id: "n1".into(), usage: None },
+            AgentDisplay { name: "b".into(), status: "busy".into(), activity: None, adapter: None, node_id: "n2".into(), usage: None },
+            AgentDisplay { name: "c".into(), status: "busy".into(), activity: None, adapter: None, node_id: "n3".into(), usage: None },
         ];
         let busy = ch.members.iter().filter(|m| {
             agents.iter().any(|a| a.node_id == m.node_id && a.status == "busy")

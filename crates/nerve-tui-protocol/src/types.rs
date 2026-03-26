@@ -22,6 +22,16 @@ pub struct NodeInfo {
     pub created_at: f64,
     #[serde(default)]
     pub last_active_at: f64,
+    pub usage: Option<NodeUsage>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NodeUsage {
+    pub token_used: f64,
+    pub token_size: f64,
+    pub cost: f64,
+    pub last_updated: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -275,6 +285,7 @@ mod tests {
             channels: vec![],
             created_at: 0.0,
             last_active_at: 0.0,
+            usage: None,
         };
         let json = serde_json::to_value(&node).unwrap();
         assert!(json.get("createdAt").is_some());

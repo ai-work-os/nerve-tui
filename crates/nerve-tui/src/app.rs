@@ -673,6 +673,14 @@ impl App {
             is_responding: false,
         });
         self.messages.enter_dm(&node_name);
+
+        // Initialize usage display from agent snapshot
+        if let Some(agent) = self.agents.iter().find(|a| a.name == node_name) {
+            if let Some((used, size, cost)) = agent.usage {
+                self.messages.update_usage(used, size, cost);
+            }
+        }
+
         self.sync_navigation_selection();
     }
 
@@ -1511,6 +1519,10 @@ impl App {
                     let used = update.get("used").and_then(|v| v.as_f64()).unwrap_or(0.0);
                     let size = update.get("size").and_then(|v| v.as_f64()).unwrap_or(0.0);
                     let cost = update.get("cost").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                    // Update agent cache for DM re-entry
+                    if let Some(agent) = self.agents.iter_mut().find(|a| a.node_id == node_id) {
+                        agent.usage = Some((used, size, cost));
+                    }
                     if in_dm {
                         self.messages.update_usage(used, size, cost);
                     }
@@ -1611,6 +1623,7 @@ impl App {
                         activity: None,
                         adapter: n.adapter,
                         node_id: n.id,
+                        usage: n.usage.map(|u| (u.token_used, u.token_size, u.cost)),
                     })
                     .collect();
                 self.update_completions();
@@ -1783,6 +1796,7 @@ mod tests {
             activity: None,
             adapter: Some("claude".into()),
             node_id: "n1".into(),
+            usage: None,
         }];
         app.active_channel = Some("ch2".into());
 
@@ -1808,6 +1822,7 @@ mod tests {
                 activity: None,
                 adapter: Some("claude".into()),
                 node_id: "n1".into(),
+                usage: None,
             },
             AgentDisplay {
                 name: "bob".into(),
@@ -1815,6 +1830,7 @@ mod tests {
                 activity: None,
                 adapter: Some("codex".into()),
                 node_id: "n2".into(),
+                usage: None,
             },
         ];
         app.active_channel = Some("ch1".into());

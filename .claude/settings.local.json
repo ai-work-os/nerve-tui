@@ -1,0 +1,30 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(GVM_ROOT=\"\" cargo check)",
+      "Bash(export PATH=\"$HOME/.cargo/bin:$PATH\")",
+      "Bash(GVM_ROOT=\"\" ~/.cargo/bin/cargo check)",
+      "Bash(export PATH=\"$HOME/.cargo/bin:/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin:$PATH\")",
+      "mcp__nerve__nerve_post",
+      "WebSearch",
+      "Bash(gh api repos/ratatui/ratatui/contents/examples --jq '.[].name')",
+      "Bash(gh api repos/extrawurst/gitui/contents/KEY_CONFIG.md --jq '.content')",
+      "Bash(gh api repos/ClementTsang/bottom/contents/docs --jq '.[].name')",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "Bash(gh search code \"fn find\" --repo extrawurst/gitui --filename \"*.rs\" -L 10)",
+      "Bash(curl -s \"https://api.github.com/search/code?q=fuzzy_find+repo:extrawurst/gitui&per_page=5\")",
+      "Bash(python3 -c \"import sys,json; data=json.load\\(sys.stdin\\); [print\\(item[''path'']\\) for item in data.get\\(''items'',[]\\)]\")",
+      "WebFetch(domain:clementtsang.github.io)",
+      "Bash(sqlite3 /Users/renjinxi/.nerve/nerve.db \"SELECT from_name, count\\(*\\) FROM messages GROUP BY from_name ORDER BY count\\(*\\) DESC LIMIT 20;\")",
+      "Bash(sqlite3 /Users/renjinxi/.nerve/nerve.db \"SELECT from_name, content, datetime\\(timestamp/1000, ''unixepoch'', ''localtime''\\) as time FROM messages ORDER BY timestamp DESC LIMIT 20;\")",
+      "WebFetch(domain:crates.io)",
+      "WebFetch(domain:docs.rs)",
+      "WebFetch(domain:gist.github.com)",
+      "Bash(/tmp/check_wrapping.md:*)",
+      "Read(//tmp/**)"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}
