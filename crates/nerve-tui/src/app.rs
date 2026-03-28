@@ -333,6 +333,8 @@ impl App {
                         SplitFocus::Dm => SplitFocus::Channel,
                         SplitFocus::Channel => SplitFocus::Dm,
                     };
+                } else {
+                    self.input.delete_word();
                 }
             }
 
@@ -476,6 +478,9 @@ impl App {
             }
 
             // Text editing
+            KeyCode::Backspace if key.modifiers.contains(KeyModifiers::ALT) => {
+                self.input.delete_word();
+            }
             KeyCode::Backspace => self.input.backspace(),
             KeyCode::Delete => self.input.delete(),
             KeyCode::Left => self.input.move_left(),
