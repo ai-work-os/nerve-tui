@@ -17,9 +17,22 @@ use unicode_width::UnicodeWidthStr;
 static SYNTAX_SET: LazyLock<SyntaxSet> = LazyLock::new(SyntaxSet::load_defaults_newlines);
 
 /// Global theme for code highlighting.
+/// Auto-detect light/dark terminal via COLORFGBG env var.
 static CODE_THEME: LazyLock<Theme> = LazyLock::new(|| {
     let ts = ThemeSet::load_defaults();
-    ts.themes["base16-ocean.dark"].clone()
+    let is_dark = std::env::var("COLORFGBG")
+        .map(|v| {
+            // Format: "fg;bg" — bg < 8 means dark background
+            v.rsplit(';').next()
+                .and_then(|bg| bg.parse::<u32>().ok())
+                .map(|bg| bg < 8)
+                .unwrap_or(false)
+        })
+        .unwrap_or(false);
+    let theme_name = if is_dark { "base16-ocean.dark" } else { "base16-ocean.light" };
+    ts.themes.get(theme_name)
+        .cloned()
+        .unwrap_or_else(|| ts.themes["base16-ocean.dark"].clone())
 });
 
 /// Options controlling block rendering (expand/collapse state).
