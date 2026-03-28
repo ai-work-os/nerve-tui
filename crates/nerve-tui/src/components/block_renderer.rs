@@ -424,7 +424,11 @@ fn render_thinking(text: &str, elapsed: Option<std::time::Duration>, expanded: b
         }
         for line in preview_lines.into_iter().rev() {
             let truncated = if line.len() > 100 {
-                format!("{}…", &line[..100])
+                let end = line.char_indices()
+                    .map(|(i, _)| i)
+                    .find(|&i| i >= 100)
+                    .unwrap_or(line.len());
+                format!("{}…", &line[..end])
             } else {
                 line.to_string()
             };
