@@ -60,6 +60,8 @@ pub struct App {
     channel_panel_state: ChannelPanelState,
     /// Cached x-coordinate where the channel panel starts (for mouse hit-testing in split view).
     last_channel_panel_x: Option<u16>,
+    /// Dirty flag — skip redraw if nothing changed since last frame.
+    needs_redraw: bool,
 }
 
 impl App {
@@ -105,6 +107,7 @@ impl App {
             split_focus: SplitFocus::Dm,
             channel_panel_state: ChannelPanelState::new(),
             last_channel_panel_x: None,
+            needs_redraw: true,
         }
     }
 
@@ -166,12 +169,16 @@ impl App {
         let mut redraw_interval = tokio::time::interval(tokio::time::Duration::from_millis(33));
 
         loop {
-            terminal.draw(|frame| self.render(frame))?;
+            if self.needs_redraw {
+                terminal.draw(|frame| self.render(frame))?;
+                self.needs_redraw = false;
+            }
 
             if self.should_quit {
                 break;
             }
 
+            // Wait for at least one event
             tokio::select! {
                 Some(Ok(evt)) = event_stream.next() => {
                     match evt {
@@ -183,14 +190,24 @@ impl App {
                         Event::Paste(text) => self.input.insert_str(&text),
                         _ => {}
                     }
+                    self.needs_redraw = true;
                 }
                 Some(event) = self.event_rx.recv() => {
                     self.handle_nerve_event(event).await;
+                    // Drain all pending nerve events before redrawing (batch chunks)
+                    while let Ok(event) = self.event_rx.try_recv() {
+                        self.handle_nerve_event(event).await;
+                    }
+                    self.needs_redraw = true;
                 }
                 Some(err_msg) = self.error_rx.recv() => {
                     self.messages.push_system(&err_msg);
+                    self.needs_redraw = true;
                 }
-                _ = redraw_interval.tick() => {}
+                _ = redraw_interval.tick() => {
+                    // Periodic redraw for animations (blink cursor, thinking timer)
+                    self.needs_redraw = true;
+                }
             }
         }
 
