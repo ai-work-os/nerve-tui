@@ -5,11 +5,11 @@ use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::collections::hash_map::DefaultHasher;
 
-use nerve_tui_protocol::{ContentBlock, Message};
+use nerve_tui_protocol::{ContentBlock, Message, ToolStatus};
 use ratatui::text::Line;
 use tracing::debug;
 
-use super::block_renderer;
+use super::block_renderer::{self, BlockRenderOpts};
 
 /// Cache entry for a single message's rendered output.
 struct CacheEntry {
@@ -33,16 +33,25 @@ impl RenderCache {
 
     /// Get or render a message's lines.
     /// Returns cached result if width and content haven't changed.
-    pub fn get_or_render(&mut self, msg: &Message, width: u16) -> &[Line<'static>] {
-        let hash = content_hash(msg);
+    /// `expand_state` maps block_index -> expanded for collapsible blocks.
+    pub fn get_or_render(
+        &mut self,
+        msg: &Message,
+        width: u16,
+        expand_state: &HashMap<usize, bool>,
+    ) -> &[Line<'static>] {
+        let hash = content_hash(msg, expand_state);
 
-        let needs_render = match self.entries.get(&msg.id) {
+        // Skip cache entirely if message has live (running) blocks
+        let has_live = msg.blocks.iter().any(is_live_block);
+
+        let needs_render = has_live || match self.entries.get(&msg.id) {
             Some(entry) => entry.width != width || entry.content_hash != hash,
             None => true,
         };
 
         if needs_render {
-            let rendered = render_message(msg, width);
+            let rendered = render_message(msg, width, expand_state);
             debug!(
                 message_id = %msg.id,
                 blocks = msg.blocks.len(),
@@ -84,20 +93,36 @@ impl RenderCache {
     }
 }
 
+/// Check if a block is "live" (running, needs real-time updates — not cacheable).
+fn is_live_block(block: &ContentBlock) -> bool {
+    match block {
+        ContentBlock::Thinking { finished_at: None, started_at: Some(_), .. } => true,
+        ContentBlock::ToolCall { status: ToolStatus::Running | ToolStatus::Pending, .. } => true,
+        _ => false,
+    }
+}
+
 /// Render all blocks of a message into lines.
-fn render_message(msg: &Message, width: u16) -> Vec<Line<'static>> {
+fn render_message(msg: &Message, width: u16, expand_state: &HashMap<usize, bool>) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
-    for block in &msg.blocks {
-        lines.extend(block_renderer::render_block(block, width));
+    for (i, block) in msg.blocks.iter().enumerate() {
+        let expanded = expand_state.get(&i).copied().unwrap_or(false);
+        let opts = BlockRenderOpts { expanded };
+        lines.extend(block_renderer::render_block_with_opts(block, width, opts));
     }
     lines
 }
 
 /// Hash the content of a message's blocks for cache invalidation.
-fn content_hash(msg: &Message) -> u64 {
+fn content_hash(msg: &Message, expand_state: &HashMap<usize, bool>) -> u64 {
     let mut hasher = DefaultHasher::new();
     msg.blocks.len().hash(&mut hasher);
     msg.meta.partial.hash(&mut hasher);
+    // Include expand state in hash so toggling invalidates cache
+    for (idx, expanded) in expand_state {
+        idx.hash(&mut hasher);
+        expanded.hash(&mut hasher);
+    }
     for block in &msg.blocks {
         match block {
             ContentBlock::Text { text } => {
@@ -145,7 +170,7 @@ mod tests {
         let mut cache = RenderCache::new();
         let mut msg = make_msg("m1");
         msg.blocks.push(ContentBlock::Text { text: "hello".into() });
-        let lines = cache.get_or_render(&msg, 80);
+        let lines = cache.get_or_render(&msg, 80, &HashMap::new());
         assert!(!lines.is_empty());
         assert_eq!(cache.len(), 1);
     }
@@ -156,11 +181,11 @@ mod tests {
         let mut msg = make_msg("m1");
         msg.blocks.push(ContentBlock::Text { text: "hello".into() });
 
-        let lines1 = cache.get_or_render(&msg, 80);
+        let lines1 = cache.get_or_render(&msg, 80, &HashMap::new());
         let len1 = lines1.len();
 
         // Second call should hit cache (same content, same width)
-        let lines2 = cache.get_or_render(&msg, 80);
+        let lines2 = cache.get_or_render(&msg, 80, &HashMap::new());
         assert_eq!(lines2.len(), len1);
         assert_eq!(cache.len(), 1);
     }
@@ -171,11 +196,11 @@ mod tests {
         let mut msg = make_msg("m1");
         msg.blocks.push(ContentBlock::Text { text: "hello".into() });
 
-        cache.get_or_render(&msg, 80);
+        cache.get_or_render(&msg, 80, &HashMap::new());
         assert_eq!(cache.len(), 1);
 
         // Width changed → should re-render
-        cache.get_or_render(&msg, 120);
+        cache.get_or_render(&msg, 120, &HashMap::new());
         // Still 1 entry (same message_id, updated)
         assert_eq!(cache.len(), 1);
     }
@@ -186,13 +211,13 @@ mod tests {
         let mut msg = make_msg("m1");
         msg.blocks.push(ContentBlock::Text { text: "hello".into() });
 
-        cache.get_or_render(&msg, 80);
+        cache.get_or_render(&msg, 80, &HashMap::new());
 
         // Content changed (streaming appended)
         if let Some(ContentBlock::Text { ref mut text }) = msg.blocks.last_mut() {
             text.push_str(" world");
         }
-        let lines = cache.get_or_render(&msg, 80);
+        let lines = cache.get_or_render(&msg, 80, &HashMap::new());
         let text: String = lines.iter()
             .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
             .collect();
@@ -206,11 +231,11 @@ mod tests {
         msg.meta.partial = true;
         msg.blocks.push(ContentBlock::Text { text: "hello".into() });
 
-        cache.get_or_render(&msg, 80);
+        cache.get_or_render(&msg, 80, &HashMap::new());
 
         // partial → false
         msg.meta.partial = false;
-        cache.get_or_render(&msg, 80);
+        cache.get_or_render(&msg, 80, &HashMap::new());
         // Should have re-rendered (hash includes partial flag)
         assert_eq!(cache.len(), 1);
     }
@@ -220,7 +245,7 @@ mod tests {
         let mut cache = RenderCache::new();
         let mut msg = make_msg("m1");
         msg.blocks.push(ContentBlock::Text { text: "hello".into() });
-        cache.get_or_render(&msg, 80);
+        cache.get_or_render(&msg, 80, &HashMap::new());
 
         cache.invalidate("m1");
         assert!(cache.is_empty());
@@ -234,8 +259,8 @@ mod tests {
         let mut msg2 = make_msg("m2");
         msg2.blocks.push(ContentBlock::Text { text: "b".into() });
 
-        cache.get_or_render(&msg1, 80);
-        cache.get_or_render(&msg2, 80);
+        cache.get_or_render(&msg1, 80, &HashMap::new());
+        cache.get_or_render(&msg2, 80, &HashMap::new());
         assert_eq!(cache.len(), 2);
 
         cache.clear();
@@ -250,15 +275,15 @@ mod tests {
         let mut msg2 = make_msg("m2");
         msg2.blocks.push(ContentBlock::Text { text: "second".into() });
 
-        cache.get_or_render(&msg1, 80);
-        cache.get_or_render(&msg2, 80);
+        cache.get_or_render(&msg1, 80, &HashMap::new());
+        cache.get_or_render(&msg2, 80, &HashMap::new());
         assert_eq!(cache.len(), 2);
 
         // Modify msg1 only
         if let Some(ContentBlock::Text { ref mut text }) = msg1.blocks.last_mut() {
             text.push_str(" updated");
         }
-        cache.get_or_render(&msg1, 80);
+        cache.get_or_render(&msg1, 80, &HashMap::new());
         // msg2 should still be cached (untouched)
         assert_eq!(cache.len(), 2);
     }
@@ -274,13 +299,13 @@ mod tests {
             status: ToolStatus::Pending,
         });
 
-        cache.get_or_render(&msg, 80);
+        cache.get_or_render(&msg, 80, &HashMap::new());
 
         // Status changes
         if let Some(ContentBlock::ToolCall { ref mut status, .. }) = msg.blocks.last_mut() {
             *status = ToolStatus::Completed;
         }
-        let lines = cache.get_or_render(&msg, 80);
+        let lines = cache.get_or_render(&msg, 80, &HashMap::new());
         let text: String = lines.iter()
             .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
             .collect();

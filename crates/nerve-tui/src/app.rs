@@ -450,6 +450,11 @@ impl App {
                 }
             }
 
+            // Ctrl+E: toggle expand/collapse for all streaming tool/thinking blocks
+            KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.messages.toggle_all_streaming_blocks();
+            }
+
             // Esc: dismiss popup → switch split focus to DM → cancel/exit DM
             KeyCode::Esc => {
                 if self.input.is_popup_visible() {

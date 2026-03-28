@@ -22,7 +22,13 @@
       "WebFetch(domain:docs.rs)",
       "WebFetch(domain:gist.github.com)",
       "Bash(/tmp/check_wrapping.md:*)",
-      "Read(//tmp/**)"
+      "Read(//tmp/**)",
+      "mcp__nerve__nerve_session_reset",
+      "mcp__nerve__nerve_create_channel",
+      "mcp__nerve__nerve_spawn",
+      "mcp__nerve__nerve_stop",
+      "Bash(find crates/nerve-tui/src -name \"*.rs\" -exec wc -l {} +)",
+      "Bash(find /Users/renjinxi/work/worktree/ai-work-os/nerve-tui -name \"*.rs\" -exec wc -l {} +)"
     ],
     "deny": [],
     "ask": []

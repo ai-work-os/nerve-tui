@@ -1,7 +1,7 @@
 use crate::theme;
-use crate::components::block_renderer;
+use crate::components::block_renderer::{self, BlockRenderOpts};
 use chrono::{Local, TimeZone};
-use nerve_tui_protocol::{DmMessage, Message, MessageInfo, Role};
+use nerve_tui_protocol::{ContentBlock, DmMessage, Message, MessageInfo, Role};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
@@ -53,6 +53,9 @@ pub struct MessagesView {
     channel_unread: HashMap<String, usize>,
     /// Blink tick counter for streaming cursor (toggles every ~500ms)
     blink_tick: u16,
+    /// Per-block expand state: (message_id, block_index) -> expanded.
+    /// Default (missing) = collapsed for tool/thinking blocks.
+    block_expand: HashMap<(String, usize), bool>,
 }
 
 impl MessagesView {
@@ -72,6 +75,45 @@ impl MessagesView {
             channel_cache: HashMap::new(),
             channel_unread: HashMap::new(),
             blink_tick: 0,
+            block_expand: HashMap::new(),
+        }
+    }
+
+    /// Toggle expand/collapse for a specific block in a streaming message.
+    /// `agent_name` identifies the streaming message, `block_index` the block within it.
+    pub fn toggle_streaming_block(&mut self, agent_name: &str, block_index: usize) -> bool {
+        if let Some(msg) = self.streaming_messages.get(agent_name) {
+            let key = (msg.id.clone(), block_index);
+            let current = self.block_expand.get(&key).copied().unwrap_or(false);
+            let new_state = !current;
+            self.block_expand.insert(key, new_state);
+            new_state
+        } else {
+            false
+        }
+    }
+
+    /// Toggle all collapsible blocks in all active streaming messages.
+    /// If any is collapsed, expand all; otherwise collapse all.
+    pub fn toggle_all_streaming_blocks(&mut self) {
+        let collapsible: Vec<(String, usize)> = self.streaming_messages.iter()
+            .flat_map(|(_, msg)| {
+                msg.blocks.iter().enumerate()
+                    .filter(|(_, b)| matches!(b, ContentBlock::Thinking { .. } | ContentBlock::ToolCall { .. } | ContentBlock::ToolResult { .. }))
+                    .map(|(i, _)| (msg.id.clone(), i))
+            })
+            .collect();
+
+        if collapsible.is_empty() {
+            return;
+        }
+
+        let any_collapsed = collapsible.iter().any(|key| {
+            !self.block_expand.get(key).copied().unwrap_or(false)
+        });
+
+        for key in collapsible {
+            self.block_expand.insert(key, any_collapsed);
         }
     }
 
@@ -525,8 +567,13 @@ impl MessagesView {
             // Try structured rendering first (new pipeline)
             if let Some(msg) = self.streaming_messages.get(name) {
                 if !msg.blocks.is_empty() {
-                    for block in &msg.blocks {
-                        let rendered = block_renderer::render_block(block, width);
+                    for (bi, block) in msg.blocks.iter().enumerate() {
+                        let expanded = self.block_expand
+                            .get(&(msg.id.clone(), bi))
+                            .copied()
+                            .unwrap_or(false);
+                        let opts = BlockRenderOpts { expanded };
+                        let rendered = block_renderer::render_block_with_opts(block, width, opts);
                         out.extend(rendered);
                     }
                     continue;

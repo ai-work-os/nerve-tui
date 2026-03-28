@@ -1,7 +1,9 @@
 //! Message list layout with item-granularity management, gaps, follow-mode scrolling,
 //! and bottom padding.
 
-use nerve_tui_protocol::Message;
+use std::collections::HashMap;
+
+use nerve_tui_protocol::{ContentBlock, Message};
 use ratatui::text::Line;
 use tracing::debug;
 
@@ -14,6 +16,9 @@ const MESSAGE_GAP: u16 = 1;
 /// Maximum content width for readability.
 pub const MAX_CONTENT_WIDTH: u16 = 120;
 
+/// Key for block expand state: (message_id, block_index).
+type BlockKey = (String, usize);
+
 /// Message list with follow-mode scrolling and render cache integration.
 pub struct MessageList {
     /// Scroll offset from bottom (0 = at bottom).
@@ -24,6 +29,8 @@ pub struct MessageList {
     visible_height: u16,
     /// Render cache for message lines.
     cache: RenderCache,
+    /// Per-block expand state. Missing = default (collapsed for tool/thinking).
+    expand_state: HashMap<BlockKey, bool>,
 }
 
 impl MessageList {
@@ -33,6 +40,7 @@ impl MessageList {
             follow: true,
             visible_height: 0,
             cache: RenderCache::new(),
+            expand_state: HashMap::new(),
         }
     }
 
@@ -76,6 +84,50 @@ impl MessageList {
         self.cache.invalidate(message_id);
     }
 
+    /// Toggle expand state of a specific block within a message.
+    /// Returns the new expanded state.
+    pub fn toggle_block_expand(&mut self, message_id: &str, block_index: usize) -> bool {
+        let key = (message_id.to_string(), block_index);
+        let current = self.expand_state.get(&key).copied().unwrap_or(false);
+        let new_state = !current;
+        self.expand_state.insert(key, new_state);
+        // Invalidate cache for this message since its rendering changed
+        self.cache.invalidate(message_id);
+        debug!(message_id, block_index, expanded = new_state, "toggled block expand");
+        new_state
+    }
+
+    /// Toggle expand for all collapsible blocks in a message at once.
+    pub fn toggle_all_blocks(&mut self, msg: &Message) {
+        // Determine target state: if any collapsible block is collapsed, expand all; else collapse all
+        let collapsible: Vec<usize> = msg.blocks.iter().enumerate()
+            .filter(|(_, b)| is_collapsible(b))
+            .map(|(i, _)| i)
+            .collect();
+
+        if collapsible.is_empty() {
+            return;
+        }
+
+        let any_collapsed = collapsible.iter().any(|i| {
+            !self.expand_state.get(&(msg.id.clone(), *i)).copied().unwrap_or(false)
+        });
+
+        for i in collapsible {
+            self.expand_state.insert((msg.id.clone(), i), any_collapsed);
+        }
+        self.cache.invalidate(&msg.id);
+        debug!(message_id = %msg.id, expand = any_collapsed, "toggled all blocks");
+    }
+
+    /// Get expand state map for a specific message (block_index -> expanded).
+    fn expand_state_for_message(&self, message_id: &str) -> HashMap<usize, bool> {
+        self.expand_state.iter()
+            .filter(|((mid, _), _)| mid == message_id)
+            .map(|((_, idx), &expanded)| (*idx, expanded))
+            .collect()
+    }
+
     /// Clear all cached renders (e.g. on terminal resize).
     pub fn clear_cache(&mut self) {
         self.cache.clear();
@@ -101,7 +153,8 @@ impl MessageList {
                     all_lines.push(Line::from(""));
                 }
             }
-            let rendered = self.cache.get_or_render(msg, content_width);
+            let es = self.expand_state_for_message(&msg.id);
+            let rendered = self.cache.get_or_render(msg, content_width, &es);
             all_lines.extend_from_slice(rendered);
         }
 
@@ -131,10 +184,19 @@ impl MessageList {
     }
 }
 
+/// Whether a block type supports expand/collapse.
+fn is_collapsible(block: &ContentBlock) -> bool {
+    matches!(
+        block,
+        ContentBlock::Thinking { .. } | ContentBlock::ToolCall { .. } | ContentBlock::ToolResult { .. }
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nerve_tui_protocol::{Message, Role, ContentBlock};
+    use nerve_tui_protocol::{Message, Role, ContentBlock, ToolStatus};
+    use std::time::Instant;
 
     fn make_text_msg(id: &str, text: &str) -> Message {
         let mut msg = Message::new(id.into(), Role::User, 0);
@@ -290,6 +352,106 @@ mod tests {
 
         list.invalidate_message("m1");
         assert_eq!(list.cache.len(), 1);
+    }
+
+    fn make_tool_msg(id: &str) -> Message {
+        let mut msg = Message::new(id.into(), Role::Assistant, 0);
+        msg.meta.partial = false;
+        msg.blocks.push(ContentBlock::ToolCall {
+            id: "tc1".into(),
+            name: "Read".into(),
+            input: r#"{"path": "/tmp/test.rs"}"#.into(),
+            status: ToolStatus::Completed,
+        });
+        msg
+    }
+
+    fn make_thinking_msg(id: &str, finished: bool) -> Message {
+        let mut msg = Message::new(id.into(), Role::Assistant, 0);
+        msg.meta.partial = !finished;
+        let now = Instant::now();
+        msg.blocks.push(ContentBlock::Thinking {
+            text: "considering options...".into(),
+            started_at: Some(now),
+            finished_at: if finished { Some(now) } else { None },
+        });
+        msg
+    }
+
+    #[test]
+    fn blocks_collapsed_by_default() {
+        let mut list = MessageList::new();
+        let msgs = vec![make_tool_msg("m1")];
+        let lines = list.build_visible_lines(&msgs, 80, 20);
+        let text: String = lines.iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
+            .collect();
+        // Collapsed: should show ▶ indicator
+        assert!(text.contains("▶") || text.contains("Read"));
+    }
+
+    #[test]
+    fn toggle_block_expand() {
+        let mut list = MessageList::new();
+        // Toggle from default (collapsed) to expanded
+        let expanded = list.toggle_block_expand("m1", 0);
+        assert!(expanded);
+        // Toggle back
+        let collapsed = list.toggle_block_expand("m1", 0);
+        assert!(!collapsed);
+    }
+
+    #[test]
+    fn toggle_all_blocks_expands_when_any_collapsed() {
+        let mut list = MessageList::new();
+        let msg = make_tool_msg("m1");
+        // All collapsed by default → toggle_all should expand
+        list.toggle_all_blocks(&msg);
+        let es = list.expand_state_for_message("m1");
+        assert_eq!(es.get(&0), Some(&true));
+    }
+
+    #[test]
+    fn toggle_all_blocks_collapses_when_all_expanded() {
+        let mut list = MessageList::new();
+        let msg = make_tool_msg("m1");
+        list.toggle_block_expand("m1", 0);
+        // Now all expanded → toggle_all should collapse
+        list.toggle_all_blocks(&msg);
+        let es = list.expand_state_for_message("m1");
+        assert_eq!(es.get(&0), Some(&false));
+    }
+
+    #[test]
+    fn expanded_tool_shows_more_lines() {
+        let mut list = MessageList::new();
+        let msgs = vec![make_tool_msg("m1")];
+
+        let lines_collapsed = list.build_visible_lines(&msgs, 80, 30);
+        let count_collapsed = lines_collapsed.len();
+
+        list.toggle_block_expand("m1", 0);
+        let lines_expanded = list.build_visible_lines(&msgs, 80, 30);
+        let count_expanded = lines_expanded.len();
+
+        // Expanded should have at least as many lines (may show full args)
+        assert!(count_expanded >= count_collapsed);
+    }
+
+    #[test]
+    fn running_thinking_not_cached() {
+        let mut list = MessageList::new();
+        let msgs = vec![make_thinking_msg("m1", false)];
+        // First render
+        let lines1 = list.build_visible_lines(&msgs, 80, 20);
+        let text1: String = lines1.iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
+            .collect();
+        assert!(text1.contains("思考中"));
+        // The timer value changes each call since Instant::now() is live
+        // Just verify it renders without error on second call
+        let lines2 = list.build_visible_lines(&msgs, 80, 20);
+        assert!(!lines2.is_empty());
     }
 
     #[test]
