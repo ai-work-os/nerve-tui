@@ -1,5 +1,8 @@
+pub mod block_renderer;
 pub mod input;
+pub mod message_list;
 pub mod messages;
+pub mod render_cache;
 pub mod status_bar;
 
 pub use input::InputBox;

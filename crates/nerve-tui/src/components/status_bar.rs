@@ -3,6 +3,7 @@ use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Widget};
+use std::time::Instant;
 
 use crate::theme;
 
@@ -14,6 +15,12 @@ pub struct AgentDisplay {
     pub adapter: Option<String>,
     pub node_id: String,
     pub usage: Option<(f64, f64, f64)>, // (token_used, token_size, cost)
+    /// Currently executing tool call name
+    pub tool_call_name: Option<String>,
+    /// When the current tool call started
+    pub tool_call_started: Option<Instant>,
+    /// Agent this agent is waiting for (e.g. "→main")
+    pub waiting_for: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -276,7 +283,23 @@ impl StatusBar {
                 ),
             ]));
 
-            if let Some(ref activity) = agent.activity {
+            // Show tool call progress or activity or adapter
+            if let Some(ref tool_name) = agent.tool_call_name {
+                let elapsed = agent.tool_call_started
+                    .map(|t| format_elapsed(t.elapsed().as_secs()))
+                    .unwrap_or_default();
+                lines.push(Line::from(vec![
+                    Span::styled("    ", Style::default()),
+                    Span::styled(
+                        elapsed,
+                        Style::default().fg(theme::TIMESTAMP),
+                    ),
+                    Span::styled(
+                        format!(" {}", tool_name),
+                        Style::default().fg(theme::TOOL_NAME),
+                    ),
+                ]));
+            } else if let Some(ref activity) = agent.activity {
                 lines.push(Line::from(Span::styled(
                     format!("    {}", activity),
                     Style::default().fg(theme::TIMESTAMP),
@@ -287,9 +310,31 @@ impl StatusBar {
                     Style::default().fg(theme::TIMESTAMP),
                 )));
             }
+            // Show waiting target
+            if let Some(ref target) = agent.waiting_for {
+                lines.push(Line::from(Span::styled(
+                    format!("    →{}", target),
+                    Style::default().fg(theme::MENTION),
+                )));
+            }
         }
 
         Paragraph::new(lines).render(inner, buf);
+    }
+}
+
+/// Format elapsed seconds as a compact duration string.
+pub(crate) fn format_elapsed(secs: u64) -> String {
+    if secs < 60 {
+        format!("{}s", secs)
+    } else if secs < 3600 {
+        let m = secs / 60;
+        let s = secs % 60;
+        if s > 0 { format!("{}m{}s", m, s) } else { format!("{}m", m) }
+    } else {
+        let h = secs / 3600;
+        let m = (secs % 3600) / 60;
+        if m > 0 { format!("{}h{}m", h, m) } else { format!("{}h", h) }
     }
 }
 
@@ -306,6 +351,9 @@ mod tests {
                 adapter: Some("claude".to_string()),
                 node_id: format!("n{}", i),
                 usage: None,
+                tool_call_name: None,
+                tool_call_started: None,
+                waiting_for: None,
             })
             .collect()
     }
@@ -492,13 +540,72 @@ mod tests {
             unread: 0,
         };
         let agents = vec![
-            AgentDisplay { name: "a".into(), status: "idle".into(), activity: None, adapter: None, node_id: "n1".into(), usage: None },
-            AgentDisplay { name: "b".into(), status: "busy".into(), activity: None, adapter: None, node_id: "n2".into(), usage: None },
-            AgentDisplay { name: "c".into(), status: "busy".into(), activity: None, adapter: None, node_id: "n3".into(), usage: None },
+            AgentDisplay { name: "a".into(), status: "idle".into(), activity: None, adapter: None, node_id: "n1".into(), usage: None, tool_call_name: None, tool_call_started: None, waiting_for: None },
+            AgentDisplay { name: "b".into(), status: "busy".into(), activity: None, adapter: None, node_id: "n2".into(), usage: None, tool_call_name: None, tool_call_started: None, waiting_for: None },
+            AgentDisplay { name: "c".into(), status: "busy".into(), activity: None, adapter: None, node_id: "n3".into(), usage: None, tool_call_name: None, tool_call_started: None, waiting_for: None },
         ];
         let busy = ch.members.iter().filter(|m| {
             agents.iter().any(|a| a.node_id == m.node_id && a.status == "busy")
         }).count();
         assert_eq!(busy, 2);
+    }
+
+    // --- Tool call display tests ---
+
+    #[test]
+    fn format_elapsed_seconds() {
+        assert_eq!(format_elapsed(5), "5s");
+        assert_eq!(format_elapsed(59), "59s");
+    }
+
+    #[test]
+    fn format_elapsed_minutes() {
+        assert_eq!(format_elapsed(60), "1m");
+        assert_eq!(format_elapsed(90), "1m30s");
+        assert_eq!(format_elapsed(3599), "59m59s");
+    }
+
+    #[test]
+    fn format_elapsed_hours() {
+        assert_eq!(format_elapsed(3600), "1h");
+        assert_eq!(format_elapsed(5400), "1h30m");
+    }
+
+    #[test]
+    fn render_with_tool_call_no_panic() {
+        let bar = StatusBar::new();
+        let agents = vec![AgentDisplay {
+            name: "main".into(),
+            status: "busy".into(),
+            activity: None,
+            adapter: None,
+            node_id: "n1".into(),
+            usage: None,
+            tool_call_name: Some("Write".into()),
+            tool_call_started: Some(Instant::now()),
+            waiting_for: None,
+        }];
+        let area = Rect::new(0, 0, 24, 20);
+        let mut buf = Buffer::empty(area);
+        bar.render(&[], None, &agents, None, None, false, area, &mut buf);
+    }
+
+    #[test]
+    fn render_with_waiting_for_no_panic() {
+        let bar = StatusBar::new();
+        let agents = vec![AgentDisplay {
+            name: "reviewer".into(),
+            status: "busy".into(),
+            activity: None,
+            adapter: None,
+            node_id: "n1".into(),
+            usage: None,
+            tool_call_name: None,
+            tool_call_started: None,
+            waiting_for: Some("main".into()),
+        }];
+        let area = Rect::new(0, 0, 24, 20);
+        let mut buf = Buffer::empty(area);
+        bar.render(&[], None, &agents, None, None, false, area, &mut buf);
     }
 }

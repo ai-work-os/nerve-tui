@@ -198,6 +198,9 @@ impl App {
     }
 
     fn render(&mut self, frame: &mut Frame) {
+        // Advance blink tick for streaming cursor
+        self.messages.tick_blink();
+
         let area = frame.area();
         let in_split = self.split_view && self.active_dm.is_some();
         let input_inner_w = AppLayout::input_inner_width(area, self.sidebar_visible, in_split);
@@ -460,6 +463,18 @@ impl App {
                 }
             }
 
+            // Shift+Left/Right: cycle agent filter tabs in channel mode
+            KeyCode::Left if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                if !self.messages.is_dm_mode() {
+                    self.cycle_agent_filter(false);
+                }
+            }
+            KeyCode::Right if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                if !self.messages.is_dm_mode() {
+                    self.cycle_agent_filter(true);
+                }
+            }
+
             // Text editing
             KeyCode::Backspace => self.input.backspace(),
             KeyCode::Delete => self.input.delete(),
@@ -496,6 +511,35 @@ impl App {
     fn is_mouse_in_channel_panel(&self, column: u16) -> bool {
         self.last_channel_panel_x
             .is_some_and(|panel_x| column >= panel_x)
+    }
+
+    /// Cycle through agent filter tabs: None → agent1 → agent2 → ... → None
+    fn cycle_agent_filter(&mut self, forward: bool) {
+        let agent_names: Vec<String> = self.agents.iter().map(|a| a.name.clone()).collect();
+        if agent_names.is_empty() {
+            return;
+        }
+        let current_idx = self.messages.filter.as_ref()
+            .and_then(|f| agent_names.iter().position(|n| n == f));
+
+        let new_filter = if forward {
+            match current_idx {
+                None => Some(agent_names[0].clone()),
+                Some(i) if i + 1 < agent_names.len() => Some(agent_names[i + 1].clone()),
+                Some(_) => None, // wrap to "All"
+            }
+        } else {
+            match current_idx {
+                None => Some(agent_names[agent_names.len() - 1].clone()),
+                Some(0) => None, // wrap to "All"
+                Some(i) => Some(agent_names[i - 1].clone()),
+            }
+        };
+
+        let label = new_filter.as_deref().unwrap_or("All");
+        debug!(filter = label, "agent filter tab switched");
+        self.messages.filter = new_filter;
+        self.messages.snap_to_bottom();
     }
 
     fn sync_navigation_selection(&mut self) {
@@ -1150,6 +1194,12 @@ impl App {
                 if let Some(agent) = self.agents.iter_mut().find(|a| a.name == name) {
                     agent.status = status.clone();
                     agent.activity = activity;
+                    // Clear tool call display when agent goes idle
+                    if status == "idle" {
+                        agent.tool_call_name = None;
+                        agent.tool_call_started = None;
+                        agent.waiting_for = None;
+                    }
                 }
                 // When agent goes idle, flush any pending streaming buffer as DM message
                 if status == "idle" {
@@ -1272,6 +1322,8 @@ impl App {
             }
         }
         self.messages.streaming.retain(|(n, _)| n != name);
+        // Also clean up structured streaming message
+        self.messages.take_streaming_message(name);
         self.flushed_agents.insert(name.to_string());
         if let Some(ref mut dm_state) = self.active_dm {
             if dm_state.node_id == node_id {
@@ -1308,6 +1360,9 @@ impl App {
 
             match kind {
                 Some("agent_message_chunk") => {
+                    // New pipeline: structured ContentBlock
+                    self.messages.apply_streaming_event(name, "agent_message_chunk", update);
+
                     let text = update
                         .get("content")
                         .and_then(|c| c.get("text"))
@@ -1349,6 +1404,9 @@ impl App {
                     // should set is_responding = true.
                 }
                 Some("agent_message_start") => {
+                    // New pipeline: start structured message
+                    self.messages.start_streaming_message(name);
+
                     let old_buf_len = self.messages.streaming
                         .iter()
                         .find(|(n, _)| n == name)
@@ -1368,6 +1426,10 @@ impl App {
                     self.flushed_agents.remove(name);
                 }
                 Some("agent_message_end") => {
+                    // New pipeline: finalize structured message
+                    self.messages.apply_streaming_event(name, "agent_message_end", update);
+                    self.messages.take_streaming_message(name);
+
                     // If idle already flushed this agent's streaming buffer, skip to
                     // avoid persisting the same message twice.
                     let already_flushed = self.flushed_agents.remove(name);
@@ -1429,6 +1491,41 @@ impl App {
                         }
                     }
                 }
+                Some("agent_thought_chunk") => {
+                    // New pipeline: structured thinking block
+                    self.messages.apply_streaming_event(name, "agent_thought_chunk", update);
+
+                    let text = update
+                        .get("content")
+                        .and_then(|c| c.get("text"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    if !text.is_empty() {
+                        // Old pipeline: append [thinking] marker to streaming buffer
+                        if let Some(entry) = self.messages.streaming.iter_mut().find(|(n, _)| n == name) {
+                            // Only add [thinking] prefix once at the start of a thinking block
+                            if !entry.1.ends_with("[thinking] ") && !entry.1.ends_with(text) {
+                                if entry.1.is_empty() || entry.1.ends_with('\n') {
+                                    entry.1.push_str("[thinking] ");
+                                }
+                                entry.1.push_str(text);
+                            }
+                        } else {
+                            self.messages.streaming.push((name.to_string(), format!("[thinking] {}", text)));
+                        }
+                    }
+                }
+                Some("agent_thought_end") => {
+                    // New pipeline: mark thinking block finished
+                    self.messages.apply_streaming_event(name, "agent_thought_end", update);
+
+                    // Old pipeline: add newline after thinking block
+                    if let Some(entry) = self.messages.streaming.iter_mut().find(|(n, _)| n == name) {
+                        if !entry.1.is_empty() && !entry.1.ends_with('\n') {
+                            entry.1.push('\n');
+                        }
+                    }
+                }
                 Some("user_message") => {
                     // Replay of user's prompt (from subscribe buffer)
                     if in_dm {
@@ -1456,69 +1553,124 @@ impl App {
                     }
                 }
                 Some("tool_call") => {
+                    // New pipeline: structured tool_call block
+                    self.messages.apply_streaming_event(name, "tool_call", update);
+
+                    // Update sidebar tool call display
+                    // Support both nested (toolCall: {...}) and flat ACP format (toolCallId, _meta, title, ...)
                     let tc = update.get("toolCall").or_else(|| update.get("tool_call"));
-                    if let Some(tc) = tc {
-                        let tool_name = tc.get("name").and_then(|v| v.as_str()).unwrap_or("unknown");
-                        let desc = tc.get("description").and_then(|v| v.as_str()).unwrap_or("");
-                        let mut formatted = format!("\n[tool:{}]", tool_name);
-                        if !desc.is_empty() {
-                            formatted.push(' ');
-                            formatted.push_str(desc);
+                    let (tool_name, desc, raw_input) = if let Some(tc) = tc {
+                        // Legacy nested
+                        let tn = tc.get("name").and_then(|v| v.as_str()).unwrap_or("unknown");
+                        let d = tc.get("description").and_then(|v| v.as_str()).unwrap_or("");
+                        let ri = tc.get("input").cloned();
+                        (tn.to_string(), d.to_string(), ri)
+                    } else {
+                        // Flat ACP format
+                        let tn = update.pointer("/_meta/claudeCode/toolName")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_else(|| update.get("title").and_then(|v| v.as_str()).unwrap_or("unknown"));
+                        let d = update.get("title").and_then(|v| v.as_str()).unwrap_or("");
+                        let ri = update.get("rawInput").cloned();
+                        (tn.to_string(), d.to_string(), ri)
+                    };
+                    let mut formatted = format!("\n[tool:{}]", tool_name);
+                    if !desc.is_empty() {
+                        formatted.push(' ');
+                        formatted.push_str(&desc);
+                    }
+                    if let Some(input) = raw_input.as_ref().and_then(|v| v.as_object()) {
+                        for (key, val) in input {
+                            let val_str = match val.as_str() {
+                                Some(s) if s.len() > 120 => format!("{}…", &s[..120]),
+                                Some(s) => s.to_string(),
+                                None => {
+                                    let j = serde_json::to_string(val).unwrap_or_default();
+                                    if j.len() > 120 { format!("{}…", &j[..120]) } else { j }
+                                }
+                            };
+                            formatted.push_str(&format!("\n  {}: {}", key, val_str));
                         }
-                        if let Some(input) = tc.get("input").and_then(|v| v.as_object()) {
-                            for (key, val) in input {
-                                let val_str = match val.as_str() {
-                                    Some(s) if s.len() > 120 => format!("{}…", &s[..120]),
-                                    Some(s) => s.to_string(),
-                                    None => {
-                                        let j = serde_json::to_string(val).unwrap_or_default();
-                                        if j.len() > 120 { format!("{}…", &j[..120]) } else { j }
-                                    }
-                                };
-                                formatted.push_str(&format!("\n  {}: {}", key, val_str));
-                            }
-                        }
-                        if let Some(entry) = self.messages.streaming.iter_mut().find(|(n, _)| n == name) {
-                            entry.1.push_str(&formatted);
-                        } else {
-                            self.messages.streaming.push((name.to_string(), formatted));
-                        }
+                    }
+                    if let Some(entry) = self.messages.streaming.iter_mut().find(|(n, _)| n == name) {
+                        entry.1.push_str(&formatted);
+                    } else {
+                        self.messages.streaming.push((name.to_string(), formatted));
+                    }
+
+                    // Update sidebar: show current tool call name + start timer
+                    if let Some(agent) = self.agents.iter_mut().find(|a| a.name == name) {
+                        agent.tool_call_name = Some(tool_name.clone());
+                        agent.tool_call_started = Some(std::time::Instant::now());
+                        debug!(agent = name, tool = %tool_name, "sidebar: tool_call started");
                     }
                 }
                 Some("tool_call_update") => {
+                    // New pipeline: structured tool_call_update
+                    self.messages.apply_streaming_event(name, "tool_call_update", update);
+
+                    // Support both nested and flat ACP format
                     let tcu = update.get("toolCallUpdate").or_else(|| update.get("tool_call_update"));
-                    if let Some(tcu) = tcu {
-                        let status = tcu.get("status").and_then(|v| v.as_str()).unwrap_or("");
-                        if status == "completed" || status == "failed" {
-                            let result_val = tcu.get("result")
-                                .or_else(|| tcu.get("output"))
-                                .and_then(|v| v.get("value").or(Some(v)));
-                            let result_text = match result_val {
-                                Some(v) if v.is_string() => v.as_str().unwrap_or("").to_string(),
-                                Some(v) => serde_json::to_string_pretty(v).unwrap_or_default(),
-                                None => String::new(),
-                            };
-                            let marker = if status == "completed" { "✓" } else { "✗" };
-                            let mut formatted = format!("\n[tool_result:{}]", marker);
-                            let lines: Vec<&str> = result_text.lines().collect();
-                            for (i, line) in lines.iter().enumerate() {
-                                if i >= 3 {
-                                    formatted.push_str(&format!("\n  … {} 行已省略", lines.len() - 3));
-                                    break;
-                                }
-                                let display = if line.len() > 150 { &line[..150] } else { line };
-                                formatted.push_str(&format!("\n  {}", display));
+                    let (status, result_text) = if let Some(tcu) = tcu {
+                        let s = tcu.get("status").and_then(|v| v.as_str()).unwrap_or("");
+                        let rt = tcu.get("result")
+                            .or_else(|| tcu.get("output"))
+                            .and_then(|v| v.get("value").or(Some(v)));
+                        let text = match rt {
+                            Some(v) if v.is_string() => v.as_str().unwrap_or("").to_string(),
+                            Some(v) => serde_json::to_string_pretty(v).unwrap_or_default(),
+                            None => String::new(),
+                        };
+                        (s.to_string(), text)
+                    } else {
+                        // Flat ACP format
+                        let s = update.get("status").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                        let text = update.get("content")
+                            .and_then(|v| {
+                                if v.is_string() { v.as_str().map(|s| s.to_string()) }
+                                else if let Some(arr) = v.as_array() {
+                                    let texts: Vec<String> = arr.iter().filter_map(|item| {
+                                        item.get("content").and_then(|c| c.get("text")).and_then(|t| t.as_str()).map(|s| s.to_string())
+                                    }).collect();
+                                    if texts.is_empty() { None } else { Some(texts.join("\n")) }
+                                } else { None }
+                            })
+                            .unwrap_or_default();
+                        (s, text)
+                    };
+                    if status == "completed" || status == "failed" {
+                        // Clear sidebar tool call display
+                        if let Some(agent) = self.agents.iter_mut().find(|a| a.name == name) {
+                            agent.tool_call_name = None;
+                            agent.tool_call_started = None;
+                        }
+                        let marker = if status == "completed" { "✓" } else { "✗" };
+                        let mut formatted = format!("\n[tool_result:{}]", marker);
+                        let lines: Vec<&str> = result_text.lines().collect();
+                        for (i, line) in lines.iter().enumerate() {
+                            if i >= 3 {
+                                formatted.push_str(&format!("\n  … {} 行已省略", lines.len() - 3));
+                                break;
                             }
-                            if let Some(entry) = self.messages.streaming.iter_mut().find(|(n, _)| n == name) {
-                                entry.1.push_str(&formatted);
-                            }
+                            let display = if line.len() > 150 { &line[..150] } else { line };
+                            formatted.push_str(&format!("\n  {}", display));
+                        }
+                        if let Some(entry) = self.messages.streaming.iter_mut().find(|(n, _)| n == name) {
+                            entry.1.push_str(&formatted);
                         }
                     }
                 }
                 Some("usage_update") => {
                     let used = update.get("used").and_then(|v| v.as_f64()).unwrap_or(0.0);
                     let size = update.get("size").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                    let cost = update.get("cost").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                    // claude-agent-acp sends cost as { amount: number, currency: "USD" }
+                    // Fall back to plain number for compatibility
+                    let cost = update.get("cost")
+                        .and_then(|v| {
+                            v.get("amount").and_then(|a| a.as_f64())
+                                .or_else(|| v.as_f64())
+                        })
+                        .unwrap_or(0.0);
                     // Update agent cache for DM re-entry
                     if let Some(agent) = self.agents.iter_mut().find(|a| a.node_id == node_id) {
                         agent.usage = Some((used, size, cost));
@@ -1624,6 +1776,9 @@ impl App {
                         adapter: n.adapter,
                         node_id: n.id,
                         usage: n.usage.map(|u| (u.token_used, u.token_size, u.cost)),
+                        tool_call_name: None,
+                        tool_call_started: None,
+                        waiting_for: None,
                     })
                     .collect();
                 self.update_completions();
@@ -1797,6 +1952,9 @@ mod tests {
             adapter: Some("claude".into()),
             node_id: "n1".into(),
             usage: None,
+            tool_call_name: None,
+            tool_call_started: None,
+            waiting_for: None,
         }];
         app.active_channel = Some("ch2".into());
 
@@ -1823,6 +1981,9 @@ mod tests {
                 adapter: Some("claude".into()),
                 node_id: "n1".into(),
                 usage: None,
+                tool_call_name: None,
+                tool_call_started: None,
+                waiting_for: None,
             },
             AgentDisplay {
                 name: "bob".into(),
@@ -1831,6 +1992,9 @@ mod tests {
                 adapter: Some("codex".into()),
                 node_id: "n2".into(),
                 usage: None,
+                tool_call_name: None,
+                tool_call_started: None,
+                waiting_for: None,
             },
         ];
         app.active_channel = Some("ch1".into());

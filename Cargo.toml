@@ -23,4 +23,5 @@ chrono = { version = "0.4", features = ["serde"] }
 anyhow = "1"
 unicode-width = "0.2"
 regex = "1"
+syntect = { version = "5", default-features = false, features = ["default-syntaxes", "default-themes", "regex-fancy"] }
 

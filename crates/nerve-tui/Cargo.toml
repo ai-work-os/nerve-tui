@@ -18,3 +18,4 @@ chrono.workspace = true
 unicode-width.workspace = true
 regex.workspace = true
 pulldown-cmark = "0.12"
+syntect.workspace = true

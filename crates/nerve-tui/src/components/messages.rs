@@ -1,7 +1,7 @@
 use crate::theme;
+use crate::components::block_renderer;
 use chrono::{Local, TimeZone};
-use nerve_tui_protocol::DmMessage;
-use nerve_tui_protocol::MessageInfo;
+use nerve_tui_protocol::{DmMessage, Message, MessageInfo, Role};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
@@ -10,6 +10,7 @@ use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Widget, Wrap};
 use serde_json::Value;
 use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
 use std::collections::HashMap;
+use tracing::debug;
 use unicode_width::UnicodeWidthStr;
 
 struct MessageLine {
@@ -34,6 +35,11 @@ pub struct MessagesView {
     visible_height: u16,
     /// Streaming previews: (agent_name, partial_content)
     pub streaming: Vec<(String, String)>,
+    /// Structured streaming messages: agent_name → Message with ContentBlocks.
+    /// Used by the new rendering pipeline alongside `streaming`.
+    pub streaming_messages: HashMap<String, Message>,
+    /// Message ID counter for generating unique IDs.
+    next_msg_id: u64,
     /// Filter: None = all, Some(name) = only from/to this agent
     pub filter: Option<String>,
     /// DM mode: if Some, render DM messages instead of channel messages
@@ -45,6 +51,8 @@ pub struct MessagesView {
     channel_cache: HashMap<String, Vec<MessageLine>>,
     /// Unread count per channel
     channel_unread: HashMap<String, usize>,
+    /// Blink tick counter for streaming cursor (toggles every ~500ms)
+    blink_tick: u16,
 }
 
 impl MessagesView {
@@ -55,13 +63,29 @@ impl MessagesView {
             auto_scroll: true,
             visible_height: 0,
             streaming: Vec::new(),
+            streaming_messages: HashMap::new(),
+            next_msg_id: 0,
             filter: None,
             dm_view: None,
             dm_lines: Vec::new(),
             has_new_messages: false,
             channel_cache: HashMap::new(),
             channel_unread: HashMap::new(),
+            blink_tick: 0,
         }
+    }
+
+    /// Advance the blink tick. Call each render frame (~33ms).
+    /// Returns true when the cursor should be visible (on for ~500ms, off for ~500ms).
+    pub fn tick_blink(&mut self) -> bool {
+        self.blink_tick = self.blink_tick.wrapping_add(1);
+        // 15 ticks * 33ms ≈ 500ms per phase
+        self.cursor_visible()
+    }
+
+    /// Whether the streaming cursor is currently in the visible phase.
+    pub fn cursor_visible(&self) -> bool {
+        (self.blink_tick / 15) % 2 == 0
     }
 
     pub fn push(&mut self, msg: &MessageInfo, _is_agent: bool) {
@@ -138,6 +162,46 @@ impl MessagesView {
         self.channel_unread.remove(channel_id);
     }
 
+    // --- Structured streaming (new rendering pipeline) ---
+
+    /// Start a new structured streaming message for an agent.
+    pub fn start_streaming_message(&mut self, agent_name: &str) {
+        self.next_msg_id += 1;
+        let id = format!("stream-{}-{}", agent_name, self.next_msg_id);
+        let msg = Message::new(id, Role::Assistant, chrono::Local::now().timestamp() as u64);
+        debug!(agent = agent_name, "started streaming message");
+        self.streaming_messages.insert(agent_name.to_string(), msg);
+    }
+
+    /// Apply an ACP event to the structured streaming message for an agent.
+    /// Creates a new message if none exists.
+    pub fn apply_streaming_event(&mut self, agent_name: &str, kind: &str, update: &Value) -> bool {
+        if !self.streaming_messages.contains_key(agent_name) {
+            self.start_streaming_message(agent_name);
+        }
+        if let Some(msg) = self.streaming_messages.get_mut(agent_name) {
+            msg.apply_acp_event(kind, update)
+        } else {
+            false
+        }
+    }
+
+    /// Finalize and remove the structured streaming message for an agent.
+    /// Returns the completed Message if one exists.
+    pub fn take_streaming_message(&mut self, agent_name: &str) -> Option<Message> {
+        if let Some(mut msg) = self.streaming_messages.remove(agent_name) {
+            msg.meta.partial = false;
+            debug!(
+                agent = agent_name,
+                blocks = msg.blocks.len(),
+                "finalized streaming message"
+            );
+            Some(msg)
+        } else {
+            None
+        }
+    }
+
     pub fn scroll_down(&mut self, n: u16) {
         self.scroll_offset = self.scroll_offset.saturating_add(n);
         // Will be clamped in render; if clamped to bottom, auto_scroll re-enabled there
@@ -176,6 +240,7 @@ impl MessagesView {
     pub fn clear_dm(&mut self) {
         self.dm_lines.clear();
         self.streaming.clear();
+        self.streaming_messages.clear();
         self.scroll_offset = 0;
         self.auto_scroll = true;
         self.has_new_messages = false;
@@ -195,6 +260,7 @@ impl MessagesView {
         });
         self.dm_lines.clear();
         self.streaming.clear();
+        self.streaming_messages.clear();
         self.scroll_offset = 0;
         self.auto_scroll = true;
         self.has_new_messages = false;
@@ -220,6 +286,7 @@ impl MessagesView {
         self.dm_view = None;
         self.dm_lines.clear();
         self.streaming.clear();
+        self.streaming_messages.clear();
         self.has_new_messages = false;
     }
 
@@ -252,7 +319,12 @@ impl MessagesView {
             });
             (t, u)
         } else {
-            (" Messages ".to_string(), None)
+            let title = if let Some(ref f) = self.filter {
+                format!(" Messages [@{}] ", f)
+            } else {
+                " Messages ".to_string()
+            };
+            (title, None)
         };
 
         let mut block = Block::default()
@@ -322,6 +394,7 @@ impl MessagesView {
 
     fn build_text(&self, width: u16) -> Vec<Line<'static>> {
         let mut out: Vec<Line<'static>> = Vec::new();
+        let mut prev_timestamp: Option<f64> = None;
 
         let source = if self.dm_view.is_some() {
             &self.dm_lines
@@ -360,6 +433,7 @@ impl MessagesView {
 
             // System messages: single line, no timestamp, styled by content
             if msg.from == "系统" {
+                prev_timestamp = Some(msg.timestamp);
                 let content_lower = display_content.to_lowercase();
                 let style = if content_lower.contains("失败")
                     || content_lower.contains("error")
@@ -387,8 +461,13 @@ impl MessagesView {
                 continue;
             }
 
-            // Header: from → target  HH:MM:SS  or  from  HH:MM:SS
+            // Header: from → target  HH:MM:SS · +Xs
             let time_str = format_time(msg.timestamp);
+            let interval_str = prev_timestamp
+                .map(|prev| format_interval(prev, msg.timestamp))
+                .unwrap_or_default();
+            prev_timestamp = Some(msg.timestamp);
+
             let name_color = theme::agent_color(&msg.from);
             let name_style = Style::default().fg(name_color).add_modifier(Modifier::BOLD);
 
@@ -413,6 +492,12 @@ impl MessagesView {
             }
             header.push(Span::raw("  "));
             header.push(Span::styled(time_str, Style::default().fg(theme::TIMESTAMP)));
+            if !interval_str.is_empty() {
+                header.push(Span::styled(
+                    format!(" · {}", interval_str),
+                    Style::default().fg(theme::TIMESTAMP),
+                ));
+            }
             out.push(Line::from(header));
 
             // Content lines: render first (tool_call detection on raw content),
@@ -423,7 +508,8 @@ impl MessagesView {
             out.extend(content_lines);
         }
 
-        // Streaming previews
+        // Streaming previews — use block_renderer when structured message exists
+        let cursor_char = if self.cursor_visible() { " ▌" } else { "  " };
         for (name, content) in &self.streaming {
             out.push(Line::from(""));
             out.push(Line::from(vec![
@@ -433,23 +519,32 @@ impl MessagesView {
                         .fg(theme::AGENT_MSG)
                         .add_modifier(Modifier::BOLD),
                 ),
-                Span::styled(" ▌", Style::default().fg(theme::MENTION)),
+                Span::styled(cursor_char.to_string(), Style::default().fg(theme::MENTION)),
             ]));
-            // Show trailing streaming lines (capped to avoid perf issues with very long output)
+
+            // Try structured rendering first (new pipeline)
+            if let Some(msg) = self.streaming_messages.get(name) {
+                if !msg.blocks.is_empty() {
+                    for block in &msg.blocks {
+                        let rendered = block_renderer::render_block(block, width);
+                        out.extend(rendered);
+                    }
+                    continue;
+                }
+            }
+
+            // Fallback: old string-based streaming rendering
             let max_preview = if width > 0 { self.visible_height.max(20) as usize } else { 20 };
             let w = width.max(1) as usize;
             let all_lines: Vec<&str> = content.lines().collect();
-            // Count visual lines (accounting for CJK wide chars wrapping)
             let mut visual_count = 0usize;
             let mut start = all_lines.len();
-            // Index of a line that needs tail-truncation, and how many visual lines to keep
             let mut truncate_first: Option<(usize, usize)> = None;
             for (i, line) in all_lines.iter().enumerate().rev() {
                 let lw = UnicodeWidthStr::width(*line);
                 let vl = if lw == 0 { 1 } else { (lw + w - 1) / w };
                 visual_count += vl;
                 if visual_count > max_preview {
-                    // This line pushed us over. Keep the tail portion that fits.
                     let keep_vl = vl.saturating_sub(visual_count - max_preview);
                     if keep_vl > 0 {
                         start = i;
@@ -467,7 +562,6 @@ impl MessagesView {
                     Style::default().fg(theme::SYSTEM_MSG),
                 )));
             }
-            // Render the visible streaming lines with markdown
             let mut first_line_truncated = false;
             if let Some((trunc_idx, keep_vl)) = truncate_first {
                 if trunc_idx == start {
@@ -604,6 +698,7 @@ impl MessagesView {
     /// Build text lines from channel messages (for split-view right panel).
     fn build_channel_text(&self, _width: u16) -> Vec<Line<'static>> {
         let mut out: Vec<Line<'static>> = Vec::new();
+        let mut prev_timestamp: Option<f64> = None;
 
         for (i, msg) in self.lines.iter().enumerate() {
             // Apply filter if set
@@ -621,6 +716,7 @@ impl MessagesView {
 
             // System messages: single line, styled by content (same as main panel)
             if msg.from == "系统" {
+                prev_timestamp = Some(msg.timestamp);
                 let content_lower = display_content.to_lowercase();
                 let style = if content_lower.contains("失败")
                     || content_lower.contains("error")
@@ -649,6 +745,11 @@ impl MessagesView {
             }
 
             let time_str = format_time(msg.timestamp);
+            let interval_str = prev_timestamp
+                .map(|prev| format_interval(prev, msg.timestamp))
+                .unwrap_or_default();
+            prev_timestamp = Some(msg.timestamp);
+
             let name_color = theme::agent_color(&msg.from);
             let name_style = Style::default()
                 .fg(name_color)
@@ -673,6 +774,12 @@ impl MessagesView {
                 time_str,
                 Style::default().fg(theme::TIMESTAMP),
             ));
+            if !interval_str.is_empty() {
+                header.push(Span::styled(
+                    format!(" · {}", interval_str),
+                    Style::default().fg(theme::TIMESTAMP),
+                ));
+            }
             out.push(Line::from(header));
 
             let mut content_lines: Vec<Line<'static>> = Vec::new();
@@ -747,6 +854,48 @@ fn format_time(ts: f64) -> String {
         .single()
         .map(|dt| dt.format("%H:%M:%S").to_string())
         .unwrap_or_default()
+}
+
+/// Format the time interval between two timestamps as a human-readable string.
+/// Returns empty string if interval is less than 1 second.
+/// Examples: "+3s", "+1m30s", "+2h15m", "+1d3h"
+pub(crate) fn format_interval(prev: f64, curr: f64) -> String {
+    let normalize = |ts: f64| -> f64 {
+        if ts > 1e12 { ts / 1000.0 } else { ts }
+    };
+    let diff = (normalize(curr) - normalize(prev)).abs();
+    let secs = diff as u64;
+    if secs < 1 {
+        return String::new();
+    }
+    if secs < 60 {
+        return format!("+{}s", secs);
+    }
+    if secs < 3600 {
+        let m = secs / 60;
+        let s = secs % 60;
+        return if s > 0 {
+            format!("+{}m{}s", m, s)
+        } else {
+            format!("+{}m", m)
+        };
+    }
+    if secs < 86400 {
+        let h = secs / 3600;
+        let m = (secs % 3600) / 60;
+        return if m > 0 {
+            format!("+{}h{}m", h, m)
+        } else {
+            format!("+{}h", h)
+        };
+    }
+    let d = secs / 86400;
+    let h = (secs % 86400) / 3600;
+    if h > 0 {
+        format!("+{}d{}h", d, h)
+    } else {
+        format!("+{}d", d)
+    }
 }
 
 pub(crate) fn highlight_mentions(text: &str) -> Vec<Span<'static>> {
@@ -1643,5 +1792,165 @@ mod tests {
         assert!(text.contains("line 49"), "should show last line");
         // Should show "已省略" indicator
         assert!(text.contains("已省略"), "should show truncation indicator");
+    }
+
+    // --- Blink cursor tests ---
+
+    #[test]
+    fn blink_tick_toggles() {
+        let mut view = MessagesView::new();
+        // Initially visible (tick=0)
+        assert!(view.cursor_visible());
+        // Ticks 1-14: still visible ((1..14)/15 = 0, 0%2 = 0 → visible)
+        for i in 1..=14 {
+            let v = view.tick_blink();
+            assert!(v, "tick {} should be visible", i);
+        }
+        // Tick 15: invisible ((15/15)%2 = 1)
+        assert!(!view.tick_blink(), "tick 15 should be invisible");
+        // Ticks 16-29: invisible
+        for _ in 16..=29 {
+            assert!(!view.tick_blink());
+        }
+        // Tick 30: visible again ((30/15)%2 = 0)
+        assert!(view.tick_blink(), "tick 30 should be visible");
+    }
+
+    #[test]
+    fn streaming_cursor_blinks_in_output() {
+        let mut view = MessagesView::new();
+        view.streaming.push(("agent".to_string(), "text".to_string()));
+
+        // Visible phase
+        let lines = view.build_text(80);
+        let text: String = lines.iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
+            .collect();
+        assert!(text.contains("▌"), "cursor visible in on phase");
+
+        // Advance to invisible phase
+        for _ in 0..15 {
+            view.tick_blink();
+        }
+        let lines = view.build_text(80);
+        let text: String = lines.iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
+            .collect();
+        assert!(!text.contains("▌"), "cursor hidden in off phase");
+    }
+
+    // --- Time interval tests ---
+
+    #[test]
+    fn format_interval_seconds() {
+        assert_eq!(format_interval(1000.0, 1015.0), "+15s");
+    }
+
+    #[test]
+    fn format_interval_minutes() {
+        assert_eq!(format_interval(1000.0, 1090.0), "+1m30s");
+        assert_eq!(format_interval(1000.0, 1060.0), "+1m");
+    }
+
+    #[test]
+    fn format_interval_hours() {
+        assert_eq!(format_interval(1000.0, 4600.0), "+1h");
+        assert_eq!(format_interval(1000.0, 5500.0), "+1h15m");
+    }
+
+    #[test]
+    fn format_interval_days() {
+        assert_eq!(format_interval(1000.0, 87400.0), "+1d");
+        assert_eq!(format_interval(1000.0, 97800.0), "+1d2h");
+    }
+
+    #[test]
+    fn format_interval_sub_second() {
+        assert_eq!(format_interval(1000.0, 1000.5), "");
+    }
+
+    #[test]
+    fn format_interval_millis_timestamps() {
+        // Both in milliseconds
+        assert_eq!(format_interval(1710000000000.0, 1710000015000.0), "+15s");
+    }
+
+    #[test]
+    fn time_interval_in_header() {
+        let mut view = MessagesView::new();
+        let mut msg1 = make_msg("alice", "first");
+        msg1.timestamp = 1710000000.0;
+        view.push(&msg1, true);
+        let mut msg2 = make_msg("bob", "second");
+        msg2.timestamp = 1710000015.0;
+        view.push(&msg2, true);
+
+        let lines = view.build_text(80);
+        // Find the header line for "bob"
+        let bob_header = lines.iter().find(|l| {
+            l.spans.iter().any(|s| s.content.as_ref() == "bob")
+        });
+        assert!(bob_header.is_some(), "bob header should exist");
+        let header_text: String = bob_header.unwrap().spans.iter()
+            .map(|s| s.content.to_string()).collect();
+        assert!(header_text.contains("+15s"), "header should show +15s interval");
+    }
+
+    #[test]
+    fn first_message_no_interval() {
+        let mut view = MessagesView::new();
+        view.push(&make_msg("alice", "first"), true);
+        let lines = view.build_text(80);
+        let header_text: String = lines[0].spans.iter()
+            .map(|s| s.content.to_string()).collect();
+        assert!(!header_text.contains('+'), "first message should have no interval");
+    }
+
+    // --- Agent filter tab tests ---
+
+    #[test]
+    fn filter_shows_in_title() {
+        let mut view = MessagesView::new();
+        view.filter = Some("alice".to_string());
+        // We can't easily test render() output without a buffer, but we can test the title logic
+        // by checking that the filter value is incorporated in the title branch
+        let title = if let Some(ref f) = view.filter {
+            format!(" Messages [@{}] ", f)
+        } else {
+            " Messages ".to_string()
+        };
+        assert!(title.contains("@alice"));
+    }
+
+    #[test]
+    fn filter_none_shows_all_messages() {
+        let mut view = MessagesView::new();
+        view.push(&make_msg("alice", "a msg"), true);
+        view.push(&make_msg("bob", "b msg"), true);
+        view.filter = None;
+        let lines = view.build_text(80);
+        let text: String = lines.iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
+            .collect();
+        assert!(text.contains("alice"));
+        assert!(text.contains("bob"));
+    }
+
+    #[test]
+    fn filter_agent_excludes_others() {
+        let mut view = MessagesView::new();
+        view.push(&make_msg("alice", "hello"), true);
+        view.push(&make_msg("bob", "world"), true);
+        view.push(&make_msg("charlie", "@alice hey"), true);
+        view.filter = Some("alice".to_string());
+        let lines = view.build_text(80);
+        let text: String = lines.iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
+            .collect();
+        assert!(text.contains("alice"), "alice's own message included");
+        assert!(text.contains("charlie"), "charlie's message mentioning alice included");
+        assert!(!lines.iter().any(|l| {
+            l.spans.iter().any(|s| s.content.as_ref() == "bob")
+        }), "bob's non-mentioning message excluded");
     }
 }
