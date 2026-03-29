@@ -14,6 +14,8 @@ pub struct AgentDisplay {
     pub activity: Option<String>,
     pub adapter: Option<String>,
     pub node_id: String,
+    pub transport: String,
+    pub capabilities: Vec<String>,
     pub usage: Option<(f64, f64, f64)>, // (token_used, token_size, cost)
     /// Currently executing tool call name
     pub tool_call_name: Option<String>,
@@ -252,74 +254,128 @@ impl StatusBar {
             }
         }
 
-        if !channels.is_empty() && !agents.is_empty() {
-            lines.push(Line::from(""));
+        // Group agents by type: AI (stdio), Programs (ws + monitor cap), Clients (ws other)
+        let ai_agents: Vec<(usize, &AgentDisplay)> = agents.iter().enumerate()
+            .filter(|(_, a)| a.transport == "stdio")
+            .collect();
+        let program_agents: Vec<(usize, &AgentDisplay)> = agents.iter().enumerate()
+            .filter(|(_, a)| a.transport != "stdio" && a.capabilities.iter().any(|c| c == "monitor"))
+            .collect();
+        let client_agents: Vec<(usize, &AgentDisplay)> = agents.iter().enumerate()
+            .filter(|(_, a)| a.transport != "stdio" && !a.capabilities.iter().any(|c| c == "monitor"))
+            .collect();
+
+        let mut has_prev = !channels.is_empty();
+
+        // Render AI agents section
+        if !ai_agents.is_empty() {
+            if has_prev { lines.push(Line::from("")); }
+            lines.push(Line::from(Span::styled(
+                "AI Agents",
+                Style::default().fg(theme::TIMESTAMP).add_modifier(Modifier::BOLD),
+            )));
+            for (i, agent) in &ai_agents {
+                Self::render_agent_item(&mut lines, *i, agent, &selected, active_dm);
+            }
+            has_prev = true;
         }
 
-        for (i, agent) in agents.iter().enumerate() {
-            let is_selected = selected == Some(NavigationTarget::Agent(i));
-            let is_active = active_dm == Some(agent.name.as_str());
-            let marker = if is_selected { "▸" } else { " " };
-            let color = if is_active {
-                theme::MENTION
-            } else {
-                theme::status_color(&agent.status)
-            };
-            let mut name_style = Style::default().fg(color);
-            if is_selected || is_active {
-                name_style = name_style.add_modifier(Modifier::BOLD);
+        // Render program nodes section
+        if !program_agents.is_empty() {
+            if has_prev { lines.push(Line::from("")); }
+            lines.push(Line::from(Span::styled(
+                "Programs",
+                Style::default().fg(theme::TIMESTAMP).add_modifier(Modifier::BOLD),
+            )));
+            for (i, agent) in &program_agents {
+                Self::render_agent_item(&mut lines, *i, agent, &selected, active_dm);
             }
+            has_prev = true;
+        }
 
-            lines.push(Line::from(vec![
-                Span::raw(format!("{} ", marker)),
-                Span::styled(
-                    format!("{} ", theme::status_icon(&agent.status)),
-                    Style::default().fg(color),
-                ),
-                Span::styled(format!("@{}", agent.name), name_style),
-                Span::styled(
-                    if is_active { " [DM]" } else { "" },
-                    Style::default().fg(theme::TIMESTAMP),
-                ),
-            ]));
-
-            // Show tool call progress or activity or adapter
-            if let Some(ref tool_name) = agent.tool_call_name {
-                let elapsed = agent.tool_call_started
-                    .map(|t| format_elapsed(t.elapsed().as_secs()))
-                    .unwrap_or_default();
-                lines.push(Line::from(vec![
-                    Span::styled("    ", Style::default()),
-                    Span::styled(
-                        elapsed,
-                        Style::default().fg(theme::TIMESTAMP),
-                    ),
-                    Span::styled(
-                        format!(" {}", tool_name),
-                        Style::default().fg(theme::TOOL_NAME),
-                    ),
-                ]));
-            } else if let Some(ref activity) = agent.activity {
-                lines.push(Line::from(Span::styled(
-                    format!("    {}", activity),
-                    Style::default().fg(theme::TIMESTAMP),
-                )));
-            } else if let Some(ref adapter) = agent.adapter {
-                lines.push(Line::from(Span::styled(
-                    format!("    {}", adapter),
-                    Style::default().fg(theme::TIMESTAMP),
-                )));
-            }
-            // Show waiting target
-            if let Some(ref target) = agent.waiting_for {
-                lines.push(Line::from(Span::styled(
-                    format!("    →{}", target),
-                    Style::default().fg(theme::MENTION),
-                )));
+        // Render client nodes section
+        if !client_agents.is_empty() {
+            if has_prev { lines.push(Line::from("")); }
+            lines.push(Line::from(Span::styled(
+                "Clients",
+                Style::default().fg(theme::TIMESTAMP).add_modifier(Modifier::BOLD),
+            )));
+            for (i, agent) in &client_agents {
+                Self::render_agent_item(&mut lines, *i, agent, &selected, active_dm);
             }
         }
 
         Paragraph::new(lines).render(inner, buf);
+    }
+
+    fn render_agent_item(
+        lines: &mut Vec<Line<'_>>,
+        i: usize,
+        agent: &AgentDisplay,
+        selected: &Option<NavigationTarget>,
+        active_dm: Option<&str>,
+    ) {
+        let is_selected = *selected == Some(NavigationTarget::Agent(i));
+        let is_active = active_dm == Some(agent.name.as_str());
+        let marker = if is_selected { "▸" } else { " " };
+        let color = if is_active {
+            theme::MENTION
+        } else {
+            theme::status_color(&agent.status)
+        };
+        let mut name_style = Style::default().fg(color);
+        if is_selected || is_active {
+            name_style = name_style.add_modifier(Modifier::BOLD);
+        }
+
+        let prefix = if agent.transport == "stdio" { "@" } else { "" };
+        lines.push(Line::from(vec![
+            Span::raw(format!("{} ", marker)),
+            Span::styled(
+                format!("{} ", theme::status_icon(&agent.status)),
+                Style::default().fg(color),
+            ),
+            Span::styled(format!("{}{}", prefix, agent.name), name_style),
+            Span::styled(
+                if is_active { " [DM]" } else { "" },
+                Style::default().fg(theme::TIMESTAMP),
+            ),
+        ]));
+
+        // Show tool call progress or activity or adapter
+        if let Some(ref tool_name) = agent.tool_call_name {
+            let elapsed = agent.tool_call_started
+                .map(|t| format_elapsed(t.elapsed().as_secs()))
+                .unwrap_or_default();
+            lines.push(Line::from(vec![
+                Span::styled("    ", Style::default()),
+                Span::styled(
+                    elapsed,
+                    Style::default().fg(theme::TIMESTAMP),
+                ),
+                Span::styled(
+                    format!(" {}", tool_name),
+                    Style::default().fg(theme::TOOL_NAME),
+                ),
+            ]));
+        } else if let Some(ref activity) = agent.activity {
+            lines.push(Line::from(Span::styled(
+                format!("    {}", activity),
+                Style::default().fg(theme::TIMESTAMP),
+            )));
+        } else if let Some(ref adapter) = agent.adapter {
+            lines.push(Line::from(Span::styled(
+                format!("    {}", adapter),
+                Style::default().fg(theme::TIMESTAMP),
+            )));
+        }
+        // Show waiting target
+        if let Some(ref target) = agent.waiting_for {
+            lines.push(Line::from(Span::styled(
+                format!("    →{}", target),
+                Style::default().fg(theme::MENTION),
+            )));
+        }
     }
 }
 
@@ -350,6 +406,8 @@ mod tests {
                 activity: None,
                 adapter: Some("claude".to_string()),
                 node_id: format!("n{}", i),
+                transport: "stdio".to_string(),
+                capabilities: vec![],
                 usage: None,
                 tool_call_name: None,
                 tool_call_started: None,
@@ -540,9 +598,9 @@ mod tests {
             unread: 0,
         };
         let agents = vec![
-            AgentDisplay { name: "a".into(), status: "idle".into(), activity: None, adapter: None, node_id: "n1".into(), usage: None, tool_call_name: None, tool_call_started: None, waiting_for: None },
-            AgentDisplay { name: "b".into(), status: "busy".into(), activity: None, adapter: None, node_id: "n2".into(), usage: None, tool_call_name: None, tool_call_started: None, waiting_for: None },
-            AgentDisplay { name: "c".into(), status: "busy".into(), activity: None, adapter: None, node_id: "n3".into(), usage: None, tool_call_name: None, tool_call_started: None, waiting_for: None },
+            AgentDisplay { name: "a".into(), status: "idle".into(), activity: None, adapter: None, node_id: "n1".into(), transport: "stdio".into(), capabilities: vec![], usage: None, tool_call_name: None, tool_call_started: None, waiting_for: None },
+            AgentDisplay { name: "b".into(), status: "busy".into(), activity: None, adapter: None, node_id: "n2".into(), transport: "stdio".into(), capabilities: vec![], usage: None, tool_call_name: None, tool_call_started: None, waiting_for: None },
+            AgentDisplay { name: "c".into(), status: "busy".into(), activity: None, adapter: None, node_id: "n3".into(), transport: "stdio".into(), capabilities: vec![], usage: None, tool_call_name: None, tool_call_started: None, waiting_for: None },
         ];
         let busy = ch.members.iter().filter(|m| {
             agents.iter().any(|a| a.node_id == m.node_id && a.status == "busy")
@@ -580,6 +638,8 @@ mod tests {
             activity: None,
             adapter: None,
             node_id: "n1".into(),
+            transport: "stdio".into(),
+            capabilities: vec![],
             usage: None,
             tool_call_name: Some("Write".into()),
             tool_call_started: Some(Instant::now()),
@@ -599,6 +659,8 @@ mod tests {
             activity: None,
             adapter: None,
             node_id: "n1".into(),
+            transport: "stdio".into(),
+            capabilities: vec![],
             usage: None,
             tool_call_name: None,
             tool_call_started: None,

@@ -16,10 +16,40 @@ use crate::components::messages::ChannelPanelState;
 use crate::components::*;
 use crate::layout::AppLayout;
 
+/// Check if `content` contains an @mention of `name` as a whole token.
+/// Mirrors server-side `parseMentions` in router.ts: @name must be preceded by
+/// whitespace (or start of string) and followed by whitespace, punctuation, or EOF.
+fn mentions_name(content: &str, name: &str) -> bool {
+    let padded = format!(" {}", content);
+    let pattern = format!("@{}", name);
+    for (i, _) in padded.match_indices(&pattern) {
+        // Check preceding char is whitespace
+        let before = padded.as_bytes().get(i.wrapping_sub(1)).copied().unwrap_or(b' ');
+        if !before.is_ascii_whitespace() {
+            continue;
+        }
+        // Check following char is whitespace, punctuation, or EOF
+        let after_pos = i + pattern.len();
+        match padded.as_bytes().get(after_pos) {
+            None => return true, // EOF
+            Some(c) if c.is_ascii_whitespace() => return true,
+            Some(c) if b".,;:!?".contains(c) => return true,
+            _ => continue, // e.g. @alice-dev when looking for @alice
+        }
+    }
+    false
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum SplitFocus {
     Dm,
     Channel,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum SplitTarget {
+    Channel,
+    Node { node_id: String, node_name: String },
 }
 
 pub struct App {
@@ -57,6 +87,9 @@ pub struct App {
     // Split view
     split_view: bool,
     split_focus: SplitFocus,
+    split_target: SplitTarget,
+    /// Streaming text buffer for split node panel
+    split_node_buffer: String,
     channel_panel_state: ChannelPanelState,
     /// Cached x-coordinate where the channel panel starts (for mouse hit-testing in split view).
     last_channel_panel_x: Option<u16>,
@@ -105,6 +138,8 @@ impl App {
             flushed_agents: HashSet::new(),
             split_view: false,
             split_focus: SplitFocus::Dm,
+            split_target: SplitTarget::Channel,
+            split_node_buffer: String::new(),
             channel_panel_state: ChannelPanelState::new(),
             last_channel_panel_x: None,
             needs_redraw: true,
@@ -241,23 +276,37 @@ impl App {
         // Messages (DM panel in split mode)
         self.messages.render(layout.messages, frame.buffer_mut());
 
-        // Channel panel (right side of split view)
+        // Right panel (split view): channel or node output
         self.last_channel_panel_x = layout.channel_panel.map(|r| r.x);
         if let Some(panel_area) = layout.channel_panel {
-            let channel_name = self
-                .channels
-                .iter()
-                .find(|c| Some(&c.id) == self.active_channel.as_ref())
-                .map(|c| c.display_name())
-                .unwrap_or("channel");
             let focused = self.split_focus == SplitFocus::Channel;
-            self.messages.render_channel_panel(
-                &channel_name,
-                &mut self.channel_panel_state,
-                focused,
-                panel_area,
-                frame.buffer_mut(),
-            );
+            match &self.split_target {
+                SplitTarget::Channel => {
+                    let channel_name = self
+                        .channels
+                        .iter()
+                        .find(|c| Some(&c.id) == self.active_channel.as_ref())
+                        .map(|c| c.display_name())
+                        .unwrap_or("channel");
+                    self.messages.render_channel_panel(
+                        channel_name,
+                        &mut self.channel_panel_state,
+                        focused,
+                        panel_area,
+                        frame.buffer_mut(),
+                    );
+                }
+                SplitTarget::Node { node_name, .. } => {
+                    self.messages.render_text_panel(
+                        &format!("@{}", node_name),
+                        &self.split_node_buffer,
+                        &mut self.channel_panel_state,
+                        focused,
+                        panel_area,
+                        frame.buffer_mut(),
+                    );
+                }
+            }
         }
 
         // Input
@@ -310,7 +359,10 @@ impl App {
 
             // Submit or confirm sidebar selection
             KeyCode::Enter => {
-                if !self.input.is_empty() {
+                if self.input.is_popup_visible() {
+                    // Confirm popup selection (same as Tab)
+                    self.input.tab();
+                } else if !self.input.is_empty() {
                     let text = self.input.take();
                     self.handle_input(&text).await;
                 } else {
@@ -331,7 +383,9 @@ impl App {
             // Split view: Ctrl+S toggle, Ctrl+W switch focus
             KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 if self.active_dm.is_some() {
-                    if self.active_channel.is_some() {
+                    let has_target = self.active_channel.is_some()
+                        || matches!(self.split_target, SplitTarget::Node { .. });
+                    if has_target {
                         self.split_view = !self.split_view;
                         if self.split_view {
                             self.split_focus = SplitFocus::Dm;
@@ -465,11 +519,6 @@ impl App {
                     self.status_bar
                         .select_prev_item(&self.channels, &self.agents);
                 }
-            }
-
-            // Ctrl+E: toggle expand/collapse for all streaming tool/thinking blocks
-            KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.messages.toggle_all_streaming_blocks();
             }
 
             // Esc: dismiss popup → switch split focus to DM → cancel/exit DM
@@ -760,6 +809,12 @@ impl App {
             debug!("exiting DM with {}", dm.node_name);
             if let Err(e) = self.client.node_unsubscribe(&dm.node_id).await {
                 warn!("unsubscribe failed: {}", e);
+            }
+            // Clean up split node subscription
+            if let SplitTarget::Node { ref node_id, .. } = self.split_target {
+                let id = node_id.clone();
+                let _ = self.client.node_unsubscribe(&id).await;
+                self.split_target = SplitTarget::Channel;
             }
             self.messages.exit_dm();
             self.split_view = false;
@@ -1109,7 +1164,7 @@ impl App {
                 self.messages
                     .push_system("  /compact              压缩 DM 上下文");
                 self.messages
-                    .push_system("  /split                切换分屏(DM+频道)");
+                    .push_system("  /split [@agent]       分屏(频道或agent输出)");
                 self.messages
                     .push_system("  /dm <name>            与 agent 1v1 对话");
                 self.messages
@@ -1130,8 +1185,50 @@ impl App {
             }
 
             "/split" => {
-                if self.active_dm.is_some() {
-                    if self.active_channel.is_some() {
+                let arg = parts.get(1).copied().unwrap_or("");
+                if arg.starts_with('@') {
+                    // /split @agent-name: show agent output in right panel
+                    let agent_name = &arg[1..];
+                    if let Some(agent) = self.agents.iter().find(|a| a.name == agent_name) {
+                        let node_id = agent.node_id.clone();
+                        let node_name = agent.name.clone();
+                        // Unsubscribe from previous split node if any
+                        if let SplitTarget::Node { node_id: old_id, .. } = &self.split_target {
+                            let old_id = old_id.clone();
+                            let _ = self.client.node_unsubscribe(&old_id).await;
+                        }
+                        // Subscribe to new target node
+                        if let Err(e) = self.client.node_subscribe(&node_id).await {
+                            self.push_contextual_system(&format!("subscribe 失败: {}", e));
+                        } else {
+                            self.split_target = SplitTarget::Node { node_id, node_name: node_name.clone() };
+                            self.split_node_buffer.clear();
+                            self.split_view = true;
+                            self.split_focus = SplitFocus::Dm;
+                            self.channel_panel_state.snap_to_bottom();
+                            self.push_contextual_system(&format!("分屏查看 @{}", node_name));
+                        }
+                    } else {
+                        self.push_contextual_system(&format!("找不到 agent: {}", agent_name));
+                    }
+                } else if self.active_dm.is_some() {
+                    if self.split_view && arg.is_empty() {
+                        // Toggle off
+                        // Unsubscribe from split node if any
+                        if let SplitTarget::Node { node_id: old_id, .. } = &self.split_target {
+                            let old_id = old_id.clone();
+                            let _ = self.client.node_unsubscribe(&old_id).await;
+                        }
+                        self.split_view = false;
+                        self.split_target = SplitTarget::Channel;
+                        self.split_focus = SplitFocus::Dm;
+                    } else if self.active_channel.is_some() || !arg.is_empty() {
+                        // Unsubscribe from previous split node if switching to channel
+                        if let SplitTarget::Node { node_id: old_id, .. } = &self.split_target {
+                            let old_id = old_id.clone();
+                            let _ = self.client.node_unsubscribe(&old_id).await;
+                        }
+                        self.split_target = SplitTarget::Channel;
                         self.split_view = !self.split_view;
                         if self.split_view {
                             self.split_focus = SplitFocus::Dm;
@@ -1142,8 +1239,8 @@ impl App {
                     } else {
                         self.push_contextual_system("需要先加入频道才能分屏");
                     }
-                } else {
-                    self.push_contextual_system("需要先进入 DM 才能分屏");
+                } else if arg.is_empty() {
+                    self.push_contextual_system("用法: /split [@agent] 或在 DM 中 /split");
                 }
             }
 
@@ -1165,22 +1262,32 @@ impl App {
                 channel_id,
                 message,
             } => {
-                let is_active = self.active_channel.as_deref() == Some(&channel_id);
-                if is_active {
-                    let is_agent = self.agents.iter().any(|a| a.name == message.from);
-                    self.messages.push(&message, is_agent);
-                } else {
-                    // Cache message for non-active channel + bump unread
-                    self.messages.push_to_channel(&channel_id, &message);
-                    // Update sidebar unread badge
-                    if let Some(ch) = self.channels.iter_mut().find(|c| c.id == channel_id) {
-                        ch.unread = self.messages.unread_count(&channel_id);
+                // Only show messages that @mention me or that I sent.
+                // Token-level match: @name must be preceded by whitespace and followed
+                // by whitespace, punctuation, or EOF (mirrors server router.ts:parseMentions).
+                let dominated = message.from == self.client.node_name
+                    || mentions_name(&message.content, &self.client.node_name);
+                if dominated {
+                    let is_active = self.active_channel.as_deref() == Some(&channel_id);
+                    if is_active {
+                        let is_agent = self.agents.iter().any(|a| a.name == message.from);
+                        self.messages.push(&message, is_agent);
+                    } else {
+                        // Cache message for non-active channel + bump unread
+                        self.messages.push_to_channel(&channel_id, &message);
+                        // Update sidebar unread badge
+                        if let Some(ch) = self.channels.iter_mut().find(|c| c.id == channel_id) {
+                            ch.unread = self.messages.unread_count(&channel_id);
+                        }
                     }
                 }
             }
 
-            NerveEvent::ChannelMention { message, .. } => {
-                if self.active_dm.is_none() {
+            NerveEvent::ChannelMention { channel_id, message } => {
+                // Dedup: active channel mentions already shown via ChannelMessage handler.
+                // Non-active channel mentions always show (even in DM mode).
+                let is_active = self.active_channel.as_deref() == Some(&channel_id);
+                if !is_active {
                     let is_agent = self.agents.iter().any(|a| a.name == message.from);
                     self.messages.push(&message, is_agent);
                 }
@@ -1218,7 +1325,9 @@ impl App {
                 status,
                 activity,
             } => {
-                if let Some(agent) = self.agents.iter_mut().find(|a| a.name == name) {
+                let found = self.agents.iter_mut().find(|a| a.node_id == node_id || a.name == name);
+                if let Some(agent) = found {
+                    debug!("NodeStatusChanged: {} status={} activity={:?}", name, status, activity);
                     agent.status = status.clone();
                     agent.activity = activity;
                     // Clear tool call display when agent goes idle
@@ -1227,6 +1336,8 @@ impl App {
                         agent.tool_call_started = None;
                         agent.waiting_for = None;
                     }
+                } else {
+                    debug!("NodeStatusChanged: {} not found in agents list (len={})", name, self.agents.len());
                 }
                 // When agent goes idle, flush any pending streaming buffer as DM message
                 if status == "idle" {
@@ -1279,17 +1390,21 @@ impl App {
 
             NerveEvent::NodeRegistered {
                 ref name,
-                ref transport,
                 ..
             } => {
-                let is_agent = transport.as_deref() == Some("stdio");
-                if is_agent {
-                    if self.active_dm.is_none() {
-                        self.messages
-                            .push_system(&format!("{} 已注册", name));
-                    }
-                    self.refresh_agents().await;
+                info!("NodeRegistered: name={}", name);
+                // Show in both channel and DM views
+                self.messages
+                    .push_system(&format!("{} 已注册", name));
+                if self.active_dm.is_some() {
+                    self.messages.push_dm_system(&format!("{} 已注册", name));
                 }
+                self.refresh_agents().await;
+                info!(
+                    "NodeRegistered: after refresh, agents count={}, names=[{}]",
+                    self.agents.len(),
+                    self.agents.iter().map(|a| a.name.as_str()).collect::<Vec<_>>().join(", ")
+                );
             }
 
             NerveEvent::NodeStopped { node_id, name } => {
@@ -1307,6 +1422,13 @@ impl App {
                 } else if self.agents.iter().any(|a| a.node_id == node_id) {
                     self.messages
                         .push_system(&format!("{} 已停止", name));
+                }
+                // Clean up split panel if targeting the stopped node
+                if matches!(&self.split_target, SplitTarget::Node { node_id: sid, .. } if sid == &node_id) {
+                    let _ = self.client.node_unsubscribe(&node_id).await;
+                    self.split_target = SplitTarget::Channel;
+                    self.split_node_buffer.clear();
+                    self.split_view = false;
                 }
                 // Remove from agents list immediately
                 self.agents.retain(|a| a.node_id != node_id);
@@ -1330,27 +1452,31 @@ impl App {
             return;
         }
 
-        if let Some((_n, content)) = self.messages.streaming.iter().find(|(n, _)| n == name) {
-            if !content.is_empty() {
-                debug!(
-                    "flush_streaming_as_dm: {} went idle, persisting {} chars",
-                    name,
-                    content.len()
-                );
-                let dm_msg = DmMessage {
-                    role: "assistant".to_string(),
-                    content: content.clone(),
-                    timestamp: chrono::Local::now().timestamp(),
-                };
-                self.messages.push_dm(&dm_msg);
-                if let Some(ref mut dm_state) = self.active_dm {
-                    dm_state.messages.push(dm_msg);
-                }
+        // Extract content and clear streaming BEFORE pushing to dm_lines
+        // to prevent any render frame from seeing both.
+        let content = self.messages.streaming.iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, c)| c.clone())
+            .unwrap_or_default();
+        self.messages.streaming.retain(|(n, _)| n != name);
+        self.messages.take_streaming_message(name);
+
+        if !content.is_empty() {
+            debug!(
+                "flush_streaming_as_dm: {} went idle, persisting {} chars",
+                name,
+                content.len()
+            );
+            let dm_msg = DmMessage {
+                role: "assistant".to_string(),
+                content,
+                timestamp: chrono::Local::now().timestamp(),
+            };
+            self.messages.push_dm(&dm_msg);
+            if let Some(ref mut dm_state) = self.active_dm {
+                dm_state.messages.push(dm_msg);
             }
         }
-        self.messages.streaming.retain(|(n, _)| n != name);
-        // Also clean up structured streaming message
-        self.messages.take_streaming_message(name);
         self.flushed_agents.insert(name.to_string());
         if let Some(ref mut dm_state) = self.active_dm {
             if dm_state.node_id == node_id {
@@ -1365,6 +1491,21 @@ impl App {
             .active_dm
             .as_ref()
             .map_or(false, |dm| dm.node_id == node_id);
+
+        // Route updates to split node buffer if target matches
+        let is_split_node = matches!(&self.split_target, SplitTarget::Node { node_id: sid, .. } if sid == node_id);
+        if is_split_node {
+            if let Some(update) = detail.get("update") {
+                let kind = update.get("sessionUpdate").and_then(|v| v.as_str());
+                if kind == Some("agent_message_chunk") {
+                    if let Some(text) = update.get("content").and_then(|c| c.get("text")).and_then(|v| v.as_str()) {
+                        self.split_node_buffer.push_str(text);
+                    }
+                } else if kind == Some("agent_message_end") || kind == Some("stop_reason") {
+                    self.split_node_buffer.push('\n');
+                }
+            }
+        }
 
         // In DM mode, ignore streaming from non-active nodes
         if is_dm_active && !in_dm {
@@ -1461,6 +1602,8 @@ impl App {
                     // avoid persisting the same message twice.
                     let already_flushed = self.flushed_agents.remove(name);
 
+                    // Extract and clear streaming content BEFORE pushing to dm_lines
+                    // to prevent duplicate rendering.
                     let streaming_content = self
                         .messages
                         .streaming
@@ -1468,6 +1611,7 @@ impl App {
                         .find(|(n, _)| n == name)
                         .map(|(_, c)| c.clone())
                         .unwrap_or_default();
+                    self.messages.streaming.retain(|(n, _)| n != name);
 
                     // Some agents include full content in the end event
                     let end_content = update
@@ -1510,8 +1654,6 @@ impl App {
                     } else if in_dm {
                         debug!("agent_message_end from {} but no content to persist (already_flushed={})", name, already_flushed);
                     }
-                    // In channel mode: final message arrives via channel.message
-                    self.messages.streaming.retain(|(n, _)| n != name);
                     if let Some(ref mut dm_state) = self.active_dm {
                         if dm_state.node_id == node_id {
                             dm_state.is_responding = false;
@@ -1791,17 +1933,25 @@ impl App {
     }
 
     async fn refresh_agents(&mut self) {
-        match self.client.node_list(self.cwd_filter()).await {
+        let cwd = self.cwd_filter().map(|s| s.to_string());
+        debug!("refresh_agents: cwd_filter={:?}", cwd);
+        match self.client.node_list(cwd.as_deref()).await {
             Ok(nodes) => {
+                debug!("refresh_agents: got {} nodes from server", nodes.len());
+                for n in &nodes {
+                    debug!("  node: {} transport={} status={}", n.name, n.transport, n.status);
+                }
                 self.agents = nodes
                     .into_iter()
-                    .filter(|n| n.transport == "stdio")
+                    .filter(|n| n.status != "stopped")
                     .map(|n| AgentDisplay {
                         name: n.name,
                         status: n.status,
-                        activity: None,
+                        activity: n.activity,
                         adapter: n.adapter,
                         node_id: n.id,
+                        transport: n.transport,
+                        capabilities: n.capabilities,
                         usage: n.usage.map(|u| (u.token_used, u.token_size, u.cost)),
                         tool_call_name: None,
                         tool_call_started: None,
@@ -1978,6 +2128,8 @@ mod tests {
             activity: None,
             adapter: Some("claude".into()),
             node_id: "n1".into(),
+            transport: "stdio".into(),
+            capabilities: vec![],
             usage: None,
             tool_call_name: None,
             tool_call_started: None,
@@ -2007,6 +2159,8 @@ mod tests {
                 activity: None,
                 adapter: Some("claude".into()),
                 node_id: "n1".into(),
+                transport: "stdio".into(),
+                capabilities: vec![],
                 usage: None,
                 tool_call_name: None,
                 tool_call_started: None,
@@ -2018,6 +2172,8 @@ mod tests {
                 activity: None,
                 adapter: Some("codex".into()),
                 node_id: "n2".into(),
+                transport: "stdio".into(),
+                capabilities: vec![],
                 usage: None,
                 tool_call_name: None,
                 tool_call_started: None,
@@ -2125,5 +2281,98 @@ mod tests {
     fn cwd_filter_none_without_project_path() {
         let app = make_app();
         assert!(app.cwd_filter().is_none());
+    }
+
+    // --- mentions_name tests ---
+
+    #[test]
+    fn mentions_name_exact_match() {
+        assert!(mentions_name("hello @alice how are you", "alice"));
+        assert!(mentions_name("@alice", "alice"));
+        assert!(mentions_name("hey @alice.", "alice")); // trailing punctuation
+        assert!(mentions_name("@alice, @bob", "alice"));
+    }
+
+    #[test]
+    fn mentions_name_no_prefix_match() {
+        // @alice should NOT match @alice-dev
+        assert!(!mentions_name("hello @alice-dev", "alice"));
+        assert!(!mentions_name("@alice_admin is here", "alice"));
+        assert!(!mentions_name("@alicex", "alice"));
+    }
+
+    #[test]
+    fn mentions_name_no_false_positive() {
+        assert!(!mentions_name("hello alice", "alice")); // no @ prefix
+        assert!(!mentions_name("email@alice.com", "alice")); // preceded by non-whitespace
+        assert!(!mentions_name("", "alice"));
+    }
+
+    // --- ChannelMention in DM mode tests ---
+
+    #[tokio::test]
+    async fn dm_mode_does_not_swallow_other_channel_mention() {
+        let mut app = make_app();
+        // Simulate being in DM mode
+        app.active_dm = Some(DmState {
+            node_id: "n1".into(),
+            node_name: "bob".into(),
+            messages: Vec::new(),
+            streaming: None,
+            is_responding: false,
+        });
+        app.messages.enter_dm("bob");
+        // Active channel is ch1
+        app.active_channel = Some("ch1".into());
+
+        let initial_count = app.messages.line_count();
+
+        // Mention from a DIFFERENT channel (ch2) should still show
+        app.handle_nerve_event(NerveEvent::ChannelMention {
+            channel_id: "ch2".into(),
+            message: MessageInfo {
+                id: "m1".into(),
+                channel_id: "ch2".into(),
+                from: "alice".into(),
+                content: "@user hello".into(),
+                timestamp: 1710000000.0,
+                metadata: None,
+            },
+        })
+        .await;
+
+        assert_eq!(
+            app.messages.line_count(),
+            initial_count + 1,
+            "non-active channel mention should display even in DM mode"
+        );
+    }
+
+    #[tokio::test]
+    async fn active_channel_mention_deduped() {
+        let mut app = make_app();
+        app.active_channel = Some("ch1".into());
+
+        let initial_count = app.messages.line_count();
+
+        // Mention from the ACTIVE channel should be skipped (already shown via ChannelMessage)
+        app.handle_nerve_event(NerveEvent::ChannelMention {
+            channel_id: "ch1".into(),
+            message: MessageInfo {
+                id: "m2".into(),
+                channel_id: "ch1".into(),
+                from: "alice".into(),
+                content: "@user hello".into(),
+                timestamp: 1710000000.0,
+                metadata: None,
+            },
+        })
+        .await;
+
+        assert_eq!(
+            app.messages.line_count(),
+            initial_count,
+            "active channel mention should be deduped"
+        );
     }
 }

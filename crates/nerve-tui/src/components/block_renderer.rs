@@ -35,21 +35,9 @@ static CODE_THEME: LazyLock<Theme> = LazyLock::new(|| {
         .unwrap_or_else(|| ts.themes["base16-ocean.dark"].clone())
 });
 
-/// Options controlling block rendering (expand/collapse state).
-#[derive(Debug, Clone, Copy, Default)]
-pub struct BlockRenderOpts {
-    /// Whether this block is expanded (show full content).
-    pub expanded: bool,
-}
-
-/// Render any ContentBlock to styled lines (with default collapsed state).
+/// Render any ContentBlock to styled lines (always shows full content).
 pub fn render_block(block: &ContentBlock, width: u16) -> Vec<Line<'static>> {
-    render_block_with_opts(block, width, BlockRenderOpts::default())
-}
-
-/// Render a ContentBlock with explicit expand/collapse options.
-pub fn render_block_with_opts(block: &ContentBlock, width: u16, opts: BlockRenderOpts) -> Vec<Line<'static>> {
-    debug!(block_type = block.kind(), width, expanded = opts.expanded, "rendering content block");
+    debug!(block_type = block.kind(), width, "rendering content block");
     match block {
         ContentBlock::Text { text } => render_text(text, width),
         ContentBlock::Thinking { text, started_at, finished_at } => {
@@ -58,13 +46,13 @@ pub fn render_block_with_opts(block: &ContentBlock, width: u16, opts: BlockRende
                 (Some(s), None) => Some(s.elapsed()),
                 _ => None,
             };
-            render_thinking(text, elapsed, opts.expanded)
+            render_thinking(text, elapsed)
         }
         ContentBlock::ToolCall { id: _, name, input, status } => {
-            render_tool_call(name, input, status, opts.expanded)
+            render_tool_call(name, input, status)
         }
         ContentBlock::ToolResult { tool_call_id: _, content, is_error } => {
-            render_tool_result(content, *is_error, opts.expanded)
+            render_tool_result(content, *is_error)
         }
         ContentBlock::Error { message } => render_error(message),
     }
@@ -388,15 +376,14 @@ fn syntect_style_to_ratatui(syn: SynStyle) -> Style {
 // Thinking block: collapsed by default, shows timer
 // ---------------------------------------------------------------------------
 
-fn render_thinking(text: &str, elapsed: Option<std::time::Duration>, expanded: bool) -> Vec<Line<'static>> {
+fn render_thinking(text: &str, elapsed: Option<std::time::Duration>) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
 
     let timer = elapsed
         .map(|d| format!("{:.1}s", d.as_secs_f64()))
         .unwrap_or_else(|| "…".to_string());
 
-    let expand_hint = if expanded { "▼" } else { "▶" };
-    let header = format!("  {} 💭 思考中 ({})", expand_hint, timer);
+    let header = format!("  💭 思考中 ({})", timer);
     lines.push(Line::from(Span::styled(
         header,
         Style::default()
@@ -404,35 +391,11 @@ fn render_thinking(text: &str, elapsed: Option<std::time::Duration>, expanded: b
             .add_modifier(Modifier::ITALIC),
     )));
 
-    if expanded {
-        // Show all lines
-        for line in text.lines() {
-            lines.push(Line::from(Span::styled(
-                format!("  │ {}", line),
-                Style::default().fg(Color::DarkGray),
-            )));
-        }
-    } else {
-        // Show last 3 lines as preview
-        let total = text.lines().count();
-        let preview_lines: Vec<&str> = text.lines().rev().take(3).collect();
-        if total > 3 {
-            lines.push(Line::from(Span::styled(
-                format!("  │ … 共 {} 行", total),
-                Style::default().fg(Color::DarkGray),
-            )));
-        }
-        for line in preview_lines.into_iter().rev() {
-            let truncated = if line.len() > 100 {
-                format!("{}…", &line[..100])
-            } else {
-                line.to_string()
-            };
-            lines.push(Line::from(Span::styled(
-                format!("  │ {}", truncated),
-                Style::default().fg(Color::DarkGray),
-            )));
-        }
+    for line in text.lines() {
+        lines.push(Line::from(Span::styled(
+            format!("  │ {}", line),
+            Style::default().fg(Color::DarkGray),
+        )));
     }
 
     lines
@@ -442,7 +405,7 @@ fn render_thinking(text: &str, elapsed: Option<std::time::Duration>, expanded: b
 // ToolCall block: tool name + status icon + collapsible args
 // ---------------------------------------------------------------------------
 
-fn render_tool_call(name: &str, input: &str, status: &ToolStatus, expanded: bool) -> Vec<Line<'static>> {
+fn render_tool_call(name: &str, input: &str, status: &ToolStatus) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
 
     let (icon, icon_color) = match status {
@@ -452,15 +415,9 @@ fn render_tool_call(name: &str, input: &str, status: &ToolStatus, expanded: bool
         ToolStatus::Failed => ("✗", Color::Red),
     };
 
-    debug!(tool_name = name, ?status, expanded, "rendering tool_call block");
+    debug!(tool_name = name, ?status, "rendering tool_call block");
 
-    let expand_hint = if !input.is_empty() {
-        if expanded { " ▼" } else { " ▶" }
-    } else {
-        ""
-    };
-
-    // Header: icon + tool name + expand hint
+    // Header: icon + tool name
     lines.push(Line::from(vec![
         Span::styled(format!("  {} ", icon), Style::default().fg(icon_color)),
         Span::styled(
@@ -469,31 +426,16 @@ fn render_tool_call(name: &str, input: &str, status: &ToolStatus, expanded: bool
                 .fg(theme::TOOL_NAME)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::styled(
-            expand_hint.to_string(),
-            Style::default().fg(Color::DarkGray),
-        ),
     ]));
 
-    // Show input args
+    // Always show input args when block is rendered
     if !input.is_empty() {
-        let max_items = if expanded { usize::MAX } else { 3 };
-        let max_line_len = if expanded { usize::MAX } else { 100 };
-
         if let Ok(val) = serde_json::from_str::<serde_json::Value>(input) {
             if let Some(obj) = val.as_object() {
-                let mut count = 0;
                 for (k, v) in obj {
-                    if count >= max_items {
-                        lines.push(Line::from(Span::styled(
-                            format!("    … {} 个参数", obj.len()),
-                            Style::default().fg(theme::TOOL_LABEL),
-                        )));
-                        break;
-                    }
                     let v_str = match v {
-                        serde_json::Value::String(s) => truncate(s, max_line_len),
-                        _ => truncate(&v.to_string(), max_line_len),
+                        serde_json::Value::String(s) => s.clone(),
+                        _ => v.to_string(),
                     };
                     lines.push(Line::from(vec![
                         Span::styled(
@@ -502,25 +444,15 @@ fn render_tool_call(name: &str, input: &str, status: &ToolStatus, expanded: bool
                         ),
                         Span::styled(v_str, Style::default().fg(theme::TOOL_VALUE)),
                     ]));
-                    count += 1;
                 }
             }
         } else {
             // Plain string input
-            let line_limit = if expanded { usize::MAX } else { 3 };
-            let total_lines = input.lines().count();
-            for (i, line) in input.lines().take(line_limit).enumerate() {
+            for line in input.lines() {
                 lines.push(Line::from(Span::styled(
-                    format!("    {}", truncate(line, max_line_len)),
+                    format!("    {}", line),
                     Style::default().fg(theme::TOOL_VALUE),
                 )));
-                if !expanded && i == 2 && total_lines > 3 {
-                    lines.push(Line::from(Span::styled(
-                        format!("    … 共 {} 行", total_lines),
-                        Style::default().fg(theme::TOOL_LABEL),
-                    )));
-                    break;
-                }
             }
         }
     }
@@ -532,19 +464,13 @@ fn render_tool_call(name: &str, input: &str, status: &ToolStatus, expanded: bool
 // ToolResult block: shows result content with error styling
 // ---------------------------------------------------------------------------
 
-fn render_tool_result(content: &str, is_error: bool, expanded: bool) -> Vec<Line<'static>> {
+fn render_tool_result(content: &str, is_error: bool) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
 
-    let expand_hint = if content.lines().count() > 3 {
-        if expanded { " ▼" } else { " ▶" }
-    } else {
-        ""
-    };
-
     let (label, label_color) = if is_error {
-        (format!("  ✗ 结果（错误）{}", expand_hint), Color::Red)
+        ("  ✗ 结果（错误）".to_string(), Color::Red)
     } else {
-        (format!("  ✓ 结果{}", expand_hint), theme::TOOL_LABEL)
+        ("  ✓ 结果".to_string(), theme::TOOL_LABEL)
     };
 
     lines.push(Line::from(Span::styled(
@@ -558,30 +484,11 @@ fn render_tool_result(content: &str, is_error: bool, expanded: bool) -> Vec<Line
         theme::TOOL_VALUE
     };
 
-    let content_lines: Vec<&str> = content.lines().collect();
-    let max_line_len = if expanded { usize::MAX } else { 120 };
-
-    if expanded {
-        for line in &content_lines {
-            lines.push(Line::from(Span::styled(
-                format!("    {}", line),
-                Style::default().fg(content_color),
-            )));
-        }
-    } else {
-        let show_count = content_lines.len().min(3);
-        for line in &content_lines[..show_count] {
-            lines.push(Line::from(Span::styled(
-                format!("    {}", truncate(line, max_line_len)),
-                Style::default().fg(content_color),
-            )));
-        }
-        if content_lines.len() > 3 {
-            lines.push(Line::from(Span::styled(
-                format!("    … 共 {} 行", content_lines.len()),
-                Style::default().fg(theme::TOOL_LABEL),
-            )));
-        }
+    for line in content.lines() {
+        lines.push(Line::from(Span::styled(
+            format!("    {}", line),
+            Style::default().fg(content_color),
+        )));
     }
 
     lines
@@ -601,15 +508,6 @@ fn render_error(message: &str) -> Vec<Line<'static>> {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-fn truncate(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        s.to_string()
-    } else {
-        let truncated: String = s.chars().take(max).collect();
-        format!("{}…", truncated)
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -719,7 +617,7 @@ mod tests {
     #[test]
     fn thinking_with_elapsed() {
         let elapsed = Some(Duration::from_secs_f64(2.5));
-        let lines = render_thinking("I need to check the file...", elapsed, false);
+        let lines = render_thinking("I need to check the file...", elapsed);
         let text: String = lines.iter()
             .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
             .collect();
@@ -730,7 +628,7 @@ mod tests {
 
     #[test]
     fn thinking_no_elapsed() {
-        let lines = render_thinking("step 1", None, false);
+        let lines = render_thinking("step 1", None);
         let text: String = lines.iter()
             .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
             .collect();
@@ -738,48 +636,24 @@ mod tests {
     }
 
     #[test]
-    fn thinking_long_text_shows_last_3_lines() {
+    fn thinking_shows_all_content() {
         let long = (0..10).map(|i| format!("line {}", i)).collect::<Vec<_>>().join("\n");
-        let lines = render_thinking(&long, Some(Duration::from_secs(1)), false);
-        // Header + "共 10 行" + 3 preview lines = 5
-        assert_eq!(lines.len(), 5);
-        let text: String = lines.iter()
-            .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
-            .collect();
-        assert!(text.contains("共 10 行"));
-        assert!(text.contains("line 7"));
-        assert!(text.contains("line 8"));
-        assert!(text.contains("line 9"));
-    }
-
-    #[test]
-    fn thinking_expanded_shows_all_lines() {
-        let long = (0..10).map(|i| format!("line {}", i)).collect::<Vec<_>>().join("\n");
-        let lines = render_thinking(&long, Some(Duration::from_secs(1)), true);
-        // Header + 10 lines = 11
+        let lines = render_thinking(&long, Some(Duration::from_secs(1)));
+        // Header + 10 content lines = 11
         assert_eq!(lines.len(), 11);
         let text: String = lines.iter()
             .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
             .collect();
-        assert!(text.contains("▼")); // expanded indicator
+        assert!(text.contains("思考中"));
         assert!(text.contains("line 0"));
         assert!(text.contains("line 9"));
-    }
-
-    #[test]
-    fn thinking_collapsed_shows_arrow() {
-        let lines = render_thinking("short", Some(Duration::from_secs(1)), false);
-        let text: String = lines.iter()
-            .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
-            .collect();
-        assert!(text.contains("▶"));
     }
 
     // --- ToolCall block tests ---
 
     #[test]
     fn tool_call_pending() {
-        let lines = render_tool_call("Read", "{}", &ToolStatus::Pending, false);
+        let lines = render_tool_call("Read", "{}", &ToolStatus::Pending);
         let text: String = lines.iter()
             .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
             .collect();
@@ -789,7 +663,7 @@ mod tests {
 
     #[test]
     fn tool_call_completed() {
-        let lines = render_tool_call("Edit", "{}", &ToolStatus::Completed, false);
+        let lines = render_tool_call("Edit", "{}", &ToolStatus::Completed);
         let text: String = lines.iter()
             .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
             .collect();
@@ -799,7 +673,7 @@ mod tests {
 
     #[test]
     fn tool_call_failed() {
-        let lines = render_tool_call("Bash", "{}", &ToolStatus::Failed, false);
+        let lines = render_tool_call("Bash", "{}", &ToolStatus::Failed);
         let text: String = lines.iter()
             .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
             .collect();
@@ -807,72 +681,53 @@ mod tests {
     }
 
     #[test]
-    fn tool_call_with_json_args() {
+    fn tool_call_shows_all_args() {
         let input = r#"{"path": "/tmp/test.rs", "content": "fn main() {}"}"#;
-        let lines = render_tool_call("Write", input, &ToolStatus::Running, false);
+        let lines = render_tool_call("Write", input, &ToolStatus::Running);
         let text: String = lines.iter()
             .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
             .collect();
+        assert!(text.contains("Write"));
         assert!(text.contains("path"));
         assert!(text.contains("/tmp/test.rs"));
     }
 
     #[test]
-    fn tool_call_many_args_truncated() {
+    fn tool_call_many_args_all_shown() {
         let input = r#"{"a":"1","b":"2","c":"3","d":"4","e":"5"}"#;
-        let lines = render_tool_call("Foo", input, &ToolStatus::Pending, false);
+        let lines = render_tool_call("Foo", input, &ToolStatus::Pending);
         let text: String = lines.iter()
             .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
             .collect();
-        // Should show "… 5 个参数"
-        assert!(text.contains("个参数"));
-    }
-
-    #[test]
-    fn tool_call_expanded_shows_all_args() {
-        let input = r#"{"a":"1","b":"2","c":"3","d":"4","e":"5"}"#;
-        let lines = render_tool_call("Foo", input, &ToolStatus::Pending, true);
-        let text: String = lines.iter()
-            .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
-            .collect();
-        // Expanded: should show all 5 args, no truncation indicator
         assert!(text.contains("a:"));
         assert!(text.contains("e:"));
-        assert!(!text.contains("个参数"));
-        assert!(text.contains("▼")); // expanded indicator
-    }
-
-    #[test]
-    fn tool_call_collapsed_shows_arrow() {
-        let input = r#"{"a":"1"}"#;
-        let lines = render_tool_call("Foo", input, &ToolStatus::Pending, false);
-        let text: String = lines.iter()
-            .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
-            .collect();
-        assert!(text.contains("▶"));
+        // Header + 5 args = 6
+        assert_eq!(lines.len(), 6);
     }
 
     // --- ToolResult block tests ---
 
     #[test]
-    fn tool_result_success() {
-        let lines = render_tool_result("file1.txt\nfile2.txt", false, false);
+    fn tool_result_success_shows_content() {
+        let lines = render_tool_result("file1.txt\nfile2.txt", false);
         let text: String = lines.iter()
             .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
             .collect();
         assert!(text.contains("✓ 结果"));
         assert!(text.contains("file1.txt"));
+        // Header + 2 content lines = 3
+        assert_eq!(lines.len(), 3);
     }
 
     #[test]
-    fn tool_result_error() {
-        let lines = render_tool_result("command not found", true, false);
+    fn tool_result_error_shows_content() {
+        let lines = render_tool_result("command not found", true);
         let text: String = lines.iter()
             .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
             .collect();
         assert!(text.contains("✗ 结果（错误）"));
         assert!(text.contains("command not found"));
-        // Check red color
+        // Check red color on content
         let error_span = lines.iter()
             .flat_map(|l| l.spans.iter())
             .find(|s| s.content.contains("command not found"));
@@ -880,41 +735,36 @@ mod tests {
     }
 
     #[test]
-    fn tool_result_long_truncated() {
+    fn tool_result_long_shows_all() {
         let content = (0..10).map(|i| format!("line {}", i)).collect::<Vec<_>>().join("\n");
-        let lines = render_tool_result(&content, false, false);
-        let text: String = lines.iter()
-            .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
-            .collect();
-        assert!(text.contains("共 10 行"));
+        let lines = render_tool_result(&content, false);
+        // Header + 10 content lines = 11
+        assert_eq!(lines.len(), 11);
     }
 
     #[test]
-    fn tool_result_expanded_shows_all() {
+    fn tool_result_always_shows_all() {
         let content = (0..10).map(|i| format!("line {}", i)).collect::<Vec<_>>().join("\n");
-        let lines = render_tool_result(&content, false, true);
+        let lines = render_tool_result(&content, false);
         let text: String = lines.iter()
             .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
             .collect();
         assert!(text.contains("line 0"));
         assert!(text.contains("line 9"));
-        assert!(!text.contains("共 10 行")); // no truncation in expanded
-        assert!(text.contains("▼"));
     }
 
     #[test]
-    fn render_block_with_opts_expanded() {
+    fn render_block_shows_content() {
         let block = ContentBlock::Thinking {
             text: "long thought".into(),
             started_at: Some(Instant::now()),
             finished_at: Some(Instant::now()),
         };
-        let opts = BlockRenderOpts { expanded: true };
-        let lines = render_block_with_opts(&block, 80, opts);
+        let lines = render_block(&block, 80);
         let text: String = lines.iter()
             .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
             .collect();
-        assert!(text.contains("▼"));
+        assert!(text.contains("long thought"));
     }
 
     // --- Error block tests ---
@@ -997,18 +847,6 @@ mod tests {
     fn highlight_code_unknown_lang_fallback() {
         let lines = highlight_code("some stuff", "nonexistent_lang");
         assert!(lines.len() >= 3); // border + 1 line + border
-    }
-
-    #[test]
-    fn truncate_short_string() {
-        assert_eq!(truncate("hello", 10), "hello");
-    }
-
-    #[test]
-    fn truncate_long_string() {
-        let result = truncate("hello world this is long", 10);
-        assert!(result.ends_with('…'));
-        assert!(result.chars().count() <= 11); // 10 + …
     }
 
     // --- Table rendering tests ---
