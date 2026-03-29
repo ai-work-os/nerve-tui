@@ -137,6 +137,32 @@ impl DmView {
         self.usage_ratio = ratio;
     }
 
+    // --- Node log entries (program node observability) ---
+
+    pub fn push_log_entries(&mut self, update: &Value) {
+        if let Some(entries) = update.get("entries").and_then(|v| v.as_array()) {
+            for entry in entries {
+                let level = entry.get("level").and_then(|v| v.as_str()).unwrap_or("info");
+                let message = entry.get("message").and_then(|v| v.as_str()).unwrap_or("");
+                let ts_str = entry.get("ts").and_then(|v| v.as_str()).unwrap_or("");
+                // Parse timestamp for display: extract HH:MM:SS from ISO string
+                let time_display = ts_str.get(11..19).unwrap_or("??:??:??");
+                let formatted = format!("[{}] [{}] {}", time_display, level.to_uppercase(), message);
+                self.messages.push(MessageLine {
+                    from: "log".to_string(),
+                    content: formatted.clone(),
+                    timestamp: Local::now().timestamp() as f64,
+                    blocks: vec![ContentBlock::Text { text: formatted }],
+                });
+            }
+            if self.auto_scroll {
+                self.snap_to_bottom();
+            } else {
+                self.has_new_messages = true;
+            }
+        }
+    }
+
     // --- Structured streaming ---
 
     pub fn start_streaming_message(&mut self, agent_name: &str) {
@@ -316,6 +342,20 @@ impl DmView {
                     format!("— {}", display_content),
                     style,
                 )));
+                continue;
+            }
+
+            // Log entries from program nodes
+            if msg.from == "log" {
+                prev_timestamp = Some(msg.timestamp);
+                let style = if display_content.contains("[ERROR]") {
+                    Style::default().fg(Color::Red)
+                } else if display_content.contains("[WARN]") {
+                    Style::default().fg(Color::Yellow)
+                } else {
+                    Style::default().fg(Color::DarkGray)
+                };
+                out.push(Line::from(Span::styled(display_content.clone(), style)));
                 continue;
             }
 
