@@ -20,6 +20,7 @@ struct ViewSnapshot {
     has_new_messages: bool,
 }
 
+#[allow(dead_code)]
 pub(crate) struct MessageLine {
     pub from: String,
     pub content: String,
@@ -281,7 +282,8 @@ impl ChannelView {
         para.render(inner, buf);
     }
 
-    /// Public accessor for build_text (used by MessagesView proxy in tests).
+    /// Public accessor for build_text (used by tests).
+    #[allow(dead_code)]
     pub(crate) fn build_text_pub(&self, width: u16) -> Vec<Line<'static>> {
         self.build_text(width)
     }

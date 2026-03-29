@@ -14,6 +14,7 @@ use unicode_width::UnicodeWidthStr;
 
 use super::messages::{compact_rendered_lines, format_interval, format_time};
 
+#[allow(dead_code)]
 pub(crate) struct MessageLine {
     pub from: String,
     pub content: String,
@@ -345,10 +346,19 @@ impl DmView {
             }
             out.push(Line::from(header));
 
-            // Content via block_renderer
-            let blocks = Message::content_to_blocks(&display_content);
+            // Content via block_renderer — use pre-built blocks if they contain
+            // structured content (tool calls, thinking, etc). Plain text-only blocks
+            // go through content_to_blocks for channel-origin stripping etc.
+            let fallback_blocks;
+            let has_structured = msg.blocks.iter().any(|b| !matches!(b, ContentBlock::Text { .. }));
+            let blocks = if has_structured {
+                &msg.blocks
+            } else {
+                fallback_blocks = Message::content_to_blocks(&display_content);
+                &fallback_blocks
+            };
             let mut content_lines: Vec<Line<'static>> = Vec::new();
-            for block in &blocks {
+            for block in blocks {
                 content_lines.extend(block_renderer::render_block_collapsed(block, width));
             }
             compact_rendered_lines(&mut content_lines);
