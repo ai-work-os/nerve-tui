@@ -28,9 +28,12 @@
       "mcp__nerve__nerve_spawn",
       "mcp__nerve__nerve_stop",
       "Bash(find crates/nerve-tui/src -name \"*.rs\" -exec wc -l {} +)",
-      "Bash(find /Users/renjinxi/work/worktree/ai-work-os/nerve-tui -name \"*.rs\" -exec wc -l {} +)"
+      "Bash(find /Users/renjinxi/work/worktree/ai-work-os/nerve-tui -name \"*.rs\" -exec wc -l {} +)",
+      "mcp__nerve__nerve_join",
+      "mcp__nerve__nerve_remove"
     ],
     "deny": [],
     "ask": []
-  }
+  },
+  "model": "opus[1m]"
 }

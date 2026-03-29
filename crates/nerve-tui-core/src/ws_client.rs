@@ -441,7 +441,7 @@ fn parse_notification(method: &str, params: Value) -> Option<NerveEvent> {
                 .map(String::from);
             Some(NerveEvent::ChannelCreated { channel_id, name })
         }
-        "channel.closed" => {
+        "channel.closed" | "channel.deleted" => {
             let channel_id = params.get("channelId")?.as_str()?.to_string();
             let name = params
                 .get("name")

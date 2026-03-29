@@ -292,6 +292,94 @@ impl Message {
         }
     }
 
+    /// Parse a persisted content string back into ContentBlocks.
+    ///
+    /// The server stores messages as plain strings. This function detects
+    /// tool_call JSON, tool_result JSON, and plain text, returning them
+    /// as structured blocks so they can be rendered via block_renderer.
+    pub fn content_to_blocks(content: &str) -> Vec<ContentBlock> {
+        let trimmed = content.trim();
+        if trimmed.is_empty() {
+            return Vec::new();
+        }
+
+        // Try tool_call: JSON object with "name" + ("arguments" or "input")
+        if trimmed.starts_with('{') {
+            if let Ok(val) = serde_json::from_str::<Value>(trimmed) {
+                if let Some(obj) = val.as_object() {
+                    // Tool call detection
+                    if obj.contains_key("name")
+                        && (obj.contains_key("arguments") || obj.contains_key("input"))
+                    {
+                        let name = obj
+                            .get("name")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("unknown")
+                            .to_string();
+                        let id = obj
+                            .get("id")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let input_val = obj
+                            .get("arguments")
+                            .or_else(|| obj.get("input"));
+                        let input = match input_val {
+                            Some(v) if v.is_string() => {
+                                v.as_str().unwrap_or("").to_string()
+                            }
+                            Some(v) => serde_json::to_string_pretty(v).unwrap_or_default(),
+                            None => String::new(),
+                        };
+                        debug!(tool_name = %name, "content_to_blocks: detected tool_call");
+                        return vec![ContentBlock::ToolCall {
+                            id,
+                            name,
+                            input,
+                            status: ToolStatus::Completed,
+                        }];
+                    }
+
+                    // Tool result detection
+                    let is_result = obj
+                        .get("type")
+                        .and_then(|v| v.as_str())
+                        .map_or(false, |t| t == "tool_result")
+                        || obj.contains_key("tool_use_id");
+                    if is_result {
+                        let tool_call_id = obj
+                            .get("tool_use_id")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let result_content = obj
+                            .get("content")
+                            .and_then(|v| v.as_str())
+                            .or_else(|| obj.get("output").and_then(|v| v.as_str()))
+                            .unwrap_or("")
+                            .to_string();
+                        let is_error = obj
+                            .get("is_error")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false);
+                        debug!(tool_call_id = %tool_call_id, is_error, "content_to_blocks: detected tool_result");
+                        return vec![ContentBlock::ToolResult {
+                            tool_call_id,
+                            content: result_content,
+                            is_error,
+                        }];
+                    }
+                }
+            }
+        }
+
+        // Default: plain text
+        debug!(len = trimmed.len(), "content_to_blocks: plain text");
+        vec![ContentBlock::Text {
+            text: content.to_string(),
+        }]
+    }
+
     /// Apply an ACP streaming event to this message.
     /// Returns true if the message was modified.
     pub fn apply_acp_event(&mut self, kind: &str, update: &Value) -> bool {
@@ -1195,6 +1283,193 @@ mod tests {
             finished_at: None,
         }.kind(), "thinking");
         assert_eq!(ContentBlock::Error { message: String::new() }.kind(), "error");
+    }
+
+    // --- content_to_blocks tests ---
+
+    #[test]
+    fn content_to_blocks_empty_string() {
+        let blocks = Message::content_to_blocks("");
+        assert!(blocks.is_empty());
+    }
+
+    #[test]
+    fn content_to_blocks_whitespace_only() {
+        let blocks = Message::content_to_blocks("   \n  ");
+        assert!(blocks.is_empty());
+    }
+
+    #[test]
+    fn content_to_blocks_plain_text() {
+        let blocks = Message::content_to_blocks("Hello world");
+        assert_eq!(blocks.len(), 1);
+        match &blocks[0] {
+            ContentBlock::Text { text } => assert_eq!(text, "Hello world"),
+            _ => panic!("expected Text block"),
+        }
+    }
+
+    #[test]
+    fn content_to_blocks_markdown_text() {
+        let content = "## Title\n\nSome **bold** text with `code`";
+        let blocks = Message::content_to_blocks(content);
+        assert_eq!(blocks.len(), 1);
+        match &blocks[0] {
+            ContentBlock::Text { text } => assert_eq!(text, content),
+            _ => panic!("expected Text block"),
+        }
+    }
+
+    #[test]
+    fn content_to_blocks_tool_call_with_arguments() {
+        let content = r#"{"name": "Read", "arguments": {"file_path": "/tmp/test.rs"}}"#;
+        let blocks = Message::content_to_blocks(content);
+        assert_eq!(blocks.len(), 1);
+        match &blocks[0] {
+            ContentBlock::ToolCall { name, input, status, .. } => {
+                assert_eq!(name, "Read");
+                assert!(input.contains("/tmp/test.rs"));
+                assert_eq!(*status, ToolStatus::Completed);
+            }
+            _ => panic!("expected ToolCall block"),
+        }
+    }
+
+    #[test]
+    fn content_to_blocks_tool_call_with_input() {
+        let content = r#"{"name": "Bash", "input": {"command": "ls -la"}}"#;
+        let blocks = Message::content_to_blocks(content);
+        assert_eq!(blocks.len(), 1);
+        match &blocks[0] {
+            ContentBlock::ToolCall { name, input, .. } => {
+                assert_eq!(name, "Bash");
+                assert!(input.contains("ls -la"));
+            }
+            _ => panic!("expected ToolCall block"),
+        }
+    }
+
+    #[test]
+    fn content_to_blocks_tool_call_with_id() {
+        let content = r#"{"id": "tc1", "name": "Edit", "arguments": {}}"#;
+        let blocks = Message::content_to_blocks(content);
+        match &blocks[0] {
+            ContentBlock::ToolCall { id, name, .. } => {
+                assert_eq!(id, "tc1");
+                assert_eq!(name, "Edit");
+            }
+            _ => panic!("expected ToolCall block"),
+        }
+    }
+
+    #[test]
+    fn content_to_blocks_tool_call_string_input() {
+        let content = r#"{"name": "Write", "arguments": "raw string arg"}"#;
+        let blocks = Message::content_to_blocks(content);
+        match &blocks[0] {
+            ContentBlock::ToolCall { input, .. } => {
+                assert_eq!(input, "raw string arg");
+            }
+            _ => panic!("expected ToolCall block"),
+        }
+    }
+
+    #[test]
+    fn content_to_blocks_tool_result_by_type() {
+        let content = r#"{"type": "tool_result", "content": "file1.txt\nfile2.txt"}"#;
+        let blocks = Message::content_to_blocks(content);
+        assert_eq!(blocks.len(), 1);
+        match &blocks[0] {
+            ContentBlock::ToolResult { content, is_error, .. } => {
+                assert_eq!(content, "file1.txt\nfile2.txt");
+                assert!(!is_error);
+            }
+            _ => panic!("expected ToolResult block"),
+        }
+    }
+
+    #[test]
+    fn content_to_blocks_tool_result_by_tool_use_id() {
+        let content = r#"{"tool_use_id": "tc1", "content": "ok"}"#;
+        let blocks = Message::content_to_blocks(content);
+        assert_eq!(blocks.len(), 1);
+        match &blocks[0] {
+            ContentBlock::ToolResult { tool_call_id, content, .. } => {
+                assert_eq!(tool_call_id, "tc1");
+                assert_eq!(content, "ok");
+            }
+            _ => panic!("expected ToolResult block"),
+        }
+    }
+
+    #[test]
+    fn content_to_blocks_tool_result_error() {
+        let content = r#"{"type": "tool_result", "content": "not found", "is_error": true}"#;
+        let blocks = Message::content_to_blocks(content);
+        match &blocks[0] {
+            ContentBlock::ToolResult { is_error, content, .. } => {
+                assert!(is_error);
+                assert_eq!(content, "not found");
+            }
+            _ => panic!("expected ToolResult block"),
+        }
+    }
+
+    #[test]
+    fn content_to_blocks_tool_result_with_output_field() {
+        let content = r#"{"type": "tool_result", "output": "some output"}"#;
+        let blocks = Message::content_to_blocks(content);
+        match &blocks[0] {
+            ContentBlock::ToolResult { content, .. } => {
+                assert_eq!(content, "some output");
+            }
+            _ => panic!("expected ToolResult block"),
+        }
+    }
+
+    #[test]
+    fn content_to_blocks_json_without_name_is_text() {
+        // A JSON object that doesn't match tool_call or tool_result patterns
+        let content = r#"{"key": "value", "other": 42}"#;
+        let blocks = Message::content_to_blocks(content);
+        assert_eq!(blocks.len(), 1);
+        match &blocks[0] {
+            ContentBlock::Text { text } => assert_eq!(text, content),
+            _ => panic!("expected Text block"),
+        }
+    }
+
+    #[test]
+    fn content_to_blocks_invalid_json_is_text() {
+        let content = r#"{broken json"#;
+        let blocks = Message::content_to_blocks(content);
+        assert_eq!(blocks.len(), 1);
+        match &blocks[0] {
+            ContentBlock::Text { text } => assert_eq!(text, content),
+            _ => panic!("expected Text block"),
+        }
+    }
+
+    #[test]
+    fn content_to_blocks_preserves_original_text() {
+        // Ensure leading/trailing whitespace in the original is preserved in Text block
+        let content = "  some text with spaces  ";
+        let blocks = Message::content_to_blocks(content);
+        match &blocks[0] {
+            ContentBlock::Text { text } => assert_eq!(text, content),
+            _ => panic!("expected Text block"),
+        }
+    }
+
+    #[test]
+    fn content_to_blocks_multiline_text() {
+        let content = "line 1\nline 2\nline 3";
+        let blocks = Message::content_to_blocks(content);
+        assert_eq!(blocks.len(), 1);
+        match &blocks[0] {
+            ContentBlock::Text { text } => assert_eq!(text, content),
+            _ => panic!("expected Text block"),
+        }
     }
 
     #[test]

@@ -7,12 +7,12 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Span;
 use ratatui::Frame;
 use serde_json::Value;
-use std::collections::HashSet;
 use std::path::Path;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
-use crate::components::messages::ChannelPanelState;
+use crate::components::channel_view::{self, ChannelPanelState, ChannelView};
+use crate::components::dm_view::DmView;
 use crate::components::*;
 use crate::layout::AppLayout;
 
@@ -56,8 +56,9 @@ pub struct App {
     pub client: NerveClient,
     event_rx: mpsc::UnboundedReceiver<NerveEvent>,
 
-    // UI components
-    messages: MessagesView,
+    // UI components — direct view fields (replaces MessagesView proxy)
+    channel_view: ChannelView,
+    dm_view: DmView,
     status_bar: StatusBar,
     input: InputBox,
 
@@ -67,8 +68,9 @@ pub struct App {
     active_channel: Option<String>,
     should_quit: bool,
 
-    // DM mode
-    active_dm: Option<DmState>,
+    /// Explicit view mode state machine.
+    view_mode: ViewMode,
+
     project_path: Option<String>,
     project_name: Option<String>,
     /// When false (default), only show channels/agents for project_path
@@ -80,9 +82,6 @@ pub struct App {
     error_rx: mpsc::UnboundedReceiver<String>,
     /// Cached archived channels from last /restore call
     archived_channels: Vec<Value>,
-
-    /// Agents whose streaming buffer was already flushed by idle (to avoid double-persist)
-    flushed_agents: HashSet<String>,
 
     // Split view
     split_view: bool,
@@ -120,14 +119,15 @@ impl App {
         Self {
             client,
             event_rx,
-            messages: MessagesView::new(),
+            channel_view: ChannelView::new(),
+            dm_view: DmView::inactive(),
             status_bar: StatusBar::new(),
             input: InputBox::new(),
             channels: Vec::new(),
             agents: Vec::new(),
             active_channel: None,
             should_quit: false,
-            active_dm: None,
+            view_mode: ViewMode::Channel { channel_id: String::new() },
             project_path,
             project_name,
             global_mode: false,
@@ -135,7 +135,6 @@ impl App {
             error_tx,
             error_rx,
             archived_channels: Vec::new(),
-            flushed_agents: HashSet::new(),
             split_view: false,
             split_focus: SplitFocus::Dm,
             split_target: SplitTarget::Channel,
@@ -169,6 +168,65 @@ impl App {
                     Some(trimmed.to_string())
                 }
             })
+    }
+
+    fn is_dm_mode(&self) -> bool {
+        matches!(self.view_mode, ViewMode::Dm { .. })
+    }
+
+    fn dm_node_id(&self) -> Option<&str> {
+        match &self.view_mode {
+            ViewMode::Dm { node_id, .. } => Some(node_id.as_str()),
+            _ => None,
+        }
+    }
+
+    fn dm_node_name(&self) -> Option<&str> {
+        match &self.view_mode {
+            ViewMode::Dm { node_name, .. } => Some(node_name.as_str()),
+            _ => None,
+        }
+    }
+
+    /// Scroll the currently active view (DM or channel).
+    fn scroll_active_up(&mut self, n: u16) {
+        if self.is_dm_mode() {
+            self.dm_view.scroll_up(n);
+        } else {
+            self.channel_view.scroll_up(n);
+        }
+    }
+
+    fn scroll_active_down(&mut self, n: u16) {
+        if self.is_dm_mode() {
+            self.dm_view.scroll_down(n);
+        } else {
+            self.channel_view.scroll_down(n);
+        }
+    }
+
+    fn page_active_up(&mut self) {
+        if self.is_dm_mode() {
+            self.dm_view.page_up();
+        } else {
+            self.channel_view.page_up();
+        }
+    }
+
+    fn page_active_down(&mut self) {
+        if self.is_dm_mode() {
+            self.dm_view.page_down();
+        } else {
+            self.channel_view.page_down();
+        }
+    }
+
+    fn snap_active_to_bottom(&mut self) {
+        if self.is_dm_mode() {
+            self.dm_view.snap_to_bottom();
+        } else {
+            self.channel_view.snap_to_bottom();
+        }
     }
 
     /// Initialize: fetch channels, nodes, join first channel if exists.
@@ -236,7 +294,7 @@ impl App {
                     self.needs_redraw = true;
                 }
                 Some(err_msg) = self.error_rx.recv() => {
-                    self.messages.push_system(&err_msg);
+                    self.channel_view.push_system(&err_msg);
                     self.needs_redraw = true;
                 }
                 _ = redraw_interval.tick() => {
@@ -251,10 +309,10 @@ impl App {
 
     fn render(&mut self, frame: &mut Frame) {
         // Advance blink tick for streaming cursor
-        self.messages.tick_blink();
+        self.dm_view.tick_blink();
 
         let area = frame.area();
-        let in_split = self.split_view && self.active_dm.is_some();
+        let in_split = self.split_view && self.is_dm_mode();
         let input_inner_w = AppLayout::input_inner_width(area, self.sidebar_visible, in_split);
         let input_lines = self.input.visual_line_count(input_inner_w) + 2;
         let layout = AppLayout::build(area, input_lines, self.sidebar_visible, in_split);
@@ -265,7 +323,7 @@ impl App {
                 &self.channels,
                 self.active_channel.as_deref(),
                 &self.agents,
-                self.active_dm.as_ref().map(|dm| dm.node_name.as_str()),
+                self.dm_node_name(),
                 self.project_name.as_deref(),
                 self.global_mode,
                 layout.sidebar,
@@ -274,7 +332,11 @@ impl App {
         }
 
         // Messages (DM panel in split mode)
-        self.messages.render(layout.messages, frame.buffer_mut());
+        if self.is_dm_mode() {
+            self.dm_view.render(layout.messages, frame.buffer_mut());
+        } else {
+            self.channel_view.render(layout.messages, frame.buffer_mut());
+        }
 
         // Right panel (split view): channel or node output
         self.last_channel_panel_x = layout.channel_panel.map(|r| r.x);
@@ -288,7 +350,7 @@ impl App {
                         .find(|c| Some(&c.id) == self.active_channel.as_ref())
                         .map(|c| c.display_name())
                         .unwrap_or("channel");
-                    self.messages.render_channel_panel(
+                    self.channel_view.render_panel(
                         channel_name,
                         &mut self.channel_panel_state,
                         focused,
@@ -297,7 +359,7 @@ impl App {
                     );
                 }
                 SplitTarget::Node { node_name, .. } => {
-                    self.messages.render_text_panel(
+                    channel_view::render_text_panel(
                         &format!("@{}", node_name),
                         &self.split_node_buffer,
                         &mut self.channel_panel_state,
@@ -314,8 +376,8 @@ impl App {
         self.input.render_popup(layout.input, frame.buffer_mut());
 
         // DM status indicator on input box border
-        if let Some(ref dm) = self.active_dm {
-            let status = if dm.is_responding {
+        if self.is_dm_mode() {
+            let status = if self.dm_view.is_responding {
                 Span::styled(" 回复中... ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
             } else {
                 Span::styled(" 就绪 ", Style::default().fg(Color::Green))
@@ -334,7 +396,7 @@ impl App {
         match key.code {
             // Ctrl+C: cancel active DM response if agent is responding
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                if self.active_dm.as_ref().is_some_and(|dm| dm.is_responding) {
+                if self.is_dm_mode() && self.dm_view.is_responding {
                     self.cancel_active_dm().await;
                 }
             }
@@ -382,7 +444,7 @@ impl App {
 
             // Split view: Ctrl+S toggle, Ctrl+W switch focus
             KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                if self.active_dm.is_some() {
+                if self.is_dm_mode() {
                     let has_target = self.active_channel.is_some()
                         || matches!(self.split_target, SplitTarget::Node { .. });
                     if has_target {
@@ -394,12 +456,12 @@ impl App {
                             self.split_focus = SplitFocus::Dm;
                         }
                     } else {
-                        self.messages.push_system("需要先加入频道才能分屏");
+                        self.push_system_to_active("需要先加入频道才能分屏");
                     }
                 }
             }
             KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                if self.split_view && self.active_dm.is_some() {
+                if self.split_view && self.is_dm_mode() {
                     self.split_focus = match self.split_focus {
                         SplitFocus::Dm => SplitFocus::Channel,
                         SplitFocus::Channel => SplitFocus::Dm,
@@ -416,7 +478,7 @@ impl App {
                 } else if self.split_view && self.split_focus == SplitFocus::Channel {
                     self.channel_panel_state.scroll_up(1);
                 } else {
-                    self.messages.scroll_up(1);
+                    self.scroll_active_up(1);
                 }
             }
             KeyCode::Down if key.modifiers.is_empty() => {
@@ -425,7 +487,7 @@ impl App {
                 } else if self.split_view && self.split_focus == SplitFocus::Channel {
                     self.channel_panel_state.scroll_down(1);
                 } else {
-                    self.messages.scroll_down(1);
+                    self.scroll_active_down(1);
                 }
             }
 
@@ -434,28 +496,28 @@ impl App {
                 if self.split_view && self.split_focus == SplitFocus::Channel {
                     self.channel_panel_state.page_up();
                 } else {
-                    self.messages.page_up();
+                    self.page_active_up();
                 }
             }
             KeyCode::PageDown => {
                 if self.split_view && self.split_focus == SplitFocus::Channel {
                     self.channel_panel_state.page_down();
                 } else {
-                    self.messages.page_down();
+                    self.page_active_down();
                 }
             }
             KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 if self.split_view && self.split_focus == SplitFocus::Channel {
                     self.channel_panel_state.scroll_down(1);
                 } else {
-                    self.messages.scroll_down(1);
+                    self.scroll_active_down(1);
                 }
             }
             KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 if self.split_view && self.split_focus == SplitFocus::Channel {
                     self.channel_panel_state.scroll_down(10);
                 } else {
-                    self.messages.scroll_down(10);
+                    self.scroll_active_down(10);
                 }
             }
 
@@ -482,7 +544,7 @@ impl App {
             KeyCode::Char('g') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.global_mode = !self.global_mode;
                 let mode = if self.global_mode { "全局" } else { "项目" };
-                self.messages.push_system(&format!("切换到{}模式", mode));
+                self.push_system_to_active(&format!("切换到{}模式", mode));
                 self.refresh_agents().await;
                 self.refresh_channels().await;
                 // Validate active channel still visible
@@ -496,8 +558,8 @@ impl App {
                     }
                 }
                 // Validate active DM agent still visible
-                if let Some(ref dm) = self.active_dm {
-                    if !self.agents.iter().any(|a| a.name == dm.node_name) {
+                if let ViewMode::Dm { ref node_name, .. } = self.view_mode.clone() {
+                    if !self.agents.iter().any(|a| a.name == *node_name) {
                         self.exit_dm().await;
                     }
                 }
@@ -527,8 +589,8 @@ impl App {
                     self.input.dismiss_popup();
                 } else if self.split_view && self.split_focus == SplitFocus::Channel {
                     self.split_focus = SplitFocus::Dm;
-                } else if self.active_dm.is_some() {
-                    if self.active_dm.as_ref().is_some_and(|dm| dm.is_responding) {
+                } else if self.is_dm_mode() {
+                    if self.dm_view.is_responding {
                         self.cancel_active_dm().await;
                     } else {
                         self.exit_dm().await;
@@ -538,12 +600,12 @@ impl App {
 
             // Shift+Left/Right: cycle agent filter tabs in channel mode
             KeyCode::Left if key.modifiers.contains(KeyModifiers::SHIFT) => {
-                if !self.messages.is_dm_mode() {
+                if !self.is_dm_mode() {
                     self.cycle_agent_filter(false);
                 }
             }
             KeyCode::Right if key.modifiers.contains(KeyModifiers::SHIFT) => {
-                if !self.messages.is_dm_mode() {
+                if !self.is_dm_mode() {
                     self.cycle_agent_filter(true);
                 }
             }
@@ -569,14 +631,14 @@ impl App {
                 if self.split_view && self.is_mouse_in_channel_panel(mouse.column) {
                     self.channel_panel_state.scroll_up(3);
                 } else {
-                    self.messages.scroll_up(3);
+                    self.scroll_active_up(3);
                 }
             }
             MouseEventKind::ScrollDown => {
                 if self.split_view && self.is_mouse_in_channel_panel(mouse.column) {
                     self.channel_panel_state.scroll_down(3);
                 } else {
-                    self.messages.scroll_down(3);
+                    self.scroll_active_down(3);
                 }
             }
             _ => {}
@@ -595,7 +657,7 @@ impl App {
         if agent_names.is_empty() {
             return;
         }
-        let current_idx = self.messages.filter.as_ref()
+        let current_idx = self.channel_view.filter.as_ref()
             .and_then(|f| agent_names.iter().position(|n| n == f));
 
         let new_filter = if forward {
@@ -614,19 +676,23 @@ impl App {
 
         let label = new_filter.as_deref().unwrap_or("All");
         debug!(filter = label, "agent filter tab switched");
-        self.messages.filter = new_filter;
-        self.messages.snap_to_bottom();
+        self.channel_view.filter = new_filter;
+        self.snap_active_to_bottom();
     }
 
     fn sync_navigation_selection(&mut self) {
-        self.messages.filter = None;
+        self.channel_view.filter = None;
+        let dm_name = match &self.view_mode {
+            ViewMode::Dm { ref node_name, .. } => Some(node_name.as_str()),
+            _ => None,
+        };
         self.status_bar.sync_to_context(
             &self.channels,
             self.active_channel.as_deref(),
             &self.agents,
-            self.active_dm.as_ref().map(|dm| dm.node_name.as_str()),
+            dm_name,
         );
-        self.messages.snap_to_bottom();
+        self.snap_active_to_bottom();
     }
 
     async fn confirm_selected_navigation(&mut self) {
@@ -637,7 +703,7 @@ impl App {
             Some(NavigationTarget::Channel(idx)) => {
                 if let Some(ch) = self.channels.get(idx) {
                     let ch_id = ch.id.clone();
-                    if self.active_dm.is_some() {
+                    if self.is_dm_mode() {
                         self.exit_dm().await;
                     }
                     if self.active_channel.as_deref() != Some(&ch_id) {
@@ -664,11 +730,11 @@ impl App {
         }
 
         // DM mode: send via node.prompt
-        if let Some(ref dm) = self.active_dm.clone() {
-            if dm.is_responding {
+        if let ViewMode::Dm { ref node_id, ref node_name } = self.view_mode.clone() {
+            if self.dm_view.is_responding {
                 debug!(
                     "dm send blocked for {}: agent still responding",
-                    dm.node_name
+                    node_name
                 );
                 self.push_contextual_system("agent 正在回复，先等待完成或 Ctrl+C 取消");
                 return;
@@ -676,14 +742,14 @@ impl App {
 
             debug!(
                 "dm send to {}: {}",
-                dm.node_name,
-                &text[..text.len().min(50)]
+                node_name,
+                &text[..{let mut e = text.len().min(50); while e > 0 && !text.is_char_boundary(e) { e -= 1; } e}]
             );
 
             // Flush any remaining streaming content before adding user message,
             // so user message appears after the agent's reply, not before streaming tail.
-            let node_id_ref = dm.node_id.clone();
-            let node_name_ref = dm.node_name.clone();
+            let node_id_ref = node_id.clone();
+            let node_name_ref = node_name.clone();
             self.flush_streaming_as_dm(&node_id_ref, &node_name_ref);
 
             // Add user message locally immediately
@@ -692,13 +758,11 @@ impl App {
                 content: text.to_string(),
                 timestamp: chrono::Local::now().timestamp(),
             };
-            self.messages.push_dm(&user_msg);
-            if let Some(ref mut dm_state) = self.active_dm {
-                dm_state.messages.push(user_msg);
-            }
+            self.dm_view.push(&user_msg);
+            self.dm_view.dm_history.push(user_msg);
 
             // Send prompt in background — response comes via node.update
-            let node_id = dm.node_id.clone();
+            let node_id = node_id.clone();
             let content = text.to_string();
             let client_ws_tx = self.client.ws_tx_clone();
             let pending = self.client.pending_clone();
@@ -717,53 +781,65 @@ impl App {
         if let Some(ref ch_id) = self.active_channel.clone() {
             match self.client.channel_post(ch_id, text).await {
                 Ok(_) => {} // Message arrives via channel.message notification
-                Err(e) => self.messages.push_system(&format!("发送失败: {}", e)),
+                Err(e) => self.channel_view.push_system(&format!("发送失败: {}", e)),
             }
         } else {
-            self.messages
+            self.channel_view
                 .push_system("未加入频道，用 /join 或 /create 先创建");
         }
     }
 
     // --- DM mode ---
 
+    /// Push a system message to the currently active view (Channel or DM).
+    /// Uses view_mode to route — will replace push_contextual_system in Step 4b.
+    fn push_system_to_active(&mut self, content: &str) {
+        match &self.view_mode {
+            ViewMode::Channel { .. } => self.channel_view.push_system(content),
+            ViewMode::Dm { .. } => self.dm_view.push_system(content),
+        }
+    }
+
     fn push_contextual_system(&mut self, content: &str) {
-        if self.active_dm.is_some() {
+        if self.is_dm_mode() {
             let dm_msg = DmMessage {
                 role: "系统".to_string(),
                 content: content.to_string(),
                 timestamp: chrono::Local::now().timestamp(),
             };
-            self.messages.push_dm(&dm_msg);
-            if let Some(ref mut dm_state) = self.active_dm {
-                dm_state.messages.push(dm_msg);
-            }
+            self.dm_view.push(&dm_msg);
+            self.dm_view.dm_history.push(dm_msg);
         } else {
-            self.messages.push_system(content);
+            self.channel_view.push_system(content);
         }
     }
 
     fn reset_dm_before_enter(&mut self, next_node_id: &str) -> Option<String> {
-        let old_dm = self.active_dm.as_ref()?.clone();
-        let same_node = old_dm.node_id == next_node_id;
+        let (old_node_id, old_node_name) = match &self.view_mode {
+            ViewMode::Dm { node_id, node_name } => (node_id.clone(), node_name.clone()),
+            _ => return None,
+        };
+        let same_node = old_node_id == next_node_id;
         if same_node {
             debug!(
                 "re-entering DM with {}, resetting local DM state",
-                old_dm.node_name
+                old_node_name
             );
         } else {
-            debug!("switching DM: unsubscribe old node {}", old_dm.node_id);
+            debug!("switching DM: unsubscribe old node {}", old_node_id);
         }
 
-        self.messages.exit_dm();
-        self.active_dm = None;
-        Some(old_dm.node_id)
+        self.dm_view.clear();
+        self.view_mode = ViewMode::Channel {
+            channel_id: self.active_channel.clone().unwrap_or_default(),
+        };
+        Some(old_node_id)
     }
 
     async fn enter_dm(&mut self, agent_name: &str) {
         let agent = self.agents.iter().find(|a| a.name == agent_name);
         let Some(agent) = agent else {
-            self.messages
+            self.channel_view
                 .push_system(&format!("找不到 agent: {}", agent_name));
             return;
         };
@@ -781,23 +857,17 @@ impl App {
 
         // Subscribe to node updates
         if let Err(e) = self.client.node_subscribe(&node_id).await {
-            self.messages.push_system(&format!("subscribe 失败: {}", e));
+            self.channel_view.push_system(&format!("subscribe 失败: {}", e));
             return;
         }
 
-        self.active_dm = Some(DmState {
-            node_id,
-            node_name: node_name.clone(),
-            messages: Vec::new(),
-            streaming: None,
-            is_responding: false,
-        });
-        self.messages.enter_dm(&node_name);
+        self.dm_view = DmView::new(&node_name);
+        self.view_mode = ViewMode::Dm { node_id, node_name: node_name.clone() };
 
         // Initialize usage display from agent snapshot
         if let Some(agent) = self.agents.iter().find(|a| a.name == node_name) {
             if let Some((used, size, cost)) = agent.usage {
-                self.messages.update_usage(used, size, cost);
+                self.dm_view.update_usage(used, size, cost);
             }
         }
 
@@ -805,9 +875,9 @@ impl App {
     }
 
     async fn exit_dm(&mut self) {
-        if let Some(dm) = self.active_dm.take() {
-            debug!("exiting DM with {}", dm.node_name);
-            if let Err(e) = self.client.node_unsubscribe(&dm.node_id).await {
+        if let ViewMode::Dm { ref node_id, ref node_name } = self.view_mode.clone() {
+            debug!("exiting DM with {}", node_name);
+            if let Err(e) = self.client.node_unsubscribe(node_id).await {
                 warn!("unsubscribe failed: {}", e);
             }
             // Clean up split node subscription
@@ -816,7 +886,10 @@ impl App {
                 let _ = self.client.node_unsubscribe(&id).await;
                 self.split_target = SplitTarget::Channel;
             }
-            self.messages.exit_dm();
+            self.dm_view.clear();
+            self.view_mode = ViewMode::Channel {
+                channel_id: self.active_channel.clone().unwrap_or_default(),
+            };
             self.split_view = false;
             self.split_focus = SplitFocus::Dm;
             self.sync_navigation_selection();
@@ -824,12 +897,9 @@ impl App {
     }
 
     async fn cancel_active_dm(&mut self) {
-        let Some((node_id, node_name)) = self
-            .active_dm
-            .as_ref()
-            .map(|dm| (dm.node_id.clone(), dm.node_name.clone()))
-        else {
-            return;
+        let (node_id, node_name) = match &self.view_mode {
+            ViewMode::Dm { node_id, node_name } => (node_id.clone(), node_name.clone()),
+            _ => return,
         };
 
         debug!("cancelling active DM with {}", node_name);
@@ -839,9 +909,7 @@ impl App {
         }
 
         self.flush_streaming_as_dm(&node_id, &node_name);
-        if let Some(ref mut dm_state) = self.active_dm {
-            dm_state.is_responding = false;
-        }
+        self.dm_view.is_responding = false;
         self.push_contextual_system(&format!("已中断 {}", node_name));
     }
 
@@ -854,7 +922,7 @@ impl App {
                 if let Some(name) = parts.get(1) {
                     self.enter_dm(name).await;
                 } else {
-                    self.messages.push_system("用法: /dm <agent_name>");
+                    self.push_system_to_active("用法: /dm <agent_name>");
                 }
             }
 
@@ -863,15 +931,11 @@ impl App {
             }
 
             "/clear" => {
-                if let Some(ref dm) = self.active_dm {
-                    let node_name = dm.node_name.clone();
+                if let ViewMode::Dm { ref node_name, .. } = self.view_mode.clone() {
                     match self.client.session_clear(&node_name).await {
                         Ok(_) => {
-                            self.messages.clear_dm();
-                            if let Some(ref mut dm_state) = self.active_dm {
-                                dm_state.messages.clear();
-                                dm_state.is_responding = false;
-                            }
+                            self.dm_view.clear();
+                            self.dm_view.is_responding = false;
                             self.push_contextual_system(&format!(
                                 "/clear — {} session 已清除",
                                 node_name
@@ -887,8 +951,8 @@ impl App {
             }
 
             "/compact" => {
-                if let Some(ref dm) = self.active_dm {
-                    let node_name = dm.node_name.clone();
+                if let ViewMode::Dm { ref node_name, .. } = self.view_mode.clone() {
+                    let node_name = node_name.clone();
                     self.push_contextual_system(&format!(
                         "/compact — 正在压缩 {} 上下文...",
                         node_name
@@ -917,12 +981,12 @@ impl App {
                     .await
                 {
                     Ok(ch) => {
-                        self.messages.push_system(&format!("频道已创建: {}", ch.id));
+                        self.channel_view.push_system(&format!("频道已创建: {}", ch.id));
                         let ch_id = ch.id.clone();
                         self.refresh_channels().await;
                         self.join_channel(&ch_id).await;
                     }
-                    Err(e) => self.messages.push_system(&format!("创建失败: {}", e)),
+                    Err(e) => self.channel_view.push_system(&format!("创建失败: {}", e)),
                 }
             }
 
@@ -935,14 +999,14 @@ impl App {
                         let ch_id = ch.id.clone();
                         self.join_channel(&ch_id).await;
                     } else {
-                        self.messages.push_system("没有可用频道，用 /create 创建");
+                        self.channel_view.push_system("没有可用频道，用 /create 创建");
                     }
                 }
             }
 
             "/add" => {
                 if parts.len() < 2 {
-                    self.messages.push_system("用法: /add <adapter> [name]");
+                    self.channel_view.push_system("用法: /add <adapter> [name]");
                     return;
                 }
                 let adapter = parts[1];
@@ -953,7 +1017,7 @@ impl App {
                     .await
                 {
                     Ok(node) => {
-                        self.messages
+                        self.channel_view
                             .push_system(&format!("已启动: {} ({})", node.name, node.node_id));
                         if let Some(ref ch_id) = self.active_channel.clone() {
                             if let Err(e) = self
@@ -961,12 +1025,12 @@ impl App {
                                 .channel_add_node(ch_id, &node.node_id, Some(&node.name))
                                 .await
                             {
-                                self.messages.push_system(&format!("加入频道失败: {}", e));
+                                self.channel_view.push_system(&format!("加入频道失败: {}", e));
                             }
                         }
                         self.refresh_agents().await;
                     }
-                    Err(e) => self.messages.push_system(&format!("启动失败: {}", e)),
+                    Err(e) => self.channel_view.push_system(&format!("启动失败: {}", e)),
                 }
             }
 
@@ -980,14 +1044,14 @@ impl App {
                         let nid = agent.node_id.clone();
                         match self.client.node_stop(&nid).await {
                             Ok(_) => {
-                                self.messages
+                                self.channel_view
                                     .push_system(&format!("已停止: {}", name_or_id));
                                 self.refresh_agents().await;
                             }
-                            Err(e) => self.messages.push_system(&format!("停止失败: {}", e)),
+                            Err(e) => self.channel_view.push_system(&format!("停止失败: {}", e)),
                         }
                     } else {
-                        self.messages
+                        self.channel_view
                             .push_system(&format!("找不到: {}", name_or_id));
                     }
                 }
@@ -1003,9 +1067,9 @@ impl App {
                         let nid = agent.node_id.clone();
                         match self.client.node_cancel(&nid).await {
                             Ok(_) => self
-                                .messages
+                                .channel_view
                                 .push_system(&format!("已取消: {}", name_or_id)),
-                            Err(e) => self.messages.push_system(&format!("取消失败: {}", e)),
+                            Err(e) => self.channel_view.push_system(&format!("取消失败: {}", e)),
                         }
                     }
                 }
@@ -1014,10 +1078,10 @@ impl App {
             "/list" => {
                 self.refresh_agents().await;
                 if self.agents.is_empty() {
-                    self.messages.push_system("没有 agent");
+                    self.channel_view.push_system("没有 agent");
                 } else {
                     for a in &self.agents {
-                        self.messages.push_system(&format!(
+                        self.channel_view.push_system(&format!(
                             "  {} [{}] {}",
                             a.name,
                             a.status,
@@ -1030,7 +1094,7 @@ impl App {
             "/channels" => {
                 self.refresh_channels().await;
                 if self.channels.is_empty() {
-                    self.messages.push_system("没有频道");
+                    self.channel_view.push_system("没有频道");
                 } else {
                     for ch in &self.channels {
                         let active = if self.active_channel.as_deref() == Some(&ch.id) {
@@ -1038,7 +1102,7 @@ impl App {
                         } else {
                             ""
                         };
-                        self.messages.push_system(&format!(
+                        self.channel_view.push_system(&format!(
                             "  {} ({} 节点){}",
                             ch.display_name(),
                             ch.node_count,
@@ -1068,16 +1132,16 @@ impl App {
                             Ok(ch) => {
                                 let restored_id = ch.id.clone();
                                 let name = ch.name.as_deref().unwrap_or(&restored_id);
-                                self.messages
+                                self.channel_view
                                     .push_system(&format!("频道已恢复: {}", name));
                                 self.archived_channels.clear();
                                 self.refresh_channels().await;
                                 self.join_channel(&restored_id).await;
                             }
-                            Err(e) => self.messages.push_system(&format!("恢复失败: {}", e)),
+                            Err(e) => self.channel_view.push_system(&format!("恢复失败: {}", e)),
                         }
                     } else {
-                        self.messages.push_system("无效序号，先用 /restore 查看列表");
+                        self.channel_view.push_system("无效序号，先用 /restore 查看列表");
                     }
                 } else {
                     // /restore with no args: list archived channels
@@ -1085,9 +1149,9 @@ impl App {
                         Ok(channels) => {
                             if channels.is_empty() {
                                 self.archived_channels.clear();
-                                self.messages.push_system("没有归档频道");
+                                self.channel_view.push_system("没有归档频道");
                             } else {
-                                self.messages.push_system("归档频道:");
+                                self.channel_view.push_system("归档频道:");
                                 for (i, ch) in channels.iter().enumerate() {
                                     let id = ch
                                         .get("id")
@@ -1120,21 +1184,21 @@ impl App {
                                     } else {
                                         String::new()
                                     };
-                                    self.messages.push_system(&format!(
+                                    self.channel_view.push_system(&format!(
                                         "  {}. {}{}",
                                         i + 1,
                                         display,
                                         agents_str
                                     ));
                                 }
-                                self.messages
+                                self.channel_view
                                     .push_system("用 /restore <序号> 恢复频道");
                                 self.archived_channels = channels;
                             }
                         }
                         Err(e) => {
                             self.archived_channels.clear();
-                            self.messages
+                            self.channel_view
                                 .push_system(&format!("获取归档列表失败: {}", e));
                         }
                     }
@@ -1142,46 +1206,46 @@ impl App {
             }
 
             "/help" => {
-                self.messages.push_system("命令:");
-                self.messages
+                self.channel_view.push_system("命令:");
+                self.channel_view
                     .push_system("  /create [name]        创建频道");
-                self.messages
+                self.channel_view
                     .push_system("  /join [id]            加入频道");
-                self.messages
+                self.channel_view
                     .push_system("  /channels             列出频道");
-                self.messages
+                self.channel_view
                     .push_system("  /add <adapter> [name] 启动 agent");
-                self.messages
+                self.channel_view
                     .push_system("  /stop <name>          停止 agent");
-                self.messages
+                self.channel_view
                     .push_system("  /cancel <name>        取消 agent 任务");
-                self.messages
+                self.channel_view
                     .push_system("  /list                 列出 agents");
-                self.messages
+                self.channel_view
                     .push_system("  /restore [n]          恢复归档频道");
-                self.messages
+                self.channel_view
                     .push_system("  /clear                清除 DM session");
-                self.messages
+                self.channel_view
                     .push_system("  /compact              压缩 DM 上下文");
-                self.messages
+                self.channel_view
                     .push_system("  /split [@agent]       分屏(频道或agent输出)");
-                self.messages
+                self.channel_view
                     .push_system("  /dm <name>            与 agent 1v1 对话");
-                self.messages
+                self.channel_view
                     .push_system("  /back                 退出 DM 回频道");
-                self.messages.push_system("  /help                 帮助");
-                self.messages.push_system("快捷键:");
-                self.messages.push_system("  Enter       发送消息 / 确认选择");
-                self.messages.push_system("  Tab         补全 / 确认选择");
-                self.messages.push_system("  Ctrl+O      输入框换行");
-                self.messages.push_system("  Ctrl+C      中断当前 DM 回复");
-                self.messages.push_system("  Esc         DM回复中=取消，否则退出DM");
-                self.messages.push_system("  Ctrl+N/P    侧边栏导航 下/上");
-                self.messages.push_system("  Ctrl+J/K    滚动消息 下/上（1行）");
-                self.messages.push_system("  Ctrl+D/U    滚动消息 下/上（10行）");
-                self.messages.push_system("  PgDn/PgUp   翻页（20行）");
-                self.messages.push_system("  Ctrl+G      切换全局/项目模式");
-                self.messages.push_system("  Ctrl+Q      退出");
+                self.channel_view.push_system("  /help                 帮助");
+                self.channel_view.push_system("快捷键:");
+                self.channel_view.push_system("  Enter       发送消息 / 确认选择");
+                self.channel_view.push_system("  Tab         补全 / 确认选择");
+                self.channel_view.push_system("  Ctrl+O      输入框换行");
+                self.channel_view.push_system("  Ctrl+C      中断当前 DM 回复");
+                self.channel_view.push_system("  Esc         DM回复中=取消，否则退出DM");
+                self.channel_view.push_system("  Ctrl+N/P    侧边栏导航 下/上");
+                self.channel_view.push_system("  Ctrl+J/K    滚动消息 下/上（1行）");
+                self.channel_view.push_system("  Ctrl+D/U    滚动消息 下/上（10行）");
+                self.channel_view.push_system("  PgDn/PgUp   翻页（20行）");
+                self.channel_view.push_system("  Ctrl+G      切换全局/项目模式");
+                self.channel_view.push_system("  Ctrl+Q      退出");
             }
 
             "/split" => {
@@ -1211,7 +1275,7 @@ impl App {
                     } else {
                         self.push_contextual_system(&format!("找不到 agent: {}", agent_name));
                     }
-                } else if self.active_dm.is_some() {
+                } else if self.is_dm_mode() {
                     if self.split_view && arg.is_empty() {
                         // Toggle off
                         // Unsubscribe from split node if any
@@ -1249,7 +1313,7 @@ impl App {
             }
 
             _ => {
-                self.messages.push_system(&format!("未知命令: {}", cmd));
+                self.channel_view.push_system(&format!("未知命令: {}", cmd));
             }
         }
     }
@@ -1271,13 +1335,13 @@ impl App {
                     let is_active = self.active_channel.as_deref() == Some(&channel_id);
                     if is_active {
                         let is_agent = self.agents.iter().any(|a| a.name == message.from);
-                        self.messages.push(&message, is_agent);
+                        self.channel_view.push(&message, is_agent);
                     } else {
                         // Cache message for non-active channel + bump unread
-                        self.messages.push_to_channel(&channel_id, &message);
+                        self.channel_view.push_to_channel(&channel_id, &message);
                         // Update sidebar unread badge
                         if let Some(ch) = self.channels.iter_mut().find(|c| c.id == channel_id) {
-                            ch.unread = self.messages.unread_count(&channel_id);
+                            ch.unread = self.channel_view.unread_count(&channel_id);
                         }
                     }
                 }
@@ -1289,13 +1353,13 @@ impl App {
                 let is_active = self.active_channel.as_deref() == Some(&channel_id);
                 if !is_active {
                     let is_agent = self.agents.iter().any(|a| a.name == message.from);
-                    self.messages.push(&message, is_agent);
+                    self.channel_view.push(&message, is_agent);
                 }
             }
 
             NerveEvent::NodeJoined { node_name, .. } => {
-                if self.active_dm.is_none() {
-                    self.messages
+                if !self.is_dm_mode() {
+                    self.channel_view
                         .push_system(&format!("{} 加入频道", node_name));
                 }
                 self.refresh_agents().await;
@@ -1303,8 +1367,8 @@ impl App {
             }
 
             NerveEvent::NodeLeft { node_name, .. } => {
-                if self.active_dm.is_none() {
-                    self.messages
+                if !self.is_dm_mode() {
+                    self.channel_view
                         .push_system(&format!("{} 离开频道", node_name));
                 }
                 self.refresh_agents().await;
@@ -1342,10 +1406,8 @@ impl App {
                 // When agent goes idle, flush any pending streaming buffer as DM message
                 if status == "idle" {
                     self.flush_streaming_as_dm(&node_id, &name);
-                } else if let Some(ref mut dm_state) = self.active_dm {
-                    if dm_state.node_id == node_id && status == "busy" {
-                        dm_state.is_responding = true;
-                    }
+                } else if self.dm_node_id() == Some(node_id.as_str()) && status == "busy" {
+                    self.dm_view.is_responding = true;
                 }
             }
 
@@ -1356,7 +1418,7 @@ impl App {
                 self.refresh_channels().await;
                 if self.channels.iter().any(|c| c.id == channel_id) {
                     let label = name.as_deref().unwrap_or("unnamed");
-                    self.messages
+                    self.channel_view
                         .push_system(&format!("频道 {} 已创建", label));
                 }
             }
@@ -1373,7 +1435,7 @@ impl App {
 
                 if was_visible {
                     let label = name.as_deref().unwrap_or("unnamed");
-                    self.messages
+                    self.channel_view
                         .push_system(&format!("频道 {} 已关闭", label));
                 }
 
@@ -1394,10 +1456,10 @@ impl App {
             } => {
                 info!("NodeRegistered: name={}", name);
                 // Show in both channel and DM views
-                self.messages
+                self.channel_view
                     .push_system(&format!("{} 已注册", name));
-                if self.active_dm.is_some() {
-                    self.messages.push_dm_system(&format!("{} 已注册", name));
+                if self.is_dm_mode() {
+                    self.dm_view.push_system(&format!("{} 已注册", name));
                 }
                 self.refresh_agents().await;
                 info!(
@@ -1410,17 +1472,15 @@ impl App {
             NerveEvent::NodeStopped { node_id, name } => {
                 // If we're in a DM with this node, flush streaming and exit DM
                 self.flush_streaming_as_dm(&node_id, &name);
-                if self
-                    .active_dm
-                    .as_ref()
-                    .map_or(false, |dm| dm.node_id == node_id)
-                {
-                    self.active_dm = None;
-                    self.messages.exit_dm();
-                    self.messages
+                if self.dm_node_id() == Some(node_id.as_str()) {
+                    self.dm_view.clear();
+                    self.view_mode = ViewMode::Channel {
+                        channel_id: self.active_channel.clone().unwrap_or_default(),
+                    };
+                    self.channel_view
                         .push_system(&format!("{} 已停止", name));
                 } else if self.agents.iter().any(|a| a.node_id == node_id) {
-                    self.messages
+                    self.channel_view
                         .push_system(&format!("{} 已停止", name));
                 }
                 // Clean up split panel if targeting the stopped node
@@ -1437,60 +1497,44 @@ impl App {
             }
 
             NerveEvent::Disconnected => {
-                self.messages.push_system("⚠ 与 nerve 断开连接");
+                self.channel_view.push_system("⚠ 与 nerve 断开连接");
             }
         }
     }
 
     /// Flush streaming buffer as a DM message when agent goes idle (no explicit end event).
     fn flush_streaming_as_dm(&mut self, node_id: &str, name: &str) {
-        let in_dm = self
-            .active_dm
-            .as_ref()
-            .map_or(false, |dm| dm.node_id == node_id);
+        let in_dm = self.dm_node_id() == Some(node_id);
         if !in_dm {
             return;
         }
 
-        // Extract content and clear streaming BEFORE pushing to dm_lines
-        // to prevent any render frame from seeing both.
-        let content = self.messages.streaming.iter()
-            .find(|(n, _)| n == name)
-            .map(|(_, c)| c.clone())
-            .unwrap_or_default();
-        self.messages.streaming.retain(|(n, _)| n != name);
-        self.messages.take_streaming_message(name);
-
-        if !content.is_empty() {
-            debug!(
-                "flush_streaming_as_dm: {} went idle, persisting {} chars",
-                name,
-                content.len()
-            );
-            let dm_msg = DmMessage {
-                role: "assistant".to_string(),
-                content,
-                timestamp: chrono::Local::now().timestamp(),
-            };
-            self.messages.push_dm(&dm_msg);
-            if let Some(ref mut dm_state) = self.active_dm {
-                dm_state.messages.push(dm_msg);
+        // Take structured message from streaming pipeline
+        if let Some(msg) = self.dm_view.take_streaming_message(name) {
+            if !msg.blocks.is_empty() {
+                let content = crate::components::dm_view::blocks_to_text(&msg.blocks);
+                debug!(
+                    "flush_streaming_as_dm: {} persisting {} blocks, {} chars",
+                    name, msg.blocks.len(), content.len()
+                );
+                let dm_msg = DmMessage {
+                    role: "assistant".to_string(),
+                    content,
+                    timestamp: chrono::Local::now().timestamp(),
+                };
+                self.dm_view.push_with_blocks(&dm_msg, msg.blocks);
+                self.dm_view.dm_history.push(dm_msg);
             }
         }
-        self.flushed_agents.insert(name.to_string());
-        if let Some(ref mut dm_state) = self.active_dm {
-            if dm_state.node_id == node_id {
-                dm_state.is_responding = false;
-            }
+        self.dm_view.flushed_agents.insert(name.to_string());
+        if self.dm_node_id() == Some(node_id) {
+            self.dm_view.is_responding = false;
         }
     }
 
     fn handle_node_update(&mut self, node_id: &str, name: &str, detail: &serde_json::Value) {
-        let is_dm_active = self.active_dm.is_some();
-        let in_dm = self
-            .active_dm
-            .as_ref()
-            .map_or(false, |dm| dm.node_id == node_id);
+        let is_dm_active = self.is_dm_mode();
+        let in_dm = self.dm_node_id() == Some(node_id);
 
         // Route updates to split node buffer if target matches
         let is_split_node = matches!(&self.split_target, SplitTarget::Node { node_id: sid, .. } if sid == node_id);
@@ -1507,12 +1551,21 @@ impl App {
             }
         }
 
-        // In DM mode, ignore streaming from non-active nodes
-        if is_dm_active && !in_dm {
-            debug!(
-                "node.update from {} ignored (DM active for different node)",
-                name
-            );
+        // Channel view: node.update should not render into message area.
+        // Channel messages arrive via channel.message events only.
+        // In DM mode: only process updates from the active DM node.
+        if !in_dm {
+            if is_dm_active {
+                debug!(
+                    "node.update from {} ignored (DM active for different node)",
+                    name
+                );
+            } else {
+                debug!(
+                    "node.update from {} ignored (channel view, not in DM)",
+                    name
+                );
+            }
             return;
         }
 
@@ -1528,172 +1581,67 @@ impl App {
 
             match kind {
                 Some("agent_message_chunk") => {
-                    // New pipeline: structured ContentBlock
-                    self.messages.apply_streaming_event(name, "agent_message_chunk", update);
-
-                    let text = update
-                        .get("content")
-                        .and_then(|c| c.get("text"))
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("");
-                    if text.is_empty() {
-                        debug!(
-                            "agent_message_chunk from {} has empty text, raw: {:?}",
-                            name, update
-                        );
-                    }
-                    let buf_len_before = self.messages.streaming
-                        .iter()
-                        .find(|(n, _)| n == name)
-                        .map(|(_, c)| c.len())
-                        .unwrap_or(0);
-                    let chunk_preview: String = text.chars().take(20).collect();
-                    info!(
-                        "CHUNK from={} len={} preview={:?} buf_before={}",
-                        name, text.len(), chunk_preview, buf_len_before
-                    );
-                    if let Some(entry) = self.messages.streaming.iter_mut().find(|(n, _)| n == name)
-                    {
-                        // Dedup: skip if buffer already ends with this exact chunk
-                        if !text.is_empty() && !entry.1.ends_with(text) {
-                            entry.1.push_str(text);
-                        } else if text.is_empty() {
-                            // empty chunk, skip
-                        } else {
-                            debug!("DEDUP: skipping duplicate chunk from {}: {:?}", name, &text[..text.len().min(20)]);
-                        }
-                    } else {
-                        self.messages
-                            .streaming
-                            .push((name.to_string(), text.to_string()));
-                    }
-                    // Note: do NOT set is_responding here — chunks arrive during
-                    // replay too (historical data). Only NodeStatusChanged("busy")
-                    // should set is_responding = true.
+                    self.dm_view.apply_streaming_event(name, "agent_message_chunk", update);
                 }
                 Some("agent_message_start") => {
-                    // New pipeline: start structured message
-                    self.messages.start_streaming_message(name);
-
-                    let old_buf_len = self.messages.streaming
-                        .iter()
-                        .find(|(n, _)| n == name)
-                        .map(|(_, c)| c.len());
-                    info!(
-                        "MSG_START from={} old_buf={:?}",
-                        name, old_buf_len
-                    );
-                    debug!(
-                        "agent_message_start from {}, clearing streaming buffer",
-                        name
-                    );
-                    self.messages.streaming.retain(|(n, _)| n != name);
-                    self.messages
-                        .streaming
-                        .push((name.to_string(), String::new()));
-                    self.flushed_agents.remove(name);
+                    debug!("agent_message_start from {}", name);
+                    self.dm_view.start_streaming_message(name);
+                    self.dm_view.flushed_agents.remove(name);
                 }
                 Some("agent_message_end") => {
-                    // New pipeline: finalize structured message
-                    self.messages.apply_streaming_event(name, "agent_message_end", update);
-                    self.messages.take_streaming_message(name);
+                    self.dm_view.apply_streaming_event(name, "agent_message_end", update);
+                    let msg = self.dm_view.take_streaming_message(name);
+                    let already_flushed = self.dm_view.flushed_agents.remove(name);
 
-                    // If idle already flushed this agent's streaming buffer, skip to
-                    // avoid persisting the same message twice.
-                    let already_flushed = self.flushed_agents.remove(name);
-
-                    // Extract and clear streaming content BEFORE pushing to dm_lines
-                    // to prevent duplicate rendering.
-                    let streaming_content = self
-                        .messages
-                        .streaming
-                        .iter()
-                        .find(|(n, _)| n == name)
-                        .map(|(_, c)| c.clone())
-                        .unwrap_or_default();
-                    self.messages.streaming.retain(|(n, _)| n != name);
-
-                    // Some agents include full content in the end event
+                    // Fallback: some agents include full content in the end event
+                    // (e.g. during replay when no chunks were sent)
                     let end_content = update
                         .get("content")
                         .and_then(|c| c.get("text"))
                         .and_then(|v| v.as_str())
                         .unwrap_or("");
 
-                    let streaming_len = streaming_content.len();
-                    let end_len = end_content.len();
-
-                    let final_content = if !streaming_content.is_empty() {
-                        streaming_content
+                    let (final_content, final_blocks) = if let Some(m) = msg {
+                        if !m.blocks.is_empty() {
+                            let text = crate::components::dm_view::blocks_to_text(&m.blocks);
+                            (text, m.blocks)
+                        } else if !already_flushed && !end_content.is_empty() {
+                            let blocks = Message::content_to_blocks(end_content);
+                            (end_content.to_string(), blocks)
+                        } else {
+                            (String::new(), Vec::new())
+                        }
                     } else if !already_flushed && !end_content.is_empty() {
-                        end_content.to_string()
+                        // No streaming_message at all (edge case: replay)
+                        let blocks = Message::content_to_blocks(end_content);
+                        (end_content.to_string(), blocks)
                     } else {
-                        String::new()
+                        (String::new(), Vec::new())
                     };
 
                     debug!(
-                        "agent_message_end from {}: in_dm={} streaming_buf={} end_content={} final={} already_flushed={}",
-                        name, in_dm, streaming_len, end_len, final_content.len(), already_flushed
+                        "agent_message_end from {}: in_dm={} final={} already_flushed={}",
+                        name, in_dm, final_content.len(), already_flushed
                     );
 
                     if in_dm && !final_content.is_empty() {
-                        debug!(
-                            "persisting DM message from {}: {} chars",
-                            name,
-                            final_content.len()
-                        );
                         let dm_msg = DmMessage {
                             role: "assistant".to_string(),
                             content: final_content,
                             timestamp: chrono::Local::now().timestamp(),
                         };
-                        self.messages.push_dm(&dm_msg);
-                        if let Some(ref mut dm_state) = self.active_dm {
-                            dm_state.messages.push(dm_msg);
-                        }
-                    } else if in_dm {
-                        debug!("agent_message_end from {} but no content to persist (already_flushed={})", name, already_flushed);
+                        self.dm_view.push_with_blocks(&dm_msg, final_blocks);
+                        self.dm_view.dm_history.push(dm_msg);
                     }
-                    if let Some(ref mut dm_state) = self.active_dm {
-                        if dm_state.node_id == node_id {
-                            dm_state.is_responding = false;
-                        }
+                    if self.dm_node_id() == Some(node_id) {
+                        self.dm_view.is_responding = false;
                     }
                 }
                 Some("agent_thought_chunk") => {
-                    // New pipeline: structured thinking block
-                    self.messages.apply_streaming_event(name, "agent_thought_chunk", update);
-
-                    let text = update
-                        .get("content")
-                        .and_then(|c| c.get("text"))
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("");
-                    if !text.is_empty() {
-                        // Old pipeline: append [thinking] marker to streaming buffer
-                        if let Some(entry) = self.messages.streaming.iter_mut().find(|(n, _)| n == name) {
-                            // Only add [thinking] prefix once at the start of a thinking block
-                            if !entry.1.ends_with("[thinking] ") && !entry.1.ends_with(text) {
-                                if entry.1.is_empty() || entry.1.ends_with('\n') {
-                                    entry.1.push_str("[thinking] ");
-                                }
-                                entry.1.push_str(text);
-                            }
-                        } else {
-                            self.messages.streaming.push((name.to_string(), format!("[thinking] {}", text)));
-                        }
-                    }
+                    self.dm_view.apply_streaming_event(name, "agent_thought_chunk", update);
                 }
                 Some("agent_thought_end") => {
-                    // New pipeline: mark thinking block finished
-                    self.messages.apply_streaming_event(name, "agent_thought_end", update);
-
-                    // Old pipeline: add newline after thinking block
-                    if let Some(entry) = self.messages.streaming.iter_mut().find(|(n, _)| n == name) {
-                        if !entry.1.is_empty() && !entry.1.ends_with('\n') {
-                            entry.1.push('\n');
-                        }
-                    }
+                    self.dm_view.apply_streaming_event(name, "agent_thought_end", update);
                 }
                 Some("user_message") => {
                     // Replay of user's prompt (from subscribe buffer)
@@ -1714,118 +1662,43 @@ impl App {
                                 content: text.to_string(),
                                 timestamp: chrono::Local::now().timestamp(),
                             };
-                            self.messages.push_dm(&dm_msg);
-                            if let Some(ref mut dm_state) = self.active_dm {
-                                dm_state.messages.push(dm_msg);
-                            }
+                            self.dm_view.push(&dm_msg);
+                            self.dm_view.dm_history.push(dm_msg);
                         }
                     }
                 }
                 Some("tool_call") => {
-                    // New pipeline: structured tool_call block
-                    self.messages.apply_streaming_event(name, "tool_call", update);
+                    self.dm_view.apply_streaming_event(name, "tool_call", update);
 
-                    // Update sidebar tool call display
-                    // Support both nested (toolCall: {...}) and flat ACP format (toolCallId, _meta, title, ...)
+                    // Update sidebar: extract tool name for display
                     let tc = update.get("toolCall").or_else(|| update.get("tool_call"));
-                    let (tool_name, desc, raw_input) = if let Some(tc) = tc {
-                        // Legacy nested
-                        let tn = tc.get("name").and_then(|v| v.as_str()).unwrap_or("unknown");
-                        let d = tc.get("description").and_then(|v| v.as_str()).unwrap_or("");
-                        let ri = tc.get("input").cloned();
-                        (tn.to_string(), d.to_string(), ri)
+                    let tool_name = if let Some(tc) = tc {
+                        tc.get("name").and_then(|v| v.as_str()).unwrap_or("unknown")
                     } else {
-                        // Flat ACP format
-                        let tn = update.pointer("/_meta/claudeCode/toolName")
+                        update.pointer("/_meta/claudeCode/toolName")
                             .and_then(|v| v.as_str())
-                            .unwrap_or_else(|| update.get("title").and_then(|v| v.as_str()).unwrap_or("unknown"));
-                        let d = update.get("title").and_then(|v| v.as_str()).unwrap_or("");
-                        let ri = update.get("rawInput").cloned();
-                        (tn.to_string(), d.to_string(), ri)
+                            .unwrap_or_else(|| update.get("title").and_then(|v| v.as_str()).unwrap_or("unknown"))
                     };
-                    let mut formatted = format!("\n[tool:{}]", tool_name);
-                    if !desc.is_empty() {
-                        formatted.push(' ');
-                        formatted.push_str(&desc);
-                    }
-                    if let Some(input) = raw_input.as_ref().and_then(|v| v.as_object()) {
-                        for (key, val) in input {
-                            let val_str = match val.as_str() {
-                                Some(s) if s.len() > 120 => format!("{}…", &s[..120]),
-                                Some(s) => s.to_string(),
-                                None => {
-                                    let j = serde_json::to_string(val).unwrap_or_default();
-                                    if j.len() > 120 { format!("{}…", &j[..120]) } else { j }
-                                }
-                            };
-                            formatted.push_str(&format!("\n  {}: {}", key, val_str));
-                        }
-                    }
-                    if let Some(entry) = self.messages.streaming.iter_mut().find(|(n, _)| n == name) {
-                        entry.1.push_str(&formatted);
-                    } else {
-                        self.messages.streaming.push((name.to_string(), formatted));
-                    }
-
-                    // Update sidebar: show current tool call name + start timer
                     if let Some(agent) = self.agents.iter_mut().find(|a| a.name == name) {
-                        agent.tool_call_name = Some(tool_name.clone());
+                        agent.tool_call_name = Some(tool_name.to_string());
                         agent.tool_call_started = Some(std::time::Instant::now());
                         debug!(agent = name, tool = %tool_name, "sidebar: tool_call started");
                     }
                 }
                 Some("tool_call_update") => {
-                    // New pipeline: structured tool_call_update
-                    self.messages.apply_streaming_event(name, "tool_call_update", update);
+                    self.dm_view.apply_streaming_event(name, "tool_call_update", update);
 
-                    // Support both nested and flat ACP format
+                    // Update sidebar: clear tool call display on completion/failure
                     let tcu = update.get("toolCallUpdate").or_else(|| update.get("tool_call_update"));
-                    let (status, result_text) = if let Some(tcu) = tcu {
-                        let s = tcu.get("status").and_then(|v| v.as_str()).unwrap_or("");
-                        let rt = tcu.get("result")
-                            .or_else(|| tcu.get("output"))
-                            .and_then(|v| v.get("value").or(Some(v)));
-                        let text = match rt {
-                            Some(v) if v.is_string() => v.as_str().unwrap_or("").to_string(),
-                            Some(v) => serde_json::to_string_pretty(v).unwrap_or_default(),
-                            None => String::new(),
-                        };
-                        (s.to_string(), text)
+                    let status = if let Some(tcu) = tcu {
+                        tcu.get("status").and_then(|v| v.as_str()).unwrap_or("")
                     } else {
-                        // Flat ACP format
-                        let s = update.get("status").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                        let text = update.get("content")
-                            .and_then(|v| {
-                                if v.is_string() { v.as_str().map(|s| s.to_string()) }
-                                else if let Some(arr) = v.as_array() {
-                                    let texts: Vec<String> = arr.iter().filter_map(|item| {
-                                        item.get("content").and_then(|c| c.get("text")).and_then(|t| t.as_str()).map(|s| s.to_string())
-                                    }).collect();
-                                    if texts.is_empty() { None } else { Some(texts.join("\n")) }
-                                } else { None }
-                            })
-                            .unwrap_or_default();
-                        (s, text)
+                        update.get("status").and_then(|v| v.as_str()).unwrap_or("")
                     };
                     if status == "completed" || status == "failed" {
-                        // Clear sidebar tool call display
                         if let Some(agent) = self.agents.iter_mut().find(|a| a.name == name) {
                             agent.tool_call_name = None;
                             agent.tool_call_started = None;
-                        }
-                        let marker = if status == "completed" { "✓" } else { "✗" };
-                        let mut formatted = format!("\n[tool_result:{}]", marker);
-                        let lines: Vec<&str> = result_text.lines().collect();
-                        for (i, line) in lines.iter().enumerate() {
-                            if i >= 3 {
-                                formatted.push_str(&format!("\n  … {} 行已省略", lines.len() - 3));
-                                break;
-                            }
-                            let display = if line.len() > 150 { &line[..150] } else { line };
-                            formatted.push_str(&format!("\n  {}", display));
-                        }
-                        if let Some(entry) = self.messages.streaming.iter_mut().find(|(n, _)| n == name) {
-                            entry.1.push_str(&formatted);
                         }
                     }
                 }
@@ -1845,7 +1718,7 @@ impl App {
                         agent.usage = Some((used, size, cost));
                     }
                     if in_dm {
-                        self.messages.update_usage(used, size, cost);
+                        self.dm_view.update_usage(used, size, cost);
                     }
                 }
                 _ => {
@@ -1861,33 +1734,43 @@ impl App {
     }
 
     async fn join_channel(&mut self, channel_id: &str) {
+        // Ensure DM is fully closed before entering channel view.
+        // This guarantees node subscriptions are cleaned up — channel view
+        // should only receive channel.message events, never node.update.
+        if self.is_dm_mode() {
+            self.exit_dm().await;
+        }
+
         // Save current channel messages to cache before switching
         if let Some(ref old_id) = self.active_channel.clone() {
             if old_id != channel_id {
-                self.messages.save_channel(old_id);
+                self.channel_view.save_channel(old_id);
             }
         }
 
         match self.client.channel_join(channel_id).await {
             Ok(_) => {
                 self.active_channel = Some(channel_id.to_string());
+                if !self.is_dm_mode() {
+                    self.view_mode = ViewMode::Channel { channel_id: channel_id.to_string() };
+                }
                 self.sync_navigation_selection();
 
                 // Try to load from cache first
-                if self.messages.load_channel(channel_id) {
-                    self.messages
+                if self.channel_view.load_channel(channel_id) {
+                    self.channel_view
                         .push_system(&format!("已切换频道: {}", channel_id));
                 } else {
                     // No cache — fetch from server
-                    self.messages.clear();
-                    self.messages
+                    self.channel_view.clear();
+                    self.channel_view
                         .push_system(&format!("已加入频道: {}", channel_id));
                     match self.client.channel_history(channel_id, Some(50)).await {
                         Ok(msgs) => {
                             for msg in &msgs {
                                 let is_agent =
                                     self.agents.iter().any(|a| a.name == msg.from);
-                                self.messages.push(msg, is_agent);
+                                self.channel_view.push(msg, is_agent);
                             }
                         }
                         Err(e) => warn!("load history failed: {}", e),
@@ -1898,7 +1781,7 @@ impl App {
                 self.refresh_agents().await;
             }
             Err(e) => {
-                self.messages.push_system(&format!("加入失败: {}", e));
+                self.channel_view.push_system(&format!("加入失败: {}", e));
             }
         }
     }
@@ -1916,7 +1799,7 @@ impl App {
                                 node_id: node_id.clone(),
                             })
                             .collect();
-                        let unread = self.messages.unread_count(&ch.id);
+                        let unread = self.channel_view.unread_count(&ch.id);
                         ChannelDisplay {
                             id: ch.id,
                             name: ch.name,
@@ -2036,71 +1919,47 @@ mod tests {
     #[tokio::test]
     async fn handle_input_blocks_while_dm_is_responding() {
         let mut app = make_app();
-        app.active_dm = Some(DmState {
-            node_id: "n1".into(),
-            node_name: "alice".into(),
-            messages: Vec::new(),
-            streaming: None,
-            is_responding: true,
-        });
-        app.messages.enter_dm("alice");
+        app.dm_view = DmView::new("alice");
+        app.dm_view.is_responding = true;
+        app.view_mode = ViewMode::Dm { node_id: "n1".into(), node_name: "alice".into() };
 
         app.handle_input("hello").await;
 
-        let dm = app.active_dm.as_ref().unwrap();
-        assert_eq!(dm.messages.len(), 1);
-        assert_eq!(dm.messages[0].role, "系统");
-        assert!(dm.messages[0].content.contains("agent 正在回复"));
+        assert_eq!(app.dm_view.dm_history.len(), 1);
+        assert_eq!(app.dm_view.dm_history[0].role, "系统");
+        assert!(app.dm_view.dm_history[0].content.contains("agent 正在回复"));
     }
 
     #[test]
     fn flush_streaming_as_dm_clears_responding_flag() {
         let mut app = make_app();
-        app.active_dm = Some(DmState {
-            node_id: "n1".into(),
-            node_name: "alice".into(),
-            messages: Vec::new(),
-            streaming: None,
-            is_responding: true,
-        });
-        app.messages.enter_dm("alice");
-        app.messages
-            .streaming
-            .push(("alice".to_string(), "partial".to_string()));
+        app.dm_view = DmView::new("alice");
+        app.dm_view.is_responding = true;
+        app.view_mode = ViewMode::Dm { node_id: "n1".into(), node_name: "alice".into() };
+        // Use structured pipeline
+        app.dm_view.start_streaming_message("alice");
+        let update = serde_json::json!({ "content": { "text": "partial" } });
+        app.dm_view.apply_streaming_event("alice", "agent_message_chunk", &update);
 
         app.flush_streaming_as_dm("n1", "alice");
 
-        let dm = app.active_dm.as_ref().unwrap();
-        assert!(!dm.is_responding);
-        assert_eq!(dm.messages.len(), 1);
-        assert_eq!(dm.messages[0].content, "partial");
+        assert!(!app.dm_view.is_responding);
+        assert_eq!(app.dm_view.dm_history.len(), 1);
+        assert_eq!(app.dm_view.dm_history[0].content, "partial");
     }
 
     #[test]
     fn reset_dm_before_enter_reinitializes_same_agent_dm() {
         let mut app = make_app();
-        app.active_dm = Some(DmState {
-            node_id: "n1".into(),
-            node_name: "alice".into(),
-            messages: vec![DmMessage {
-                role: "assistant".into(),
-                content: "stale".into(),
-                timestamp: 0,
-            }],
-            streaming: None,
-            is_responding: true,
-        });
-        app.messages.enter_dm("alice");
-        app.messages
-            .streaming
-            .push(("alice".to_string(), "partial".to_string()));
+        app.dm_view = DmView::new("alice");
+        app.view_mode = ViewMode::Dm { node_id: "n1".into(), node_name: "alice".into() };
+        app.dm_view.start_streaming_message("alice");
 
         let old_node_id = app.reset_dm_before_enter("n1");
 
         assert_eq!(old_node_id.as_deref(), Some("n1"));
-        assert!(app.active_dm.is_none());
-        assert!(!app.messages.is_dm_mode());
-        assert!(app.messages.streaming.is_empty());
+        assert!(!app.is_dm_mode());
+        assert!(app.dm_view.streaming_messages.is_empty());
     }
 
     #[test]
@@ -2181,13 +2040,7 @@ mod tests {
             },
         ];
         app.active_channel = Some("ch1".into());
-        app.active_dm = Some(DmState {
-            node_id: "n2".into(),
-            node_name: "bob".into(),
-            messages: Vec::new(),
-            streaming: None,
-            is_responding: false,
-        });
+        app.view_mode = ViewMode::Dm { node_id: "n2".into(), node_name: "bob".into() };
 
         app.sync_navigation_selection();
 
@@ -2314,18 +2167,12 @@ mod tests {
     async fn dm_mode_does_not_swallow_other_channel_mention() {
         let mut app = make_app();
         // Simulate being in DM mode
-        app.active_dm = Some(DmState {
-            node_id: "n1".into(),
-            node_name: "bob".into(),
-            messages: Vec::new(),
-            streaming: None,
-            is_responding: false,
-        });
-        app.messages.enter_dm("bob");
+        app.dm_view = DmView::new("bob");
+        app.view_mode = ViewMode::Dm { node_id: "n1".into(), node_name: "bob".into() };
         // Active channel is ch1
         app.active_channel = Some("ch1".into());
 
-        let initial_count = app.messages.line_count();
+        let initial_count = app.channel_view.line_count();
 
         // Mention from a DIFFERENT channel (ch2) should still show
         app.handle_nerve_event(NerveEvent::ChannelMention {
@@ -2342,7 +2189,7 @@ mod tests {
         .await;
 
         assert_eq!(
-            app.messages.line_count(),
+            app.channel_view.line_count(),
             initial_count + 1,
             "non-active channel mention should display even in DM mode"
         );
@@ -2353,7 +2200,7 @@ mod tests {
         let mut app = make_app();
         app.active_channel = Some("ch1".into());
 
-        let initial_count = app.messages.line_count();
+        let initial_count = app.channel_view.line_count();
 
         // Mention from the ACTIVE channel should be skipped (already shown via ChannelMessage)
         app.handle_nerve_event(NerveEvent::ChannelMention {
@@ -2370,9 +2217,161 @@ mod tests {
         .await;
 
         assert_eq!(
-            app.messages.line_count(),
+            app.channel_view.line_count(),
             initial_count,
             "active channel mention should be deduped"
         );
+    }
+
+    // --- Streaming pipeline unification tests ---
+
+    #[test]
+    fn flush_streaming_from_structured_message() {
+        // flush should take content from streaming_messages, not the old Vec
+        let mut app = make_app();
+        app.dm_view = DmView::new("alice");
+        app.dm_view.is_responding = true;
+        app.view_mode = ViewMode::Dm { node_id: "n1".into(), node_name: "alice".into() };
+
+        // Populate streaming_messages with structured blocks
+        app.dm_view.start_streaming_message("alice");
+        let update = serde_json::json!({ "content": { "text": "hello world" } });
+        app.dm_view.apply_streaming_event("alice", "agent_message_chunk", &update);
+
+        app.flush_streaming_as_dm("n1", "alice");
+
+        assert!(!app.dm_view.is_responding);
+        assert_eq!(app.dm_view.dm_history.len(), 1);
+        assert!(app.dm_view.dm_history[0].content.contains("hello world"));
+        // streaming_messages should be cleared
+        assert!(!app.dm_view.streaming_messages.contains_key("alice"));
+    }
+
+    #[test]
+    fn flush_empty_streaming_messages_no_panic() {
+        let mut app = make_app();
+        app.dm_view = DmView::new("alice");
+        app.view_mode = ViewMode::Dm { node_id: "n1".into(), node_name: "alice".into() };
+
+        // No streaming_messages at all — should not panic or create empty dm_history
+        app.flush_streaming_as_dm("n1", "alice");
+
+        assert!(app.dm_view.dm_history.is_empty());
+    }
+
+    #[test]
+    fn flush_structured_blocks_no_thinking_in_content() {
+        // Thinking blocks should not appear in persisted dm_history.content
+        let mut app = make_app();
+        app.dm_view = DmView::new("alice");
+        app.view_mode = ViewMode::Dm { node_id: "n1".into(), node_name: "alice".into() };
+
+        app.dm_view.start_streaming_message("alice");
+        // Add thinking block
+        let think = serde_json::json!({ "content": { "text": "let me think..." } });
+        app.dm_view.apply_streaming_event("alice", "agent_thought_chunk", &think);
+        // Add text block
+        let text = serde_json::json!({ "content": { "text": "the answer is 42" } });
+        app.dm_view.apply_streaming_event("alice", "agent_message_chunk", &text);
+
+        app.flush_streaming_as_dm("n1", "alice");
+
+        assert_eq!(app.dm_view.dm_history.len(), 1);
+        let content = &app.dm_view.dm_history[0].content;
+        assert!(!content.contains("think"), "thinking should not be in persisted content");
+        assert!(content.contains("the answer is 42"));
+    }
+
+    #[test]
+    fn flush_tool_call_blocks_include_status() {
+        let mut app = make_app();
+        app.dm_view = DmView::new("alice");
+        app.view_mode = ViewMode::Dm { node_id: "n1".into(), node_name: "alice".into() };
+
+        app.dm_view.start_streaming_message("alice");
+        // Add a tool_call event
+        let tc = serde_json::json!({
+            "toolCall": { "name": "Read", "id": "tc1", "input": {} },
+        });
+        app.dm_view.apply_streaming_event("alice", "tool_call", &tc);
+        // Mark completed
+        let tcu = serde_json::json!({
+            "toolCallUpdate": { "toolCallId": "tc1", "status": "completed", "result": { "value": "ok" } }
+        });
+        app.dm_view.apply_streaming_event("alice", "tool_call_update", &tcu);
+        // Add text
+        let text = serde_json::json!({ "content": { "text": "done" } });
+        app.dm_view.apply_streaming_event("alice", "agent_message_chunk", &text);
+
+        app.flush_streaming_as_dm("n1", "alice");
+
+        assert_eq!(app.dm_view.dm_history.len(), 1);
+        let content = &app.dm_view.dm_history[0].content;
+        assert!(content.contains("done"));
+        // Should have tool reference with status marker
+        assert!(content.contains("[tool:Read"), "should have tool call in content");
+    }
+
+    #[test]
+    fn flush_preserves_blocks_in_message_line() {
+        // After flush, the MessageLine pushed to messages should have structured blocks
+        let mut app = make_app();
+        app.dm_view = DmView::new("alice");
+        app.view_mode = ViewMode::Dm { node_id: "n1".into(), node_name: "alice".into() };
+
+        app.dm_view.start_streaming_message("alice");
+        let text = serde_json::json!({ "content": { "text": "structured content" } });
+        app.dm_view.apply_streaming_event("alice", "agent_message_chunk", &text);
+
+        let before_count = app.dm_view.messages.len();
+        app.flush_streaming_as_dm("n1", "alice");
+
+        assert_eq!(app.dm_view.messages.len(), before_count + 1);
+        let last_msg = app.dm_view.messages.last().unwrap();
+        // blocks should contain at least one Text block
+        assert!(
+            last_msg.blocks.iter().any(|b| matches!(b, ContentBlock::Text { .. })),
+            "MessageLine should have structured Text blocks"
+        );
+    }
+
+    #[test]
+    fn agent_message_start_clears_previous_streaming() {
+        let mut app = make_app();
+        app.dm_view = DmView::new("alice");
+
+        // First message
+        app.dm_view.start_streaming_message("alice");
+        let text = serde_json::json!({ "content": { "text": "old content" } });
+        app.dm_view.apply_streaming_event("alice", "agent_message_chunk", &text);
+
+        // New message_start should clear previous
+        app.dm_view.start_streaming_message("alice");
+        let msg = app.dm_view.streaming_messages.get("alice").unwrap();
+        assert!(msg.blocks.is_empty(), "new streaming message should start with empty blocks");
+    }
+
+    #[test]
+    fn multi_agent_streaming_isolated() {
+        let mut app = make_app();
+        app.dm_view = DmView::new("alice");
+        app.view_mode = ViewMode::Dm { node_id: "n1".into(), node_name: "alice".into() };
+
+        app.dm_view.start_streaming_message("alice");
+        app.dm_view.start_streaming_message("bob");
+
+        let text_a = serde_json::json!({ "content": { "text": "from alice" } });
+        let text_b = serde_json::json!({ "content": { "text": "from bob" } });
+        app.dm_view.apply_streaming_event("alice", "agent_message_chunk", &text_a);
+        app.dm_view.apply_streaming_event("bob", "agent_message_chunk", &text_b);
+
+        // Flush only alice
+        app.flush_streaming_as_dm("n1", "alice");
+
+        assert_eq!(app.dm_view.dm_history.len(), 1);
+        assert!(app.dm_view.dm_history[0].content.contains("from alice"));
+        // Bob's streaming should still be there
+        assert!(app.dm_view.streaming_messages.contains_key("bob"));
+        assert!(!app.dm_view.streaming_messages.contains_key("alice"));
     }
 }
