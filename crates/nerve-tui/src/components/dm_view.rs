@@ -1,7 +1,7 @@
 use crate::theme;
 use crate::components::block_renderer;
 use chrono::Local;
-use nerve_tui_protocol::{ContentBlock, DmMessage, Message, Role};
+use nerve_tui_protocol::{ContentBlock, DmMessage, Message, Role, ToolStatus};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
@@ -29,9 +29,7 @@ pub struct DmView {
     auto_scroll: bool,
     pub(crate) visible_height: u16,
     has_new_messages: bool,
-    // Streaming (old pipeline)
-    pub streaming: Vec<(String, String)>,
-    // Streaming (new pipeline)
+    // Streaming — structured message pipeline
     pub streaming_messages: HashMap<String, Message>,
     next_msg_id: u64,
     // UI
@@ -55,7 +53,6 @@ impl DmView {
             auto_scroll: true,
             visible_height: 0,
             has_new_messages: false,
-            streaming: Vec::new(),
             streaming_messages: HashMap::new(),
             next_msg_id: 0,
             usage_label: None,
@@ -82,7 +79,6 @@ impl DmView {
 
     pub fn clear(&mut self) {
         self.messages.clear();
-        self.streaming.clear();
         self.streaming_messages.clear();
         self.flushed_agents.clear();
         self.dm_history.clear();
@@ -94,6 +90,11 @@ impl DmView {
 
     pub fn push(&mut self, msg: &DmMessage) {
         let blocks = Message::content_to_blocks(&msg.content);
+        self.push_with_blocks(msg, blocks);
+    }
+
+    /// Push a DM message with pre-built blocks (skips content_to_blocks parsing).
+    pub fn push_with_blocks(&mut self, msg: &DmMessage, blocks: Vec<ContentBlock>) {
         self.messages.push(MessageLine {
             from: msg.role.clone(),
             content: msg.content.clone(),
@@ -354,9 +355,12 @@ impl DmView {
             out.extend(content_lines);
         }
 
-        // Streaming previews
+        // Streaming previews — sorted keys for stable render order
         let cursor_char = if self.cursor_visible() { " ▌" } else { "  " };
-        for (name, content) in &self.streaming {
+        let mut streaming_names: Vec<&String> = self.streaming_messages.keys().collect();
+        streaming_names.sort();
+        for name in streaming_names {
+            let msg = &self.streaming_messages[name];
             out.push(Line::from(""));
             out.push(Line::from(vec![
                 Span::styled(
@@ -368,77 +372,17 @@ impl DmView {
                 Span::styled(cursor_char.to_string(), Style::default().fg(theme::MENTION)),
             ]));
 
-            // Try structured rendering first (new pipeline)
-            if let Some(msg) = self.streaming_messages.get(name) {
-                if !msg.blocks.is_empty() {
-                    debug!(
-                        "streaming render: {} using structured pipeline, {} blocks",
-                        name, msg.blocks.len()
-                    );
-                    for block in &msg.blocks {
-                        let rendered = block_renderer::render_block(block, width);
-                        out.extend(rendered);
-                    }
-                    continue;
-                } else {
-                    debug!("streaming render: {} has structured msg but 0 blocks, falling through", name);
+            if !msg.blocks.is_empty() {
+                debug!(
+                    "streaming render: {} blocks={}",
+                    name, msg.blocks.len()
+                );
+                for block in &msg.blocks {
+                    let rendered = block_renderer::render_block(block, width);
+                    out.extend(rendered);
                 }
             } else {
-                debug!(
-                    "streaming render: {} not in streaming_messages (keys: [{}]), using text fallback",
-                    name,
-                    self.streaming_messages.keys().cloned().collect::<Vec<_>>().join(", ")
-                );
-            }
-
-            // Fallback: old string-based streaming rendering
-            let max_preview = if width > 0 { self.visible_height.max(20) as usize } else { 20 };
-            let w = width.max(1) as usize;
-            let all_lines: Vec<&str> = content.lines().collect();
-            let mut visual_count = 0usize;
-            let mut start = all_lines.len();
-            let mut truncate_first: Option<(usize, usize)> = None;
-            for (idx, line) in all_lines.iter().enumerate().rev() {
-                let lw = UnicodeWidthStr::width(*line);
-                let vl = if lw == 0 { 1 } else { (lw + w - 1) / w };
-                visual_count += vl;
-                if visual_count > max_preview {
-                    let keep_vl = vl.saturating_sub(visual_count - max_preview);
-                    if keep_vl > 0 {
-                        start = idx;
-                        truncate_first = Some((idx, keep_vl));
-                    } else {
-                        start = idx + 1;
-                    }
-                    break;
-                }
-                start = idx;
-            }
-            if start > 0 {
-                out.push(Line::from(Span::styled(
-                    format!("  … {} 行已省略", start),
-                    Style::default().fg(theme::SYSTEM_MSG),
-                )));
-            }
-            let mut first_line_truncated = false;
-            if let Some((trunc_idx, keep_vl)) = truncate_first {
-                if trunc_idx == start {
-                    let keep_width = (keep_vl * w).saturating_sub(1);
-                    let truncated = tail_by_width(&all_lines[start], keep_width);
-                    out.push(Line::from(Span::styled(
-                        format!("…{}", truncated),
-                        Style::default().fg(theme::AGENT_MSG),
-                    )));
-                    first_line_truncated = true;
-                }
-            }
-            let md_start = if first_line_truncated { start + 1 } else { start };
-            if md_start < all_lines.len() {
-                let md_text: String = all_lines[md_start..].join("\n");
-                let blocks = Message::content_to_blocks(&md_text);
-                for block in &blocks {
-                    out.extend(block_renderer::render_block(block, width));
-                }
+                debug!("streaming render: {} has 0 blocks", name);
             }
         }
 
@@ -449,6 +393,40 @@ impl DmView {
 
         out
     }
+}
+
+/// Convert structured content blocks to a plain text string for DmMessage persistence.
+/// Thinking blocks are excluded (not persisted to DM history).
+pub fn blocks_to_text(blocks: &[ContentBlock]) -> String {
+    let parts: Vec<String> = blocks
+        .iter()
+        .filter_map(|b| match b {
+            ContentBlock::Text { text } => {
+                if text.is_empty() { None } else { Some(text.clone()) }
+            }
+            ContentBlock::Thinking { .. } => None,
+            ContentBlock::ToolCall { name, status, .. } => {
+                let marker = match status {
+                    ToolStatus::Pending => "…",
+                    ToolStatus::Running => "⟳",
+                    ToolStatus::Completed => "✓",
+                    ToolStatus::Failed => "✗",
+                };
+                Some(format!("[tool:{} {}]", name, marker))
+            }
+            ContentBlock::ToolResult { content, is_error, .. } => {
+                if content.is_empty() {
+                    None
+                } else if *is_error {
+                    Some(format!("[error] {}", content))
+                } else {
+                    Some(content.clone())
+                }
+            }
+            ContentBlock::Error { message } => Some(format!("[error] {}", message)),
+        })
+        .collect();
+    parts.join("\n")
 }
 
 // --- Helper functions (DM-specific) ---
@@ -487,18 +465,4 @@ fn format_tokens(n: f64) -> String {
     } else {
         format!("{}", n as u64)
     }
-}
-
-/// Return the tail of `s` whose display width fits within `max_width`.
-fn tail_by_width(s: &str, max_width: usize) -> &str {
-    use unicode_width::UnicodeWidthChar;
-    let mut width = 0usize;
-    for (i, c) in s.char_indices().rev() {
-        let cw = UnicodeWidthChar::width(c).unwrap_or(0);
-        if width + cw > max_width {
-            return &s[i + c.len_utf8()..];
-        }
-        width += cw;
-    }
-    s
 }

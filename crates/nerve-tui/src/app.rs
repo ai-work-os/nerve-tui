@@ -1509,28 +1509,22 @@ impl App {
             return;
         }
 
-        // Extract content and clear streaming BEFORE pushing to dm_lines
-        // to prevent any render frame from seeing both.
-        let content = self.dm_view.streaming.iter()
-            .find(|(n, _)| n == name)
-            .map(|(_, c)| c.clone())
-            .unwrap_or_default();
-        self.dm_view.streaming.retain(|(n, _)| n != name);
-        self.dm_view.take_streaming_message(name);
-
-        if !content.is_empty() {
-            debug!(
-                "flush_streaming_as_dm: {} went idle, persisting {} chars",
-                name,
-                content.len()
-            );
-            let dm_msg = DmMessage {
-                role: "assistant".to_string(),
-                content,
-                timestamp: chrono::Local::now().timestamp(),
-            };
-            self.dm_view.push(&dm_msg);
-            self.dm_view.dm_history.push(dm_msg);
+        // Take structured message from streaming pipeline
+        if let Some(msg) = self.dm_view.take_streaming_message(name) {
+            if !msg.blocks.is_empty() {
+                let content = crate::components::dm_view::blocks_to_text(&msg.blocks);
+                debug!(
+                    "flush_streaming_as_dm: {} persisting {} blocks, {} chars",
+                    name, msg.blocks.len(), content.len()
+                );
+                let dm_msg = DmMessage {
+                    role: "assistant".to_string(),
+                    content,
+                    timestamp: chrono::Local::now().timestamp(),
+                };
+                self.dm_view.push_with_blocks(&dm_msg, msg.blocks);
+                self.dm_view.dm_history.push(dm_msg);
+            }
         }
         self.dm_view.flushed_agents.insert(name.to_string());
         if self.dm_node_id() == Some(node_id) {
@@ -1587,168 +1581,67 @@ impl App {
 
             match kind {
                 Some("agent_message_chunk") => {
-                    // New pipeline: structured ContentBlock
                     self.dm_view.apply_streaming_event(name, "agent_message_chunk", update);
-
-                    let text = update
-                        .get("content")
-                        .and_then(|c| c.get("text"))
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("");
-                    if text.is_empty() {
-                        debug!(
-                            "agent_message_chunk from {} has empty text, raw: {:?}",
-                            name, update
-                        );
-                    }
-                    let buf_len_before = self.dm_view.streaming
-                        .iter()
-                        .find(|(n, _)| n == name)
-                        .map(|(_, c)| c.len())
-                        .unwrap_or(0);
-                    let chunk_preview: String = text.chars().take(20).collect();
-                    info!(
-                        "CHUNK from={} len={} preview={:?} buf_before={}",
-                        name, text.len(), chunk_preview, buf_len_before
-                    );
-                    if let Some(entry) = self.dm_view.streaming.iter_mut().find(|(n, _)| n == name)
-                    {
-                        // Dedup: skip if buffer already ends with this exact chunk
-                        if !text.is_empty() && !entry.1.ends_with(text) {
-                            entry.1.push_str(text);
-                        } else if text.is_empty() {
-                            // empty chunk, skip
-                        } else {
-                            debug!("DEDUP: skipping duplicate chunk from {}: {:?}", name, &text[..{let mut e = text.len().min(20); while e > 0 && !text.is_char_boundary(e) { e -= 1; } e}]);
-                        }
-                    } else {
-                        self.dm_view
-                            .streaming
-                            .push((name.to_string(), text.to_string()));
-                    }
-                    // Note: do NOT set is_responding here — chunks arrive during
-                    // replay too (historical data). Only NodeStatusChanged("busy")
-                    // should set is_responding = true.
                 }
                 Some("agent_message_start") => {
-                    // New pipeline: start structured message
+                    debug!("agent_message_start from {}", name);
                     self.dm_view.start_streaming_message(name);
-
-                    let old_buf_len = self.dm_view.streaming
-                        .iter()
-                        .find(|(n, _)| n == name)
-                        .map(|(_, c)| c.len());
-                    info!(
-                        "MSG_START from={} old_buf={:?}",
-                        name, old_buf_len
-                    );
-                    debug!(
-                        "agent_message_start from {}, clearing streaming buffer",
-                        name
-                    );
-                    self.dm_view.streaming.retain(|(n, _)| n != name);
-                    self.dm_view
-                        .streaming
-                        .push((name.to_string(), String::new()));
                     self.dm_view.flushed_agents.remove(name);
                 }
                 Some("agent_message_end") => {
-                    // New pipeline: finalize structured message
                     self.dm_view.apply_streaming_event(name, "agent_message_end", update);
-                    self.dm_view.take_streaming_message(name);
-
-                    // If idle already flushed this agent's streaming buffer, skip to
-                    // avoid persisting the same message twice.
+                    let msg = self.dm_view.take_streaming_message(name);
                     let already_flushed = self.dm_view.flushed_agents.remove(name);
 
-                    // Extract and clear streaming content BEFORE pushing to dm_lines
-                    // to prevent duplicate rendering.
-                    let streaming_content = self
-                        .dm_view
-                        .streaming
-                        .iter()
-                        .find(|(n, _)| n == name)
-                        .map(|(_, c)| c.clone())
-                        .unwrap_or_default();
-                    self.dm_view.streaming.retain(|(n, _)| n != name);
-
-                    // Some agents include full content in the end event
+                    // Fallback: some agents include full content in the end event
+                    // (e.g. during replay when no chunks were sent)
                     let end_content = update
                         .get("content")
                         .and_then(|c| c.get("text"))
                         .and_then(|v| v.as_str())
                         .unwrap_or("");
 
-                    let streaming_len = streaming_content.len();
-                    let end_len = end_content.len();
-
-                    let final_content = if !streaming_content.is_empty() {
-                        streaming_content
+                    let (final_content, final_blocks) = if let Some(m) = msg {
+                        if !m.blocks.is_empty() {
+                            let text = crate::components::dm_view::blocks_to_text(&m.blocks);
+                            (text, m.blocks)
+                        } else if !already_flushed && !end_content.is_empty() {
+                            let blocks = Message::content_to_blocks(end_content);
+                            (end_content.to_string(), blocks)
+                        } else {
+                            (String::new(), Vec::new())
+                        }
                     } else if !already_flushed && !end_content.is_empty() {
-                        end_content.to_string()
+                        // No streaming_message at all (edge case: replay)
+                        let blocks = Message::content_to_blocks(end_content);
+                        (end_content.to_string(), blocks)
                     } else {
-                        String::new()
+                        (String::new(), Vec::new())
                     };
 
                     debug!(
-                        "agent_message_end from {}: in_dm={} streaming_buf={} end_content={} final={} already_flushed={}",
-                        name, in_dm, streaming_len, end_len, final_content.len(), already_flushed
+                        "agent_message_end from {}: in_dm={} final={} already_flushed={}",
+                        name, in_dm, final_content.len(), already_flushed
                     );
 
                     if in_dm && !final_content.is_empty() {
-                        debug!(
-                            "persisting DM message from {}: {} chars",
-                            name,
-                            final_content.len()
-                        );
                         let dm_msg = DmMessage {
                             role: "assistant".to_string(),
                             content: final_content,
                             timestamp: chrono::Local::now().timestamp(),
                         };
-                        self.dm_view.push(&dm_msg);
+                        self.dm_view.push_with_blocks(&dm_msg, final_blocks);
                         self.dm_view.dm_history.push(dm_msg);
-                    } else if in_dm {
-                        debug!("agent_message_end from {} but no content to persist (already_flushed={})", name, already_flushed);
                     }
                     if self.dm_node_id() == Some(node_id) {
                         self.dm_view.is_responding = false;
                     }
                 }
                 Some("agent_thought_chunk") => {
-                    // New pipeline: structured thinking block
                     self.dm_view.apply_streaming_event(name, "agent_thought_chunk", update);
-
-                    let text = update
-                        .get("content")
-                        .and_then(|c| c.get("text"))
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("");
-                    if !text.is_empty() {
-                        // Old pipeline: append [thinking] marker to streaming buffer
-                        if let Some(entry) = self.dm_view.streaming.iter_mut().find(|(n, _)| n == name) {
-                            // Only add [thinking] prefix once at the start of a thinking block
-                            if !entry.1.ends_with("[thinking] ") && !entry.1.ends_with(text) {
-                                if entry.1.is_empty() || entry.1.ends_with('\n') {
-                                    entry.1.push_str("[thinking] ");
-                                }
-                                entry.1.push_str(text);
-                            }
-                        } else {
-                            self.dm_view.streaming.push((name.to_string(), format!("[thinking] {}", text)));
-                        }
-                    }
                 }
                 Some("agent_thought_end") => {
-                    // New pipeline: mark thinking block finished
                     self.dm_view.apply_streaming_event(name, "agent_thought_end", update);
-
-                    // Old pipeline: add newline after thinking block
-                    if let Some(entry) = self.dm_view.streaming.iter_mut().find(|(n, _)| n == name) {
-                        if !entry.1.is_empty() && !entry.1.ends_with('\n') {
-                            entry.1.push('\n');
-                        }
-                    }
                 }
                 Some("user_message") => {
                     // Replay of user's prompt (from subscribe buffer)
@@ -1775,122 +1668,37 @@ impl App {
                     }
                 }
                 Some("tool_call") => {
-                    // New pipeline: structured tool_call block
                     self.dm_view.apply_streaming_event(name, "tool_call", update);
 
-                    // Update sidebar tool call display
-                    // Support both nested (toolCall: {...}) and flat ACP format (toolCallId, _meta, title, ...)
+                    // Update sidebar: extract tool name for display
                     let tc = update.get("toolCall").or_else(|| update.get("tool_call"));
-                    let (tool_name, desc, raw_input) = if let Some(tc) = tc {
-                        // Legacy nested
-                        let tn = tc.get("name").and_then(|v| v.as_str()).unwrap_or("unknown");
-                        let d = tc.get("description").and_then(|v| v.as_str()).unwrap_or("");
-                        let ri = tc.get("input").cloned();
-                        (tn.to_string(), d.to_string(), ri)
+                    let tool_name = if let Some(tc) = tc {
+                        tc.get("name").and_then(|v| v.as_str()).unwrap_or("unknown")
                     } else {
-                        // Flat ACP format
-                        let tn = update.pointer("/_meta/claudeCode/toolName")
+                        update.pointer("/_meta/claudeCode/toolName")
                             .and_then(|v| v.as_str())
-                            .unwrap_or_else(|| update.get("title").and_then(|v| v.as_str()).unwrap_or("unknown"));
-                        let d = update.get("title").and_then(|v| v.as_str()).unwrap_or("");
-                        let ri = update.get("rawInput").cloned();
-                        (tn.to_string(), d.to_string(), ri)
+                            .unwrap_or_else(|| update.get("title").and_then(|v| v.as_str()).unwrap_or("unknown"))
                     };
-                    let mut formatted = format!("\n[tool:{}]", tool_name);
-                    if !desc.is_empty() {
-                        formatted.push(' ');
-                        formatted.push_str(&desc);
-                    }
-                    if let Some(input) = raw_input.as_ref().and_then(|v| v.as_object()) {
-                        for (key, val) in input {
-                            let val_str = match val.as_str() {
-                                Some(s) if s.len() > 120 => {
-                                    let mut end = 120;
-                                    while end > 0 && !s.is_char_boundary(end) { end -= 1; }
-                                    format!("{}…", &s[..end])
-                                },
-                                Some(s) => s.to_string(),
-                                None => {
-                                    let j = serde_json::to_string(val).unwrap_or_default();
-                                    if j.len() > 120 {
-                                        let mut end = 120;
-                                        while end > 0 && !j.is_char_boundary(end) { end -= 1; }
-                                        format!("{}…", &j[..end])
-                                    } else { j }
-                                }
-                            };
-                            formatted.push_str(&format!("\n  {}: {}", key, val_str));
-                        }
-                    }
-                    if let Some(entry) = self.dm_view.streaming.iter_mut().find(|(n, _)| n == name) {
-                        entry.1.push_str(&formatted);
-                    } else {
-                        self.dm_view.streaming.push((name.to_string(), formatted));
-                    }
-
-                    // Update sidebar: show current tool call name + start timer
                     if let Some(agent) = self.agents.iter_mut().find(|a| a.name == name) {
-                        agent.tool_call_name = Some(tool_name.clone());
+                        agent.tool_call_name = Some(tool_name.to_string());
                         agent.tool_call_started = Some(std::time::Instant::now());
                         debug!(agent = name, tool = %tool_name, "sidebar: tool_call started");
                     }
                 }
                 Some("tool_call_update") => {
-                    // New pipeline: structured tool_call_update
                     self.dm_view.apply_streaming_event(name, "tool_call_update", update);
 
-                    // Support both nested and flat ACP format
+                    // Update sidebar: clear tool call display on completion/failure
                     let tcu = update.get("toolCallUpdate").or_else(|| update.get("tool_call_update"));
-                    let (status, result_text) = if let Some(tcu) = tcu {
-                        let s = tcu.get("status").and_then(|v| v.as_str()).unwrap_or("");
-                        let rt = tcu.get("result")
-                            .or_else(|| tcu.get("output"))
-                            .and_then(|v| v.get("value").or(Some(v)));
-                        let text = match rt {
-                            Some(v) if v.is_string() => v.as_str().unwrap_or("").to_string(),
-                            Some(v) => serde_json::to_string_pretty(v).unwrap_or_default(),
-                            None => String::new(),
-                        };
-                        (s.to_string(), text)
+                    let status = if let Some(tcu) = tcu {
+                        tcu.get("status").and_then(|v| v.as_str()).unwrap_or("")
                     } else {
-                        // Flat ACP format
-                        let s = update.get("status").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                        let text = update.get("content")
-                            .and_then(|v| {
-                                if v.is_string() { v.as_str().map(|s| s.to_string()) }
-                                else if let Some(arr) = v.as_array() {
-                                    let texts: Vec<String> = arr.iter().filter_map(|item| {
-                                        item.get("content").and_then(|c| c.get("text")).and_then(|t| t.as_str()).map(|s| s.to_string())
-                                    }).collect();
-                                    if texts.is_empty() { None } else { Some(texts.join("\n")) }
-                                } else { None }
-                            })
-                            .unwrap_or_default();
-                        (s, text)
+                        update.get("status").and_then(|v| v.as_str()).unwrap_or("")
                     };
                     if status == "completed" || status == "failed" {
-                        // Clear sidebar tool call display
                         if let Some(agent) = self.agents.iter_mut().find(|a| a.name == name) {
                             agent.tool_call_name = None;
                             agent.tool_call_started = None;
-                        }
-                        let marker = if status == "completed" { "✓" } else { "✗" };
-                        let mut formatted = format!("\n[tool_result:{}]", marker);
-                        let lines: Vec<&str> = result_text.lines().collect();
-                        for (i, line) in lines.iter().enumerate() {
-                            if i >= 3 {
-                                formatted.push_str(&format!("\n  … {} 行已省略", lines.len() - 3));
-                                break;
-                            }
-                            let display = if line.len() > 150 {
-                                let mut end = 150;
-                                while end > 0 && !line.is_char_boundary(end) { end -= 1; }
-                                &line[..end]
-                            } else { line };
-                            formatted.push_str(&format!("\n  {}", display));
-                        }
-                        if let Some(entry) = self.dm_view.streaming.iter_mut().find(|(n, _)| n == name) {
-                            entry.1.push_str(&formatted);
                         }
                     }
                 }
@@ -2128,8 +1936,10 @@ mod tests {
         app.dm_view = DmView::new("alice");
         app.dm_view.is_responding = true;
         app.view_mode = ViewMode::Dm { node_id: "n1".into(), node_name: "alice".into() };
-        app.dm_view.streaming
-            .push(("alice".to_string(), "partial".to_string()));
+        // Use structured pipeline
+        app.dm_view.start_streaming_message("alice");
+        let update = serde_json::json!({ "content": { "text": "partial" } });
+        app.dm_view.apply_streaming_event("alice", "agent_message_chunk", &update);
 
         app.flush_streaming_as_dm("n1", "alice");
 
@@ -2143,14 +1953,13 @@ mod tests {
         let mut app = make_app();
         app.dm_view = DmView::new("alice");
         app.view_mode = ViewMode::Dm { node_id: "n1".into(), node_name: "alice".into() };
-        app.dm_view.streaming
-            .push(("alice".to_string(), "partial".to_string()));
+        app.dm_view.start_streaming_message("alice");
 
         let old_node_id = app.reset_dm_before_enter("n1");
 
         assert_eq!(old_node_id.as_deref(), Some("n1"));
         assert!(!app.is_dm_mode());
-        assert!(app.dm_view.streaming.is_empty());
+        assert!(app.dm_view.streaming_messages.is_empty());
     }
 
     #[test]
@@ -2412,5 +2221,157 @@ mod tests {
             initial_count,
             "active channel mention should be deduped"
         );
+    }
+
+    // --- Streaming pipeline unification tests ---
+
+    #[test]
+    fn flush_streaming_from_structured_message() {
+        // flush should take content from streaming_messages, not the old Vec
+        let mut app = make_app();
+        app.dm_view = DmView::new("alice");
+        app.dm_view.is_responding = true;
+        app.view_mode = ViewMode::Dm { node_id: "n1".into(), node_name: "alice".into() };
+
+        // Populate streaming_messages with structured blocks
+        app.dm_view.start_streaming_message("alice");
+        let update = serde_json::json!({ "content": { "text": "hello world" } });
+        app.dm_view.apply_streaming_event("alice", "agent_message_chunk", &update);
+
+        app.flush_streaming_as_dm("n1", "alice");
+
+        assert!(!app.dm_view.is_responding);
+        assert_eq!(app.dm_view.dm_history.len(), 1);
+        assert!(app.dm_view.dm_history[0].content.contains("hello world"));
+        // streaming_messages should be cleared
+        assert!(!app.dm_view.streaming_messages.contains_key("alice"));
+    }
+
+    #[test]
+    fn flush_empty_streaming_messages_no_panic() {
+        let mut app = make_app();
+        app.dm_view = DmView::new("alice");
+        app.view_mode = ViewMode::Dm { node_id: "n1".into(), node_name: "alice".into() };
+
+        // No streaming_messages at all — should not panic or create empty dm_history
+        app.flush_streaming_as_dm("n1", "alice");
+
+        assert!(app.dm_view.dm_history.is_empty());
+    }
+
+    #[test]
+    fn flush_structured_blocks_no_thinking_in_content() {
+        // Thinking blocks should not appear in persisted dm_history.content
+        let mut app = make_app();
+        app.dm_view = DmView::new("alice");
+        app.view_mode = ViewMode::Dm { node_id: "n1".into(), node_name: "alice".into() };
+
+        app.dm_view.start_streaming_message("alice");
+        // Add thinking block
+        let think = serde_json::json!({ "content": { "text": "let me think..." } });
+        app.dm_view.apply_streaming_event("alice", "agent_thought_chunk", &think);
+        // Add text block
+        let text = serde_json::json!({ "content": { "text": "the answer is 42" } });
+        app.dm_view.apply_streaming_event("alice", "agent_message_chunk", &text);
+
+        app.flush_streaming_as_dm("n1", "alice");
+
+        assert_eq!(app.dm_view.dm_history.len(), 1);
+        let content = &app.dm_view.dm_history[0].content;
+        assert!(!content.contains("think"), "thinking should not be in persisted content");
+        assert!(content.contains("the answer is 42"));
+    }
+
+    #[test]
+    fn flush_tool_call_blocks_include_status() {
+        let mut app = make_app();
+        app.dm_view = DmView::new("alice");
+        app.view_mode = ViewMode::Dm { node_id: "n1".into(), node_name: "alice".into() };
+
+        app.dm_view.start_streaming_message("alice");
+        // Add a tool_call event
+        let tc = serde_json::json!({
+            "toolCall": { "name": "Read", "id": "tc1", "input": {} },
+        });
+        app.dm_view.apply_streaming_event("alice", "tool_call", &tc);
+        // Mark completed
+        let tcu = serde_json::json!({
+            "toolCallUpdate": { "toolCallId": "tc1", "status": "completed", "result": { "value": "ok" } }
+        });
+        app.dm_view.apply_streaming_event("alice", "tool_call_update", &tcu);
+        // Add text
+        let text = serde_json::json!({ "content": { "text": "done" } });
+        app.dm_view.apply_streaming_event("alice", "agent_message_chunk", &text);
+
+        app.flush_streaming_as_dm("n1", "alice");
+
+        assert_eq!(app.dm_view.dm_history.len(), 1);
+        let content = &app.dm_view.dm_history[0].content;
+        assert!(content.contains("done"));
+        // Should have tool reference with status marker
+        assert!(content.contains("[tool:Read"), "should have tool call in content");
+    }
+
+    #[test]
+    fn flush_preserves_blocks_in_message_line() {
+        // After flush, the MessageLine pushed to messages should have structured blocks
+        let mut app = make_app();
+        app.dm_view = DmView::new("alice");
+        app.view_mode = ViewMode::Dm { node_id: "n1".into(), node_name: "alice".into() };
+
+        app.dm_view.start_streaming_message("alice");
+        let text = serde_json::json!({ "content": { "text": "structured content" } });
+        app.dm_view.apply_streaming_event("alice", "agent_message_chunk", &text);
+
+        let before_count = app.dm_view.messages.len();
+        app.flush_streaming_as_dm("n1", "alice");
+
+        assert_eq!(app.dm_view.messages.len(), before_count + 1);
+        let last_msg = app.dm_view.messages.last().unwrap();
+        // blocks should contain at least one Text block
+        assert!(
+            last_msg.blocks.iter().any(|b| matches!(b, ContentBlock::Text { .. })),
+            "MessageLine should have structured Text blocks"
+        );
+    }
+
+    #[test]
+    fn agent_message_start_clears_previous_streaming() {
+        let mut app = make_app();
+        app.dm_view = DmView::new("alice");
+
+        // First message
+        app.dm_view.start_streaming_message("alice");
+        let text = serde_json::json!({ "content": { "text": "old content" } });
+        app.dm_view.apply_streaming_event("alice", "agent_message_chunk", &text);
+
+        // New message_start should clear previous
+        app.dm_view.start_streaming_message("alice");
+        let msg = app.dm_view.streaming_messages.get("alice").unwrap();
+        assert!(msg.blocks.is_empty(), "new streaming message should start with empty blocks");
+    }
+
+    #[test]
+    fn multi_agent_streaming_isolated() {
+        let mut app = make_app();
+        app.dm_view = DmView::new("alice");
+        app.view_mode = ViewMode::Dm { node_id: "n1".into(), node_name: "alice".into() };
+
+        app.dm_view.start_streaming_message("alice");
+        app.dm_view.start_streaming_message("bob");
+
+        let text_a = serde_json::json!({ "content": { "text": "from alice" } });
+        let text_b = serde_json::json!({ "content": { "text": "from bob" } });
+        app.dm_view.apply_streaming_event("alice", "agent_message_chunk", &text_a);
+        app.dm_view.apply_streaming_event("bob", "agent_message_chunk", &text_b);
+
+        // Flush only alice
+        app.flush_streaming_as_dm("n1", "alice");
+
+        assert_eq!(app.dm_view.dm_history.len(), 1);
+        assert!(app.dm_view.dm_history[0].content.contains("from alice"));
+        // Bob's streaming should still be there
+        assert!(app.dm_view.streaming_messages.contains_key("bob"));
+        assert!(!app.dm_view.streaming_messages.contains_key("alice"));
     }
 }
