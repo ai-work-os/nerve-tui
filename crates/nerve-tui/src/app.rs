@@ -1721,6 +1721,11 @@ impl App {
                         self.dm_view.update_usage(used, size, cost);
                     }
                 }
+                Some("node_log") => {
+                    if in_dm {
+                        self.dm_view.push_log_entries(update);
+                    }
+                }
                 _ => {
                     debug!("node.update from {} unhandled: {:?}", name, detail);
                 }
