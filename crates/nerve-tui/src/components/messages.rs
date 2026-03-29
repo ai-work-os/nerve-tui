@@ -1,14 +1,13 @@
 use crate::theme;
 use crate::components::block_renderer;
 use chrono::{Local, TimeZone};
-use nerve_tui_protocol::{DmMessage, Message, MessageInfo, Role};
+use nerve_tui_protocol::{ContentBlock, DmMessage, Message, MessageInfo, Role};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Widget, Wrap};
 use serde_json::Value;
-use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
 use std::collections::HashMap;
 use tracing::debug;
 use unicode_width::UnicodeWidthStr;
@@ -17,6 +16,8 @@ struct MessageLine {
     from: String,
     content: String,
     timestamp: f64,
+    /// Parsed content blocks for unified rendering via block_renderer.
+    blocks: Vec<ContentBlock>,
 }
 
 /// DM mode display state
@@ -93,10 +94,13 @@ impl MessagesView {
     }
 
     pub fn push(&mut self, msg: &MessageInfo, _is_agent: bool) {
+        let blocks = Message::content_to_blocks(&msg.content);
+        debug!(from = %msg.from, block_count = blocks.len(), "push: parsed content to blocks");
         self.lines.push(MessageLine {
             from: msg.from.clone(),
             content: msg.content.clone(),
             timestamp: msg.timestamp,
+            blocks,
         });
         if self.auto_scroll {
             self.snap_to_bottom();
@@ -110,6 +114,7 @@ impl MessagesView {
             from: "系统".to_string(),
             content: content.to_string(),
             timestamp: Local::now().timestamp() as f64,
+            blocks: vec![ContentBlock::Text { text: content.to_string() }],
         });
         if self.auto_scroll {
             self.snap_to_bottom();
@@ -124,6 +129,7 @@ impl MessagesView {
             from: "系统".to_string(),
             content: content.to_string(),
             timestamp: Local::now().timestamp() as f64,
+            blocks: vec![ContentBlock::Text { text: content.to_string() }],
         });
         if self.auto_scroll {
             self.snap_to_bottom();
@@ -162,10 +168,12 @@ impl MessagesView {
             .channel_cache
             .entry(channel_id.to_string())
             .or_default();
+        let blocks = Message::content_to_blocks(&msg.content);
         cache.push(MessageLine {
             from: msg.from.clone(),
             content: msg.content.clone(),
             timestamp: msg.timestamp,
+            blocks,
         });
         *self.channel_unread.entry(channel_id.to_string()).or_insert(0) += 1;
     }
@@ -309,10 +317,12 @@ impl MessagesView {
     }
 
     pub fn push_dm(&mut self, msg: &DmMessage) {
+        let blocks = Message::content_to_blocks(&msg.content);
         self.dm_lines.push(MessageLine {
             from: msg.role.clone(),
             content: msg.content.clone(),
             timestamp: msg.timestamp as f64,
+            blocks,
         });
         // Always snap to bottom when user sends a message
         if msg.role == "user" || self.auto_scroll {
@@ -507,10 +517,12 @@ impl MessagesView {
             }
             out.push(Line::from(header));
 
-            // Content lines: render first (tool_call detection on raw content),
-            // then compact blank lines in the rendered output.
+            // Unified rendering: parse content to blocks, render collapsed via block_renderer
+            let blocks = Message::content_to_blocks(&display_content);
             let mut content_lines: Vec<Line<'static>> = Vec::new();
-            render_content_lines(&display_content, &mut content_lines);
+            for block in &blocks {
+                content_lines.extend(block_renderer::render_block_collapsed(block, width));
+            }
             compact_rendered_lines(&mut content_lines);
             out.extend(content_lines);
         }
@@ -596,9 +608,10 @@ impl MessagesView {
             let md_start = if first_line_truncated { start + 1 } else { start };
             if md_start < all_lines.len() {
                 let md_text: String = all_lines[md_start..].join("\n");
-                let mut md_lines: Vec<Line<'static>> = Vec::new();
-                render_markdown_lines(&md_text, &mut md_lines);
-                out.extend(md_lines);
+                let blocks = Message::content_to_blocks(&md_text);
+                for block in &blocks {
+                    out.extend(block_renderer::render_block(block, width));
+                }
             }
         }
 
@@ -745,7 +758,7 @@ impl MessagesView {
     }
 
     /// Build text lines from channel messages (for split-view right panel).
-    fn build_channel_text(&self, _width: u16) -> Vec<Line<'static>> {
+    fn build_channel_text(&self, width: u16) -> Vec<Line<'static>> {
         let mut out: Vec<Line<'static>> = Vec::new();
         let mut prev_timestamp: Option<f64> = None;
 
@@ -831,8 +844,12 @@ impl MessagesView {
             }
             out.push(Line::from(header));
 
+            // Unified rendering: parse content to blocks, render collapsed via block_renderer
+            let blocks = Message::content_to_blocks(&display_content);
             let mut content_lines: Vec<Line<'static>> = Vec::new();
-            render_content_lines(&display_content, &mut content_lines);
+            for block in &blocks {
+                content_lines.extend(block_renderer::render_block_collapsed(block, width));
+            }
             compact_rendered_lines(&mut content_lines);
             out.extend(content_lines);
         }
@@ -947,40 +964,6 @@ pub(crate) fn format_interval(prev: f64, curr: f64) -> String {
     }
 }
 
-pub(crate) fn highlight_mentions(text: &str) -> Vec<Span<'static>> {
-    let mut spans = Vec::new();
-    let mut rest = text;
-
-    while let Some(idx) = rest.find('@') {
-        if idx > 0 {
-            spans.push(Span::raw(rest[..idx].to_string()));
-        }
-        let after_at = &rest[idx + 1..];
-        let end = after_at
-            .find(|c: char| !c.is_alphanumeric() && c != '_' && c != '-' && c != '.')
-            .unwrap_or(after_at.len());
-        if end > 0 {
-            spans.push(Span::styled(
-                rest[idx..idx + 1 + end].to_string(),
-                Style::default()
-                    .fg(theme::MENTION)
-                    .add_modifier(Modifier::BOLD),
-            ));
-            rest = &rest[idx + 1 + end..];
-        } else {
-            spans.push(Span::raw("@".to_string()));
-            rest = after_at;
-        }
-    }
-    if !rest.is_empty() {
-        spans.push(Span::raw(rest.to_string()));
-    }
-    if spans.is_empty() {
-        spans.push(Span::raw(text.to_string()));
-    }
-    spans
-}
-
 /// Compact consecutive blank lines in rendered output (Vec<Line>).
 /// Collapses runs of empty lines to at most one, and trims trailing blanks.
 fn compact_rendered_lines(lines: &mut Vec<Line<'static>>) {
@@ -1022,422 +1005,6 @@ fn tail_by_width(s: &str, max_width: usize) -> &str {
         width += cw;
     }
     s
-}
-
-/// Detect tool_call JSON and render structured lines.
-fn try_render_tool_call(content: &str) -> Option<Vec<Line<'static>>> {
-    let trimmed = content.trim();
-    if !trimmed.starts_with('{') {
-        return None;
-    }
-    let val: Value = serde_json::from_str(trimmed).ok()?;
-    let obj = val.as_object()?;
-
-    let name = obj.get("name").and_then(|v| v.as_str())?;
-    let args = obj.get("arguments").or_else(|| obj.get("input"));
-
-    let mut lines = Vec::new();
-    lines.push(Line::from(vec![
-        Span::styled("  ⚙ ", Style::default().fg(theme::TOOL_LABEL)),
-        Span::styled(
-            name.to_string(),
-            Style::default()
-                .fg(theme::TOOL_NAME)
-                .add_modifier(Modifier::BOLD),
-        ),
-    ]));
-
-    if let Some(args_val) = args {
-        render_args(args_val, &mut lines);
-    }
-
-    Some(lines)
-}
-
-fn render_args(args_val: &Value, lines: &mut Vec<Line<'static>>) {
-    match args_val {
-        Value::Object(map) => {
-            for (k, v) in map {
-                let v_str = match v {
-                    Value::String(s) => truncate_str(s, 120),
-                    _ => truncate_str(&v.to_string(), 120),
-                };
-                lines.push(Line::from(vec![
-                    Span::styled(format!("    {}: ", k), Style::default().fg(theme::TOOL_KEY)),
-                    Span::styled(v_str, Style::default().fg(theme::TOOL_VALUE)),
-                ]));
-            }
-        }
-        Value::String(s) => {
-            if let Ok(Value::Object(map)) = serde_json::from_str::<Value>(s) {
-                for (k, v) in &map {
-                    let v_str = match v {
-                        Value::String(s) => truncate_str(s, 120),
-                        _ => truncate_str(&v.to_string(), 120),
-                    };
-                    lines.push(Line::from(vec![
-                        Span::styled(
-                            format!("    {}: ", k),
-                            Style::default().fg(theme::TOOL_KEY),
-                        ),
-                        Span::styled(v_str, Style::default().fg(theme::TOOL_VALUE)),
-                    ]));
-                }
-            } else {
-                lines.push(Line::from(Span::styled(
-                    format!("    {}", truncate_str(s, 120)),
-                    Style::default().fg(theme::TOOL_VALUE),
-                )));
-            }
-        }
-        _ => {}
-    }
-}
-
-/// Detect tool_result JSON and render as collapsed summary (first 3 lines).
-fn try_render_tool_result(content: &str) -> Option<Vec<Line<'static>>> {
-    let trimmed = content.trim();
-    if !trimmed.starts_with('{') {
-        return None;
-    }
-    let val: Value = serde_json::from_str(trimmed).ok()?;
-    let obj = val.as_object()?;
-
-    let is_result = obj
-        .get("type")
-        .and_then(|v| v.as_str())
-        .map_or(false, |t| t == "tool_result")
-        || obj.contains_key("tool_use_id");
-
-    if !is_result {
-        return None;
-    }
-
-    let mut lines = Vec::new();
-    let result_text = obj
-        .get("content")
-        .and_then(|v| v.as_str())
-        .or_else(|| obj.get("output").and_then(|v| v.as_str()))
-        .unwrap_or("");
-
-    let is_error = obj
-        .get("is_error")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-
-    let (label, label_color) = if is_error {
-        ("  ✗ 结果（错误）", ratatui::style::Color::Red)
-    } else {
-        ("  ✓ 结果", theme::TOOL_LABEL)
-    };
-    lines.push(Line::from(Span::styled(
-        label.to_string(),
-        Style::default().fg(label_color),
-    )));
-
-    let result_lines: Vec<&str> = result_text.lines().collect();
-    let show_count = result_lines.len().min(3);
-    for line in &result_lines[..show_count] {
-        lines.push(Line::from(Span::styled(
-            format!("    {}", truncate_str(line, 120)),
-            Style::default().fg(theme::TOOL_VALUE),
-        )));
-    }
-    if result_lines.len() > 3 {
-        lines.push(Line::from(Span::styled(
-            format!("    … 共 {} 行", result_lines.len()),
-            Style::default().fg(theme::TOOL_LABEL),
-        )));
-    }
-
-    Some(lines)
-}
-
-/// Render content lines with tool_call/tool_result detection and markdown support.
-fn render_content_lines(content: &str, out: &mut Vec<Line<'static>>) {
-    if let Some(tool_lines) = try_render_tool_call(content) {
-        out.extend(tool_lines);
-        return;
-    }
-    if let Some(result_lines) = try_render_tool_result(content) {
-        out.extend(result_lines);
-        return;
-    }
-    render_markdown_lines(content, out);
-}
-
-/// Parse markdown content and produce styled ratatui Lines.
-fn render_markdown_lines(content: &str, out: &mut Vec<Line<'static>>) {
-    let opts = Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TABLES;
-    let parser = Parser::new_ext(content, opts);
-
-    let mut current_spans: Vec<Span<'static>> = Vec::new();
-    let mut in_code_block = false;
-    let mut is_heading = false;
-    let mut bold = false;
-    let mut italic = false;
-    let mut list_item_pending = false;
-    // Table state
-    let mut in_table = false;
-    let mut table_row: Vec<String> = Vec::new();
-    let mut table_cell_buf = String::new();
-    let mut in_table_head = false;
-    let mut table_rows: Vec<(Vec<String>, bool)> = Vec::new(); // (cells, is_header)
-
-    for event in parser {
-        match event {
-            Event::Start(Tag::CodeBlock(_)) => {
-                // Flush current line
-                if !current_spans.is_empty() {
-                    out.push(Line::from(std::mem::take(&mut current_spans)));
-                }
-                out.push(Line::from(Span::styled(
-                    "───".to_string(),
-                    Style::default().fg(Color::DarkGray),
-                )));
-                in_code_block = true;
-            }
-            Event::End(TagEnd::CodeBlock) => {
-                // Flush last code line
-                if !current_spans.is_empty() {
-                    out.push(Line::from(std::mem::take(&mut current_spans)));
-                }
-                out.push(Line::from(Span::styled(
-                    "───".to_string(),
-                    Style::default().fg(Color::DarkGray),
-                )));
-                in_code_block = false;
-            }
-            Event::Start(Tag::Heading { .. }) => {
-                if !current_spans.is_empty() {
-                    out.push(Line::from(std::mem::take(&mut current_spans)));
-                }
-                is_heading = true;
-            }
-            Event::End(TagEnd::Heading(_)) => {
-                // Flush heading line with style
-                let text: String = current_spans
-                    .iter()
-                    .map(|s| s.content.to_string())
-                    .collect();
-                current_spans.clear();
-                out.push(Line::from(Span::styled(
-                    text,
-                    Style::default()
-                        .fg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD),
-                )));
-                is_heading = false;
-            }
-            Event::Start(Tag::Paragraph) => {
-                // Add blank line between paragraphs (if we already have output)
-                if !current_spans.is_empty() {
-                    out.push(Line::from(std::mem::take(&mut current_spans)));
-                }
-                if !out.is_empty() && !in_code_block {
-                    out.push(Line::from(""));
-                }
-            }
-            Event::End(TagEnd::Paragraph) => {
-                if !current_spans.is_empty() {
-                    out.push(Line::from(std::mem::take(&mut current_spans)));
-                }
-            }
-            Event::Start(Tag::List(_)) => {}
-            Event::End(TagEnd::List(_)) => {}
-            Event::Start(Tag::Item) => {
-                if !current_spans.is_empty() {
-                    out.push(Line::from(std::mem::take(&mut current_spans)));
-                }
-                list_item_pending = true;
-            }
-            Event::End(TagEnd::Item) => {
-                if !current_spans.is_empty() {
-                    out.push(Line::from(std::mem::take(&mut current_spans)));
-                }
-            }
-            Event::Start(Tag::Strong) => {
-                bold = true;
-            }
-            Event::End(TagEnd::Strong) => {
-                bold = false;
-            }
-            Event::Start(Tag::Emphasis) => {
-                italic = true;
-            }
-            Event::End(TagEnd::Emphasis) => {
-                italic = false;
-            }
-            // --- Table events ---
-            Event::Start(Tag::Table(_)) => {
-                if !current_spans.is_empty() {
-                    out.push(Line::from(std::mem::take(&mut current_spans)));
-                }
-                in_table = true;
-                table_rows.clear();
-            }
-            Event::End(TagEnd::Table) => {
-                in_table = false;
-                if !table_rows.is_empty() {
-                    let rendered = render_table_lines(&table_rows);
-                    out.extend(rendered);
-                }
-                table_rows.clear();
-            }
-            Event::Start(Tag::TableHead) => {
-                in_table_head = true;
-                table_row.clear();
-            }
-            Event::End(TagEnd::TableHead) => {
-                table_rows.push((std::mem::take(&mut table_row), true));
-                in_table_head = false;
-            }
-            Event::Start(Tag::TableRow) => {
-                table_row.clear();
-            }
-            Event::End(TagEnd::TableRow) => {
-                if !in_table_head {
-                    table_rows.push((std::mem::take(&mut table_row), false));
-                }
-            }
-            Event::Start(Tag::TableCell) => {
-                table_cell_buf.clear();
-            }
-            Event::End(TagEnd::TableCell) => {
-                table_row.push(std::mem::take(&mut table_cell_buf));
-            }
-            Event::Code(text) => {
-                if in_table {
-                    table_cell_buf.push_str(&text);
-                } else {
-                    current_spans.push(Span::styled(
-                        text.to_string(),
-                        Style::default().fg(Color::Yellow),
-                    ));
-                }
-            }
-            Event::Text(text) => {
-                if in_code_block {
-                    // Code block: split by newlines, each as its own line
-                    let lines: Vec<&str> = text.split('\n').collect();
-                    for (i, line) in lines.iter().enumerate() {
-                        if i > 0 {
-                            // Flush previous code line
-                            out.push(Line::from(std::mem::take(&mut current_spans)));
-                        }
-                        current_spans.push(Span::styled(
-                            line.to_string(),
-                            Style::default().fg(Color::DarkGray),
-                        ));
-                    }
-                } else if in_table {
-                    table_cell_buf.push_str(&text);
-                } else if is_heading {
-                    current_spans.push(Span::raw(text.to_string()));
-                } else {
-                    // Handle list item bullet prefix
-                    if list_item_pending {
-                        current_spans.push(Span::raw("  \u{2022} ".to_string()));
-                        list_item_pending = false;
-                    }
-                    let style = if bold && italic {
-                        Style::default()
-                            .add_modifier(Modifier::BOLD)
-                            .add_modifier(Modifier::ITALIC)
-                    } else if bold {
-                        Style::default().add_modifier(Modifier::BOLD)
-                    } else if italic {
-                        Style::default().add_modifier(Modifier::ITALIC)
-                    } else {
-                        Style::default()
-                    };
-                    // Highlight @mentions within the text
-                    if text.contains('@') && !bold && !italic {
-                        current_spans.extend(highlight_mentions(&text));
-                    } else {
-                        current_spans.push(Span::styled(text.to_string(), style));
-                    }
-                }
-            }
-            Event::SoftBreak => {
-                current_spans.push(Span::raw(" ".to_string()));
-            }
-            Event::HardBreak => {
-                out.push(Line::from(std::mem::take(&mut current_spans)));
-            }
-            _ => {}
-        }
-    }
-    // Flush remaining spans
-    if !current_spans.is_empty() {
-        out.push(Line::from(current_spans));
-    }
-}
-
-/// Render a table from collected rows into styled lines (aligned with block_renderer).
-fn render_table_lines(table_rows: &[(Vec<String>, bool)]) -> Vec<Line<'static>> {
-    let col_count = table_rows.iter().map(|(cells, _)| cells.len()).max().unwrap_or(0);
-    if col_count == 0 {
-        return Vec::new();
-    }
-
-    let mut col_widths = vec![0usize; col_count];
-    for (cells, _) in table_rows {
-        for (i, cell) in cells.iter().enumerate() {
-            if i < col_count {
-                let w = UnicodeWidthStr::width(cell.as_str());
-                col_widths[i] = col_widths[i].max(w);
-            }
-        }
-    }
-
-    let mut out = Vec::new();
-    let border_style = Style::default().fg(Color::DarkGray);
-
-    for (row_idx, (cells, is_header)) in table_rows.iter().enumerate() {
-        let mut spans: Vec<Span<'static>> = Vec::new();
-        spans.push(Span::styled("│ ", border_style));
-        for (i, cell) in cells.iter().enumerate() {
-            let target_w = if i < col_widths.len() { col_widths[i] } else { UnicodeWidthStr::width(cell.as_str()) };
-            let display_w = UnicodeWidthStr::width(cell.as_str());
-            let pad = target_w.saturating_sub(display_w);
-            let padded = format!("{}{}", cell, " ".repeat(pad));
-            let style = if *is_header {
-                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
-            } else {
-                Style::default()
-            };
-            spans.push(Span::styled(padded, style));
-            spans.push(Span::styled(" │ ", border_style));
-        }
-        out.push(Line::from(spans));
-
-        // Separator after header
-        if *is_header && row_idx == 0 {
-            let mut sep_spans: Vec<Span<'static>> = Vec::new();
-            sep_spans.push(Span::styled("├─", border_style));
-            for (i, w) in col_widths.iter().enumerate() {
-                sep_spans.push(Span::styled("─".repeat(*w), border_style));
-                if i < col_widths.len() - 1 {
-                    sep_spans.push(Span::styled("─┼─", border_style));
-                }
-            }
-            sep_spans.push(Span::styled("─┤", border_style));
-            out.push(Line::from(sep_spans));
-        }
-    }
-
-    out
-}
-
-
-fn truncate_str(s: &str, max_chars: usize) -> String {
-    if s.chars().count() <= max_chars {
-        s.to_string()
-    } else {
-        let truncated: String = s.chars().take(max_chars).collect();
-        format!("{}…", truncated)
-    }
 }
 
 fn format_tokens(n: f64) -> String {
@@ -1536,52 +1103,6 @@ mod tests {
 
         view.snap_to_bottom();
         assert!(view.auto_scroll);
-    }
-
-    #[test]
-    fn highlight_no_mentions() {
-        let spans = highlight_mentions("hello world");
-        assert_eq!(spans.len(), 1);
-        assert_eq!(spans[0].content.as_ref(), "hello world");
-    }
-
-    #[test]
-    fn highlight_single_mention() {
-        let spans = highlight_mentions("hello @alice world");
-        // Should be: "hello " + "@alice" + " world"
-        assert!(spans.len() >= 3);
-        let text: String = spans.iter().map(|s| s.content.to_string()).collect();
-        assert_eq!(text, "hello @alice world");
-    }
-
-    #[test]
-    fn highlight_mention_at_start() {
-        let spans = highlight_mentions("@bob hi");
-        let text: String = spans.iter().map(|s| s.content.to_string()).collect();
-        assert_eq!(text, "@bob hi");
-        // First span should be the mention (styled)
-        assert!(spans[0].style.fg.is_some());
-    }
-
-    #[test]
-    fn highlight_multiple_mentions() {
-        let spans = highlight_mentions("@alice @bob hello");
-        let text: String = spans.iter().map(|s| s.content.to_string()).collect();
-        assert_eq!(text, "@alice @bob hello");
-    }
-
-    #[test]
-    fn highlight_mention_with_special_chars() {
-        let spans = highlight_mentions("@agent-1 @my_bot done");
-        let text: String = spans.iter().map(|s| s.content.to_string()).collect();
-        assert_eq!(text, "@agent-1 @my_bot done");
-    }
-
-    #[test]
-    fn highlight_bare_at_sign() {
-        let spans = highlight_mentions("email@ test");
-        let text: String = spans.iter().map(|s| s.content.to_string()).collect();
-        assert_eq!(text, "email@ test");
     }
 
     #[test]

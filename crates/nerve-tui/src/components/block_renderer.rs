@@ -35,9 +35,18 @@ static CODE_THEME: LazyLock<Theme> = LazyLock::new(|| {
         .unwrap_or_else(|| ts.themes["base16-ocean.dark"].clone())
 });
 
-/// Render any ContentBlock to styled lines (always shows full content).
+/// Render any ContentBlock to styled lines (full expanded view).
 pub fn render_block(block: &ContentBlock, width: u16) -> Vec<Line<'static>> {
-    debug!(block_type = block.kind(), width, "rendering content block");
+    render_block_inner(block, width, false)
+}
+
+/// Render any ContentBlock in collapsed mode (one-line summary for thinking/tool_call/tool_result).
+pub fn render_block_collapsed(block: &ContentBlock, width: u16) -> Vec<Line<'static>> {
+    render_block_inner(block, width, true)
+}
+
+fn render_block_inner(block: &ContentBlock, width: u16, collapsed: bool) -> Vec<Line<'static>> {
+    debug!(block_type = block.kind(), width, collapsed, "rendering content block");
     match block {
         ContentBlock::Text { text } => render_text(text, width),
         ContentBlock::Thinking { text, started_at, finished_at } => {
@@ -46,13 +55,13 @@ pub fn render_block(block: &ContentBlock, width: u16) -> Vec<Line<'static>> {
                 (Some(s), None) => Some(s.elapsed()),
                 _ => None,
             };
-            render_thinking(text, elapsed)
+            render_thinking(text, elapsed, collapsed)
         }
         ContentBlock::ToolCall { id: _, name, input, status } => {
-            render_tool_call(name, input, status)
+            render_tool_call(name, input, status, collapsed)
         }
         ContentBlock::ToolResult { tool_call_id: _, content, is_error } => {
-            render_tool_result(content, *is_error)
+            render_tool_result(content, *is_error, collapsed)
         }
         ContentBlock::Error { message } => render_error(message),
     }
@@ -185,7 +194,12 @@ fn render_markdown(content: &str, out: &mut Vec<Line<'static>>) {
                         (false, true) => Style::default().add_modifier(Modifier::ITALIC),
                         _ => Style::default(),
                     };
-                    current_spans.push(Span::styled(text.to_string(), style));
+                    // Highlight @mentions in unstyled text
+                    if text.contains('@') && !bold && !italic {
+                        current_spans.extend(highlight_mentions(&text));
+                    } else {
+                        current_spans.push(Span::styled(text.to_string(), style));
+                    }
                 }
             }
             Event::SoftBreak => {
@@ -376,7 +390,7 @@ fn syntect_style_to_ratatui(syn: SynStyle) -> Style {
 // Thinking block: collapsed by default, shows timer
 // ---------------------------------------------------------------------------
 
-fn render_thinking(text: &str, elapsed: Option<std::time::Duration>) -> Vec<Line<'static>> {
+fn render_thinking(text: &str, elapsed: Option<std::time::Duration>, collapsed: bool) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
 
     let timer = elapsed
@@ -391,11 +405,13 @@ fn render_thinking(text: &str, elapsed: Option<std::time::Duration>) -> Vec<Line
             .add_modifier(Modifier::ITALIC),
     )));
 
-    for line in text.lines() {
-        lines.push(Line::from(Span::styled(
-            format!("  │ {}", line),
-            Style::default().fg(Color::DarkGray),
-        )));
+    if !collapsed {
+        for line in text.lines() {
+            lines.push(Line::from(Span::styled(
+                format!("  │ {}", line),
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
     }
 
     lines
@@ -405,7 +421,7 @@ fn render_thinking(text: &str, elapsed: Option<std::time::Duration>) -> Vec<Line
 // ToolCall block: tool name + status icon + collapsible args
 // ---------------------------------------------------------------------------
 
-fn render_tool_call(name: &str, input: &str, status: &ToolStatus) -> Vec<Line<'static>> {
+fn render_tool_call(name: &str, input: &str, status: &ToolStatus, collapsed: bool) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
 
     let (icon, icon_color) = match status {
@@ -415,7 +431,7 @@ fn render_tool_call(name: &str, input: &str, status: &ToolStatus) -> Vec<Line<'s
         ToolStatus::Failed => ("✗", Color::Red),
     };
 
-    debug!(tool_name = name, ?status, "rendering tool_call block");
+    debug!(tool_name = name, ?status, collapsed, "rendering tool_call block");
 
     // Header: icon + tool name
     lines.push(Line::from(vec![
@@ -428,8 +444,8 @@ fn render_tool_call(name: &str, input: &str, status: &ToolStatus) -> Vec<Line<'s
         ),
     ]));
 
-    // Always show input args when block is rendered
-    if !input.is_empty() {
+    // Show input args only when expanded
+    if !collapsed && !input.is_empty() {
         if let Ok(val) = serde_json::from_str::<serde_json::Value>(input) {
             if let Some(obj) = val.as_object() {
                 for (k, v) in obj {
@@ -464,11 +480,16 @@ fn render_tool_call(name: &str, input: &str, status: &ToolStatus) -> Vec<Line<'s
 // ToolResult block: shows result content with error styling
 // ---------------------------------------------------------------------------
 
-fn render_tool_result(content: &str, is_error: bool) -> Vec<Line<'static>> {
+fn render_tool_result(content: &str, is_error: bool, collapsed: bool) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
+
+    let content_lines: Vec<&str> = content.lines().collect();
+    let line_count = content_lines.len();
 
     let (label, label_color) = if is_error {
         ("  ✗ 结果（错误）".to_string(), Color::Red)
+    } else if collapsed && line_count > 3 {
+        (format!("  ✓ 结果 ({} 行)", line_count), theme::TOOL_LABEL)
     } else {
         ("  ✓ 结果".to_string(), theme::TOOL_LABEL)
     };
@@ -484,11 +505,22 @@ fn render_tool_result(content: &str, is_error: bool) -> Vec<Line<'static>> {
         theme::TOOL_VALUE
     };
 
-    for line in content.lines() {
-        lines.push(Line::from(Span::styled(
-            format!("    {}", line),
-            Style::default().fg(content_color),
-        )));
+    if collapsed {
+        // Show first 3 lines when collapsed
+        let show_count = line_count.min(3);
+        for line in &content_lines[..show_count] {
+            lines.push(Line::from(Span::styled(
+                format!("    {}", line),
+                Style::default().fg(content_color),
+            )));
+        }
+    } else {
+        for line in content.lines() {
+            lines.push(Line::from(Span::styled(
+                format!("    {}", line),
+                Style::default().fg(content_color),
+            )));
+        }
     }
 
     lines
@@ -508,6 +540,42 @@ fn render_error(message: &str) -> Vec<Line<'static>> {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Highlight @mentions in text, returning styled spans.
+/// Non-mention text gets default style, @name gets MENTION color + bold.
+pub(crate) fn highlight_mentions(text: &str) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    let mut rest = text;
+
+    while let Some(idx) = rest.find('@') {
+        if idx > 0 {
+            spans.push(Span::raw(rest[..idx].to_string()));
+        }
+        let after_at = &rest[idx + 1..];
+        let end = after_at
+            .find(|c: char| !c.is_alphanumeric() && c != '_' && c != '-' && c != '.')
+            .unwrap_or(after_at.len());
+        if end > 0 {
+            spans.push(Span::styled(
+                rest[idx..idx + 1 + end].to_string(),
+                Style::default()
+                    .fg(theme::MENTION)
+                    .add_modifier(Modifier::BOLD),
+            ));
+            rest = &rest[idx + 1 + end..];
+        } else {
+            spans.push(Span::raw("@".to_string()));
+            rest = after_at;
+        }
+    }
+    if !rest.is_empty() {
+        spans.push(Span::raw(rest.to_string()));
+    }
+    if spans.is_empty() {
+        spans.push(Span::raw(text.to_string()));
+    }
+    spans
+}
 
 #[cfg(test)]
 mod tests {
@@ -617,7 +685,7 @@ mod tests {
     #[test]
     fn thinking_with_elapsed() {
         let elapsed = Some(Duration::from_secs_f64(2.5));
-        let lines = render_thinking("I need to check the file...", elapsed);
+        let lines = render_thinking("I need to check the file...", elapsed, false);
         let text: String = lines.iter()
             .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
             .collect();
@@ -628,7 +696,7 @@ mod tests {
 
     #[test]
     fn thinking_no_elapsed() {
-        let lines = render_thinking("step 1", None);
+        let lines = render_thinking("step 1", None, false);
         let text: String = lines.iter()
             .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
             .collect();
@@ -638,7 +706,7 @@ mod tests {
     #[test]
     fn thinking_shows_all_content() {
         let long = (0..10).map(|i| format!("line {}", i)).collect::<Vec<_>>().join("\n");
-        let lines = render_thinking(&long, Some(Duration::from_secs(1)));
+        let lines = render_thinking(&long, Some(Duration::from_secs(1)), false);
         // Header + 10 content lines = 11
         assert_eq!(lines.len(), 11);
         let text: String = lines.iter()
@@ -653,7 +721,7 @@ mod tests {
 
     #[test]
     fn tool_call_pending() {
-        let lines = render_tool_call("Read", "{}", &ToolStatus::Pending);
+        let lines = render_tool_call("Read", "{}", &ToolStatus::Pending, false);
         let text: String = lines.iter()
             .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
             .collect();
@@ -663,7 +731,7 @@ mod tests {
 
     #[test]
     fn tool_call_completed() {
-        let lines = render_tool_call("Edit", "{}", &ToolStatus::Completed);
+        let lines = render_tool_call("Edit", "{}", &ToolStatus::Completed, false);
         let text: String = lines.iter()
             .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
             .collect();
@@ -673,7 +741,7 @@ mod tests {
 
     #[test]
     fn tool_call_failed() {
-        let lines = render_tool_call("Bash", "{}", &ToolStatus::Failed);
+        let lines = render_tool_call("Bash", "{}", &ToolStatus::Failed, false);
         let text: String = lines.iter()
             .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
             .collect();
@@ -683,7 +751,7 @@ mod tests {
     #[test]
     fn tool_call_shows_all_args() {
         let input = r#"{"path": "/tmp/test.rs", "content": "fn main() {}"}"#;
-        let lines = render_tool_call("Write", input, &ToolStatus::Running);
+        let lines = render_tool_call("Write", input, &ToolStatus::Running, false);
         let text: String = lines.iter()
             .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
             .collect();
@@ -695,7 +763,7 @@ mod tests {
     #[test]
     fn tool_call_many_args_all_shown() {
         let input = r#"{"a":"1","b":"2","c":"3","d":"4","e":"5"}"#;
-        let lines = render_tool_call("Foo", input, &ToolStatus::Pending);
+        let lines = render_tool_call("Foo", input, &ToolStatus::Pending, false);
         let text: String = lines.iter()
             .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
             .collect();
@@ -709,7 +777,7 @@ mod tests {
 
     #[test]
     fn tool_result_success_shows_content() {
-        let lines = render_tool_result("file1.txt\nfile2.txt", false);
+        let lines = render_tool_result("file1.txt\nfile2.txt", false, false);
         let text: String = lines.iter()
             .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
             .collect();
@@ -721,7 +789,7 @@ mod tests {
 
     #[test]
     fn tool_result_error_shows_content() {
-        let lines = render_tool_result("command not found", true);
+        let lines = render_tool_result("command not found", true, false);
         let text: String = lines.iter()
             .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
             .collect();
@@ -737,7 +805,7 @@ mod tests {
     #[test]
     fn tool_result_long_shows_all() {
         let content = (0..10).map(|i| format!("line {}", i)).collect::<Vec<_>>().join("\n");
-        let lines = render_tool_result(&content, false);
+        let lines = render_tool_result(&content, false, false);
         // Header + 10 content lines = 11
         assert_eq!(lines.len(), 11);
     }
@@ -745,7 +813,7 @@ mod tests {
     #[test]
     fn tool_result_always_shows_all() {
         let content = (0..10).map(|i| format!("line {}", i)).collect::<Vec<_>>().join("\n");
-        let lines = render_tool_result(&content, false);
+        let lines = render_tool_result(&content, false, false);
         let text: String = lines.iter()
             .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
             .collect();
@@ -991,5 +1059,155 @@ mod tests {
         let body_w = UnicodeWidthStr::width(body_text.as_str());
         assert_eq!(header_w, body_w,
             "header and body should have same display width: header={}, body={}", header_w, body_w);
+    }
+
+    // --- @mention highlighting tests ---
+
+    #[test]
+    fn mention_highlight_single() {
+        let spans = highlight_mentions("hello @alice world");
+        assert_eq!(spans.len(), 3);
+        assert_eq!(spans[0].content.as_ref(), "hello ");
+        assert_eq!(spans[1].content.as_ref(), "@alice");
+        assert_eq!(spans[1].style.fg, Some(theme::MENTION));
+        assert!(spans[1].style.add_modifier.contains(Modifier::BOLD));
+        assert_eq!(spans[2].content.as_ref(), " world");
+    }
+
+    #[test]
+    fn mention_highlight_at_start() {
+        let spans = highlight_mentions("@bob hi");
+        assert_eq!(spans[0].content.as_ref(), "@bob");
+        assert_eq!(spans[0].style.fg, Some(theme::MENTION));
+    }
+
+    #[test]
+    fn mention_highlight_multiple() {
+        let spans = highlight_mentions("@alice and @bob");
+        let mention_count = spans.iter().filter(|s| s.style.fg == Some(theme::MENTION)).count();
+        assert_eq!(mention_count, 2);
+    }
+
+    #[test]
+    fn mention_highlight_bare_at() {
+        let spans = highlight_mentions("email@ test");
+        // bare @ with no following alphanumeric
+        let text: String = spans.iter().map(|s| s.content.to_string()).collect();
+        assert!(text.contains("@"));
+    }
+
+    #[test]
+    fn mention_highlight_no_mention() {
+        let spans = highlight_mentions("no mentions here");
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].content.as_ref(), "no mentions here");
+    }
+
+    #[test]
+    fn mention_in_markdown_text() {
+        // Verify @mention highlighting works through render_text
+        let lines = render_text("Hello @alice, check this", 80);
+        let all_spans: Vec<&Span> = lines.iter().flat_map(|l| l.spans.iter()).collect();
+        let mention = all_spans.iter().find(|s| s.content.as_ref() == "@alice");
+        assert!(mention.is_some(), "should find @alice span");
+        assert_eq!(mention.unwrap().style.fg, Some(theme::MENTION));
+    }
+
+    // --- Collapsed rendering tests ---
+
+    #[test]
+    fn thinking_collapsed_shows_header_only() {
+        let elapsed = Some(Duration::from_secs_f64(2.5));
+        let lines = render_thinking("line 1\nline 2\nline 3", elapsed, true);
+        // Collapsed: only header, no content lines
+        assert_eq!(lines.len(), 1);
+        let text = lines_to_text(&lines);
+        assert!(text.contains("思考中"));
+        assert!(text.contains("2.5s"));
+        assert!(!text.contains("line 1"));
+    }
+
+    #[test]
+    fn thinking_expanded_shows_all() {
+        let elapsed = Some(Duration::from_secs_f64(1.0));
+        let lines = render_thinking("line 1\nline 2", elapsed, false);
+        // Expanded: header + 2 content lines = 3
+        assert_eq!(lines.len(), 3);
+        let text = lines_to_text(&lines);
+        assert!(text.contains("line 1"));
+        assert!(text.contains("line 2"));
+    }
+
+    #[test]
+    fn tool_call_collapsed_shows_header_only() {
+        let input = r#"{"path": "/tmp/test.rs", "content": "fn main() {}"}"#;
+        let lines = render_tool_call("Write", input, &ToolStatus::Completed, true);
+        // Collapsed: only header line (icon + name), no args
+        assert_eq!(lines.len(), 1);
+        let text = lines_to_text(&lines);
+        assert!(text.contains("Write"));
+        assert!(!text.contains("path"));
+    }
+
+    #[test]
+    fn tool_call_expanded_shows_args() {
+        let input = r#"{"path": "/tmp/test.rs"}"#;
+        let lines = render_tool_call("Write", input, &ToolStatus::Completed, false);
+        // Expanded: header + 1 arg = 2
+        assert_eq!(lines.len(), 2);
+        let text = lines_to_text(&lines);
+        assert!(text.contains("path"));
+    }
+
+    #[test]
+    fn tool_result_collapsed_shows_first_3_lines() {
+        let content = (0..10).map(|i| format!("line {}", i)).collect::<Vec<_>>().join("\n");
+        let lines = render_tool_result(&content, false, true);
+        // Collapsed: header + 3 content lines = 4
+        assert_eq!(lines.len(), 4);
+        let text = lines_to_text(&lines);
+        assert!(text.contains("line 0"));
+        assert!(text.contains("line 2"));
+        assert!(!text.contains("line 3"));
+        assert!(text.contains("10 行")); // line count in header
+    }
+
+    #[test]
+    fn tool_result_collapsed_short_shows_all() {
+        let lines = render_tool_result("ok", false, true);
+        // Short content: header + 1 line = 2
+        assert_eq!(lines.len(), 2);
+    }
+
+    #[test]
+    fn tool_result_expanded_shows_all() {
+        let content = (0..10).map(|i| format!("line {}", i)).collect::<Vec<_>>().join("\n");
+        let lines = render_tool_result(&content, false, false);
+        // Expanded: header + 10 lines = 11
+        assert_eq!(lines.len(), 11);
+    }
+
+    #[test]
+    fn render_block_collapsed_dispatches() {
+        let block = ContentBlock::Thinking {
+            text: "long thought\nsecond line".into(),
+            started_at: Some(Instant::now()),
+            finished_at: Some(Instant::now()),
+        };
+        let lines = render_block_collapsed(&block, 80);
+        // Should be collapsed: only header
+        assert_eq!(lines.len(), 1);
+        let text = lines_to_text(&lines);
+        assert!(text.contains("思考中"));
+        assert!(!text.contains("long thought"));
+    }
+
+    #[test]
+    fn render_block_collapsed_text_unchanged() {
+        // Text blocks are not affected by collapsed flag
+        let block = ContentBlock::Text { text: "hello world".into() };
+        let expanded = render_block(&block, 80);
+        let collapsed = render_block_collapsed(&block, 80);
+        assert_eq!(expanded.len(), collapsed.len());
     }
 }

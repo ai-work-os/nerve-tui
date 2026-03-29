@@ -1507,12 +1507,21 @@ impl App {
             }
         }
 
-        // In DM mode, ignore streaming from non-active nodes
-        if is_dm_active && !in_dm {
-            debug!(
-                "node.update from {} ignored (DM active for different node)",
-                name
-            );
+        // Channel view: node.update should not render into message area.
+        // Channel messages arrive via channel.message events only.
+        // In DM mode: only process updates from the active DM node.
+        if !in_dm {
+            if is_dm_active {
+                debug!(
+                    "node.update from {} ignored (DM active for different node)",
+                    name
+                );
+            } else {
+                debug!(
+                    "node.update from {} ignored (channel view, not in DM)",
+                    name
+                );
+            }
             return;
         }
 
@@ -1861,6 +1870,13 @@ impl App {
     }
 
     async fn join_channel(&mut self, channel_id: &str) {
+        // Ensure DM is fully closed before entering channel view.
+        // This guarantees node subscriptions are cleaned up — channel view
+        // should only receive channel.message events, never node.update.
+        if self.active_dm.is_some() {
+            self.exit_dm().await;
+        }
+
         // Save current channel messages to cache before switching
         if let Some(ref old_id) = self.active_channel.clone() {
             if old_id != channel_id {
