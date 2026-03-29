@@ -18,6 +18,7 @@ pub struct NodeInfo {
     #[serde(default)]
     pub transport: String,
     pub adapter: Option<String>,
+    pub activity: Option<String>,
     #[serde(default)]
     pub channels: Vec<String>,
     #[serde(default)]
@@ -609,6 +610,7 @@ mod tests {
             permissions: "operator".into(),
             transport: "websocket".into(),
             adapter: None,
+            activity: None,
             channels: vec![],
             created_at: 0.0,
             last_active_at: 0.0,

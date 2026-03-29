@@ -366,10 +366,16 @@ impl InputBox {
         self.selected = None;
     }
 
-    /// Auto-show completion popup when typing `/` or `@` prefixed words.
+    /// Auto-show completion popup when typing `/` or `@` prefixed words,
+    /// or after command keywords like `/dm `.
     fn auto_complete(&mut self) {
         let word = self.current_word();
-        if word.starts_with('/') || word.starts_with('@') {
+        let before = &self.text[..self.cursor_pos];
+        let has_cmd_context = word.is_empty() && {
+            let t = before.trim_end();
+            t == "/dm" || t == "/stop" || t == "/cancel" || t == "/add" || t == "/split"
+        };
+        if word.starts_with('/') || word.starts_with('@') || has_cmd_context {
             self.build_candidates();
             if self.candidates.is_empty() {
                 self.dismiss_popup();
@@ -384,10 +390,56 @@ impl InputBox {
 
     fn build_candidates(&mut self) {
         let word = self.current_word().to_lowercase();
+        let before = &self.text[..self.cursor_pos];
+
+        // Context-aware: if input starts with a command that takes a specific argument type,
+        // filter candidates to only show relevant items.
+        let context_prefix = if word.is_empty() {
+            let trimmed = before.trim_end();
+            if trimmed == "/dm" {
+                // After /dm: show agent names (bare and @ prefix)
+                Some("agent")
+            } else if trimmed == "/stop" || trimmed == "/cancel" {
+                // After /stop, /cancel: show bare agent names only
+                Some("bare_agent")
+            } else if trimmed == "/add" {
+                // After /add: show adapter names
+                Some("adapter")
+            } else if trimmed == "/split" {
+                // After /split: show @agent names
+                Some("@")
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         self.candidates = self
             .completions
             .iter()
-            .filter(|c| c.to_lowercase().starts_with(&word))
+            .filter(|c| {
+                let cl = c.to_lowercase();
+                match context_prefix {
+                    Some("agent") => {
+                        // Show agent names (not commands, not adapters)
+                        !c.starts_with('/') && cl.starts_with(&word)
+                    }
+                    Some("bare_agent") => {
+                        // Show bare agent names only (no @ prefix, no commands)
+                        !c.starts_with('/') && !c.starts_with('@') && cl.starts_with(&word)
+                    }
+                    Some("adapter") => {
+                        // Show adapter names only
+                        !c.starts_with('/') && !c.starts_with('@') && cl.starts_with(&word)
+                    }
+                    Some("@") => {
+                        // Show @agent names
+                        c.starts_with('@') && cl.starts_with(&word)
+                    }
+                    _ => cl.starts_with(&word),
+                }
+            })
             .cloned()
             .collect();
     }

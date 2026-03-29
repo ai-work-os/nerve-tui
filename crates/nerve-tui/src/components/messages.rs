@@ -1,7 +1,7 @@
 use crate::theme;
-use crate::components::block_renderer::{self, BlockRenderOpts};
+use crate::components::block_renderer;
 use chrono::{Local, TimeZone};
-use nerve_tui_protocol::{ContentBlock, DmMessage, Message, MessageInfo, Role};
+use nerve_tui_protocol::{DmMessage, Message, MessageInfo, Role};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
@@ -53,9 +53,6 @@ pub struct MessagesView {
     channel_unread: HashMap<String, usize>,
     /// Blink tick counter for streaming cursor (toggles every ~500ms)
     blink_tick: u16,
-    /// Per-block expand state: (message_id, block_index) -> expanded.
-    /// Default (missing) = collapsed for tool/thinking blocks.
-    block_expand: HashMap<(String, usize), bool>,
 }
 
 impl MessagesView {
@@ -75,45 +72,6 @@ impl MessagesView {
             channel_cache: HashMap::new(),
             channel_unread: HashMap::new(),
             blink_tick: 0,
-            block_expand: HashMap::new(),
-        }
-    }
-
-    /// Toggle expand/collapse for a specific block in a streaming message.
-    /// `agent_name` identifies the streaming message, `block_index` the block within it.
-    pub fn toggle_streaming_block(&mut self, agent_name: &str, block_index: usize) -> bool {
-        if let Some(msg) = self.streaming_messages.get(agent_name) {
-            let key = (msg.id.clone(), block_index);
-            let current = self.block_expand.get(&key).copied().unwrap_or(false);
-            let new_state = !current;
-            self.block_expand.insert(key, new_state);
-            new_state
-        } else {
-            false
-        }
-    }
-
-    /// Toggle all collapsible blocks in all active streaming messages.
-    /// If any is collapsed, expand all; otherwise collapse all.
-    pub fn toggle_all_streaming_blocks(&mut self) {
-        let collapsible: Vec<(String, usize)> = self.streaming_messages.iter()
-            .flat_map(|(_, msg)| {
-                msg.blocks.iter().enumerate()
-                    .filter(|(_, b)| matches!(b, ContentBlock::Thinking { .. } | ContentBlock::ToolCall { .. } | ContentBlock::ToolResult { .. }))
-                    .map(|(i, _)| (msg.id.clone(), i))
-            })
-            .collect();
-
-        if collapsible.is_empty() {
-            return;
-        }
-
-        let any_collapsed = collapsible.iter().any(|key| {
-            !self.block_expand.get(key).copied().unwrap_or(false)
-        });
-
-        for key in collapsible {
-            self.block_expand.insert(key, any_collapsed);
         }
     }
 
@@ -128,6 +86,10 @@ impl MessagesView {
     /// Whether the streaming cursor is currently in the visible phase.
     pub fn cursor_visible(&self) -> bool {
         (self.blink_tick / 15) % 2 == 0
+    }
+
+    pub fn line_count(&self) -> usize {
+        self.lines.len()
     }
 
     pub fn push(&mut self, msg: &MessageInfo, _is_agent: bool) {
@@ -145,6 +107,20 @@ impl MessagesView {
 
     pub fn push_system(&mut self, content: &str) {
         self.lines.push(MessageLine {
+            from: "系统".to_string(),
+            content: content.to_string(),
+            timestamp: Local::now().timestamp() as f64,
+        });
+        if self.auto_scroll {
+            self.snap_to_bottom();
+        } else {
+            self.has_new_messages = true;
+        }
+    }
+
+    /// Push a system message to the DM view (visible when in DM mode).
+    pub fn push_dm_system(&mut self, content: &str) {
+        self.dm_lines.push(MessageLine {
             from: "系统".to_string(),
             content: content.to_string(),
             timestamp: Local::now().timestamp() as f64,
@@ -385,20 +361,11 @@ impl MessagesView {
         block.render(area, buf);
 
         let text_lines = self.build_text(inner.width);
-        // Estimate visual lines after soft-wrap (use u32 to avoid overflow)
-        let width = inner.width.max(1) as usize;
-        let total_visual_u32: u32 = text_lines
-            .iter()
-            .map(|line| {
-                let line_width: usize = line.spans.iter().map(|s| UnicodeWidthStr::width(s.content.as_ref())).sum();
-                if line_width == 0 {
-                    1u32
-                } else {
-                    ((line_width + width - 1) / width) as u32
-                }
-            })
-            .sum();
-        let total_visual = total_visual_u32.min(u16::MAX as u32) as u16;
+        // Use ratatui's own line_count to get exact wrapped line count,
+        // avoiding discrepancies between manual estimation and Paragraph::wrap.
+        let para = Paragraph::new(text_lines)
+            .wrap(Wrap { trim: false });
+        let total_visual = (para.line_count(inner.width) as u32).min(u16::MAX as u32) as u16;
         let max_offset = total_visual.saturating_sub(self.visible_height);
 
         if self.auto_scroll {
@@ -412,9 +379,7 @@ impl MessagesView {
             }
         }
 
-        let para = Paragraph::new(text_lines)
-            .scroll((self.scroll_offset, 0))
-            .wrap(Wrap { trim: false });
+        let para = para.scroll((self.scroll_offset, 0));
         para.render(inner, buf);
 
         // "New messages" indicator when scrolled up
@@ -567,17 +532,24 @@ impl MessagesView {
             // Try structured rendering first (new pipeline)
             if let Some(msg) = self.streaming_messages.get(name) {
                 if !msg.blocks.is_empty() {
-                    for (bi, block) in msg.blocks.iter().enumerate() {
-                        let expanded = self.block_expand
-                            .get(&(msg.id.clone(), bi))
-                            .copied()
-                            .unwrap_or(false);
-                        let opts = BlockRenderOpts { expanded };
-                        let rendered = block_renderer::render_block_with_opts(block, width, opts);
+                    debug!(
+                        "streaming render: {} using structured pipeline, {} blocks",
+                        name, msg.blocks.len()
+                    );
+                    for block in &msg.blocks {
+                        let rendered = block_renderer::render_block(block, width);
                         out.extend(rendered);
                     }
                     continue;
+                } else {
+                    debug!("streaming render: {} has structured msg but 0 blocks, falling through", name);
                 }
+            } else {
+                debug!(
+                    "streaming render: {} not in streaming_messages (keys: [{}]), using text fallback",
+                    name,
+                    self.streaming_messages.keys().cloned().collect::<Vec<_>>().join(", ")
+                );
             }
 
             // Fallback: old string-based streaming rendering
@@ -708,23 +680,9 @@ impl MessagesView {
         // Build text from channel lines (self.lines)
         let text_lines = self.build_channel_text(inner.width);
 
-        let width = inner.width.max(1) as usize;
-        let total_visual_u32: u32 = text_lines
-            .iter()
-            .map(|line| {
-                let line_width: usize = line
-                    .spans
-                    .iter()
-                    .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
-                    .sum();
-                if line_width == 0 {
-                    1u32
-                } else {
-                    ((line_width + width - 1) / width) as u32
-                }
-            })
-            .sum();
-        let total_visual = total_visual_u32.min(u16::MAX as u32) as u16;
+        let para = Paragraph::new(text_lines)
+            .wrap(Wrap { trim: false });
+        let total_visual = (para.line_count(inner.width) as u32).min(u16::MAX as u32) as u16;
         let max_offset = total_visual.saturating_sub(state.visible_height);
 
         if state.auto_scroll {
@@ -736,9 +694,53 @@ impl MessagesView {
             }
         }
 
+        let para = para.scroll((state.scroll_offset, 0));
+        para.render(inner, buf);
+    }
+
+    /// Render raw text content in the split-view right panel (for node output).
+    pub fn render_text_panel(
+        &self,
+        title: &str,
+        content: &str,
+        state: &mut ChannelPanelState,
+        focused: bool,
+        area: Rect,
+        buf: &mut Buffer,
+    ) {
+        let title = format!(" {} ", title);
+        let border_color = if focused { theme::BORDER } else { theme::TIMESTAMP };
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(border_color))
+            .title(title)
+            .title_style(Style::default().fg(border_color));
+
+        let inner = block.inner(area);
+        state.visible_height = inner.height;
+        block.render(area, buf);
+
+        let text_lines: Vec<Line<'static>> = content
+            .lines()
+            .map(|l| Line::from(l.to_string()))
+            .collect();
+
         let para = Paragraph::new(text_lines)
-            .scroll((state.scroll_offset, 0))
             .wrap(Wrap { trim: false });
+        let total_visual = (para.line_count(inner.width) as u32).min(u16::MAX as u32) as u16;
+        let max_offset = total_visual.saturating_sub(state.visible_height);
+
+        if state.auto_scroll {
+            state.scroll_offset = max_offset;
+        } else {
+            state.scroll_offset = state.scroll_offset.min(max_offset);
+            if state.scroll_offset >= max_offset {
+                state.auto_scroll = true;
+            }
+        }
+
+        let para = para.scroll((state.scroll_offset, 0));
         para.render(inner, buf);
     }
 
@@ -1166,7 +1168,7 @@ fn render_content_lines(content: &str, out: &mut Vec<Line<'static>>) {
 
 /// Parse markdown content and produce styled ratatui Lines.
 fn render_markdown_lines(content: &str, out: &mut Vec<Line<'static>>) {
-    let opts = Options::ENABLE_STRIKETHROUGH;
+    let opts = Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TABLES;
     let parser = Parser::new_ext(content, opts);
 
     let mut current_spans: Vec<Span<'static>> = Vec::new();
@@ -1175,6 +1177,12 @@ fn render_markdown_lines(content: &str, out: &mut Vec<Line<'static>>) {
     let mut bold = false;
     let mut italic = false;
     let mut list_item_pending = false;
+    // Table state
+    let mut in_table = false;
+    let mut table_row: Vec<String> = Vec::new();
+    let mut table_cell_buf = String::new();
+    let mut in_table_head = false;
+    let mut table_rows: Vec<(Vec<String>, bool)> = Vec::new(); // (cells, is_header)
 
     for event in parser {
         match event {
@@ -1260,11 +1268,53 @@ fn render_markdown_lines(content: &str, out: &mut Vec<Line<'static>>) {
             Event::End(TagEnd::Emphasis) => {
                 italic = false;
             }
+            // --- Table events ---
+            Event::Start(Tag::Table(_)) => {
+                if !current_spans.is_empty() {
+                    out.push(Line::from(std::mem::take(&mut current_spans)));
+                }
+                in_table = true;
+                table_rows.clear();
+            }
+            Event::End(TagEnd::Table) => {
+                in_table = false;
+                if !table_rows.is_empty() {
+                    let rendered = render_table_lines(&table_rows);
+                    out.extend(rendered);
+                }
+                table_rows.clear();
+            }
+            Event::Start(Tag::TableHead) => {
+                in_table_head = true;
+                table_row.clear();
+            }
+            Event::End(TagEnd::TableHead) => {
+                table_rows.push((std::mem::take(&mut table_row), true));
+                in_table_head = false;
+            }
+            Event::Start(Tag::TableRow) => {
+                table_row.clear();
+            }
+            Event::End(TagEnd::TableRow) => {
+                if !in_table_head {
+                    table_rows.push((std::mem::take(&mut table_row), false));
+                }
+            }
+            Event::Start(Tag::TableCell) => {
+                table_cell_buf.clear();
+            }
+            Event::End(TagEnd::TableCell) => {
+                table_row.push(std::mem::take(&mut table_cell_buf));
+            }
             Event::Code(text) => {
-                current_spans.push(Span::styled(
-                    text.to_string(),
-                    Style::default().fg(Color::Yellow),
-                ));
+                if in_table {
+                    table_cell_buf.push_str(&text);
+                } else {
+                    current_spans.push(Span::styled(
+                        text.to_string(),
+                        Style::default().fg(Color::Yellow),
+                    ));
+                }
             }
             Event::Text(text) => {
                 if in_code_block {
@@ -1280,6 +1330,8 @@ fn render_markdown_lines(content: &str, out: &mut Vec<Line<'static>>) {
                             Style::default().fg(Color::DarkGray),
                         ));
                     }
+                } else if in_table {
+                    table_cell_buf.push_str(&text);
                 } else if is_heading {
                     current_spans.push(Span::raw(text.to_string()));
                 } else {
@@ -1320,6 +1372,62 @@ fn render_markdown_lines(content: &str, out: &mut Vec<Line<'static>>) {
     if !current_spans.is_empty() {
         out.push(Line::from(current_spans));
     }
+}
+
+/// Render a table from collected rows into styled lines (aligned with block_renderer).
+fn render_table_lines(table_rows: &[(Vec<String>, bool)]) -> Vec<Line<'static>> {
+    let col_count = table_rows.iter().map(|(cells, _)| cells.len()).max().unwrap_or(0);
+    if col_count == 0 {
+        return Vec::new();
+    }
+
+    let mut col_widths = vec![0usize; col_count];
+    for (cells, _) in table_rows {
+        for (i, cell) in cells.iter().enumerate() {
+            if i < col_count {
+                let w = UnicodeWidthStr::width(cell.as_str());
+                col_widths[i] = col_widths[i].max(w);
+            }
+        }
+    }
+
+    let mut out = Vec::new();
+    let border_style = Style::default().fg(Color::DarkGray);
+
+    for (row_idx, (cells, is_header)) in table_rows.iter().enumerate() {
+        let mut spans: Vec<Span<'static>> = Vec::new();
+        spans.push(Span::styled("│ ", border_style));
+        for (i, cell) in cells.iter().enumerate() {
+            let target_w = if i < col_widths.len() { col_widths[i] } else { UnicodeWidthStr::width(cell.as_str()) };
+            let display_w = UnicodeWidthStr::width(cell.as_str());
+            let pad = target_w.saturating_sub(display_w);
+            let padded = format!("{}{}", cell, " ".repeat(pad));
+            let style = if *is_header {
+                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            };
+            spans.push(Span::styled(padded, style));
+            spans.push(Span::styled(" │ ", border_style));
+        }
+        out.push(Line::from(spans));
+
+        // Separator after header
+        if *is_header && row_idx == 0 {
+            let mut sep_spans: Vec<Span<'static>> = Vec::new();
+            sep_spans.push(Span::styled("├─", border_style));
+            for (i, w) in col_widths.iter().enumerate() {
+                sep_spans.push(Span::styled("─".repeat(*w), border_style));
+                if i < col_widths.len() - 1 {
+                    sep_spans.push(Span::styled("─┼─", border_style));
+                }
+            }
+            sep_spans.push(Span::styled("─┤", border_style));
+            out.push(Line::from(sep_spans));
+        }
+    }
+
+    out
 }
 
 

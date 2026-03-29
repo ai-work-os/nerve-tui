@@ -9,7 +9,7 @@ use nerve_tui_protocol::{ContentBlock, Message, ToolStatus};
 use ratatui::text::Line;
 use tracing::debug;
 
-use super::block_renderer::{self, BlockRenderOpts};
+use super::block_renderer;
 
 /// Cache entry for a single message's rendered output.
 struct CacheEntry {
@@ -103,12 +103,10 @@ fn is_live_block(block: &ContentBlock) -> bool {
 }
 
 /// Render all blocks of a message into lines.
-fn render_message(msg: &Message, width: u16, expand_state: &HashMap<usize, bool>) -> Vec<Line<'static>> {
+fn render_message(msg: &Message, width: u16, _expand_state: &HashMap<usize, bool>) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
-    for (i, block) in msg.blocks.iter().enumerate() {
-        let expanded = expand_state.get(&i).copied().unwrap_or(false);
-        let opts = BlockRenderOpts { expanded };
-        lines.extend(block_renderer::render_block_with_opts(block, width, opts));
+    for block in &msg.blocks {
+        lines.extend(block_renderer::render_block(block, width));
     }
     lines
 }
