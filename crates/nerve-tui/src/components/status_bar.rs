@@ -5,6 +5,8 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Widget};
 use std::time::Instant;
 
+use unicode_width::UnicodeWidthStr;
+
 use crate::theme;
 
 #[derive(Debug, Clone)]
@@ -275,7 +277,7 @@ impl StatusBar {
                 Style::default().fg(theme::TIMESTAMP).add_modifier(Modifier::BOLD),
             )));
             for (i, agent) in &ai_agents {
-                Self::render_agent_item(&mut lines, *i, agent, &selected, active_dm);
+                Self::render_agent_item(&mut lines, *i, agent, &selected, active_dm, inner.width);
             }
             has_prev = true;
         }
@@ -288,7 +290,7 @@ impl StatusBar {
                 Style::default().fg(theme::TIMESTAMP).add_modifier(Modifier::BOLD),
             )));
             for (i, agent) in &program_agents {
-                Self::render_agent_item(&mut lines, *i, agent, &selected, active_dm);
+                Self::render_agent_item(&mut lines, *i, agent, &selected, active_dm, inner.width);
             }
             has_prev = true;
         }
@@ -301,11 +303,55 @@ impl StatusBar {
                 Style::default().fg(theme::TIMESTAMP).add_modifier(Modifier::BOLD),
             )));
             for (i, agent) in &client_agents {
-                Self::render_agent_item(&mut lines, *i, agent, &selected, active_dm);
+                Self::render_agent_item(&mut lines, *i, agent, &selected, active_dm, inner.width);
             }
         }
 
         Paragraph::new(lines).render(inner, buf);
+    }
+
+    /// Build the second line for an agent: `adapter [hint]` or just `adapter`.
+    /// Hint: tool_call > activity. Fits within `max_width` columns.
+    pub fn agent_status_line(agent: &AgentDisplay, max_width: usize) -> String {
+        let adapter = agent.adapter.as_deref().unwrap_or("");
+
+        // Determine hint: tool_call > activity > none
+        let hint = if let Some(ref tool) = agent.tool_call_name {
+            Some(format!("[{}]", tool))
+        } else if let Some(ref activity) = agent.activity {
+            Some(format!("[{}]", activity))
+        } else {
+            None
+        };
+
+        match hint {
+            None => truncate_str(adapter, max_width),
+            Some(hint) => {
+                if adapter.is_empty() {
+                    return truncate_str(&hint, max_width);
+                }
+                let adapter_w = adapter.width();
+                let hint_w = hint.width();
+                let total = adapter_w + 1 + hint_w;
+
+                if total <= max_width {
+                    format!("{} {}", adapter, hint)
+                } else {
+                    // Truncate adapter first, keep hint visible (min 4 cols)
+                    let min_hint = 4;
+                    let hint_budget = hint_w.min(max_width.saturating_sub(1)); // at least try full hint
+                    let adapter_budget = max_width.saturating_sub(1 + hint_budget);
+                    if adapter_budget >= 2 && hint_budget >= min_hint {
+                        format!("{} {}", truncate_str(adapter, adapter_budget), truncate_str(&hint, hint_budget))
+                    } else if max_width > hint_w {
+                        // Just show hint
+                        truncate_str(&hint, max_width)
+                    } else {
+                        truncate_str(&hint, max_width)
+                    }
+                }
+            }
+        }
     }
 
     fn render_agent_item(
@@ -314,6 +360,7 @@ impl StatusBar {
         agent: &AgentDisplay,
         selected: &Option<NavigationTarget>,
         active_dm: Option<&str>,
+        width: u16,
     ) {
         let is_selected = *selected == Some(NavigationTarget::Agent(i));
         let is_active = active_dm == Some(agent.name.as_str());
@@ -328,58 +375,95 @@ impl StatusBar {
             name_style = name_style.add_modifier(Modifier::BOLD);
         }
 
-        let prefix = if agent.transport == "stdio" { "@" } else { "" };
-        lines.push(Line::from(vec![
+        // Line 1: "▸ ● agent-name [DM]"
+        let prefix_len: usize = 4; // "▸ ● "
+        let suffix = if is_active { " [DM]" } else { "" };
+        let suffix_len = suffix.width();
+        let name_budget = (width as usize).saturating_sub(prefix_len + suffix_len);
+        let name_display = truncate_str(&agent.name, name_budget);
+
+        let mut spans = vec![
             Span::raw(format!("{} ", marker)),
             Span::styled(
                 format!("{} ", theme::status_icon(&agent.status)),
                 Style::default().fg(color),
             ),
-            Span::styled(format!("{}{}", prefix, agent.name), name_style),
-            Span::styled(
-                if is_active { " [DM]" } else { "" },
+            Span::styled(name_display, name_style),
+        ];
+        if !suffix.is_empty() {
+            spans.push(Span::styled(
+                suffix.to_string(),
                 Style::default().fg(theme::TIMESTAMP),
-            ),
-        ]));
-
-        // Show tool call progress or activity or adapter
-        if let Some(ref tool_name) = agent.tool_call_name {
-            let elapsed = agent.tool_call_started
-                .map(|t| format_elapsed(t.elapsed().as_secs()))
-                .unwrap_or_default();
-            lines.push(Line::from(vec![
-                Span::styled("    ", Style::default()),
-                Span::styled(
-                    elapsed,
-                    Style::default().fg(theme::TIMESTAMP),
-                ),
-                Span::styled(
-                    format!(" {}", tool_name),
-                    Style::default().fg(theme::TOOL_NAME),
-                ),
-            ]));
-        } else if let Some(ref activity) = agent.activity {
-            lines.push(Line::from(Span::styled(
-                format!("    {}", activity),
-                Style::default().fg(theme::TIMESTAMP),
-            )));
-        } else if let Some(ref adapter) = agent.adapter {
-            lines.push(Line::from(Span::styled(
-                format!("    {}", adapter),
-                Style::default().fg(theme::TIMESTAMP),
-            )));
+            ));
         }
-        // Show waiting target
-        if let Some(ref target) = agent.waiting_for {
-            lines.push(Line::from(Span::styled(
-                format!("    →{}", target),
-                Style::default().fg(theme::MENTION),
-            )));
+        lines.push(Line::from(spans));
+
+        // Line 2: "  adapter [hint]"
+        let indent = "  ";
+        let indent_len = indent.width();
+        let status_budget = (width as usize).saturating_sub(indent_len);
+        let status_text = Self::agent_status_line(agent, status_budget);
+
+        if !status_text.is_empty() {
+            // Split into adapter part and hint part for coloring
+            let (adapter_part, hint_part) = if let Some(pos) = status_text.find('[') {
+                let idx = status_text[..pos].trim_end().len();
+                (&status_text[..idx], Some(status_text[idx..].trim_start()))
+            } else {
+                (status_text.as_str(), None)
+            };
+
+            let mut line2_spans = vec![
+                Span::styled(indent, Style::default()),
+            ];
+            if !adapter_part.is_empty() {
+                line2_spans.push(Span::styled(
+                    adapter_part.to_string(),
+                    Style::default().fg(theme::TIMESTAMP),
+                ));
+            }
+            if let Some(hint) = hint_part {
+                let hint_color = if agent.tool_call_name.is_some() {
+                    theme::TOOL_NAME
+                } else {
+                    theme::TIMESTAMP
+                };
+                let separator = if adapter_part.is_empty() { "" } else { " " };
+                line2_spans.push(Span::styled(
+                    format!("{}{}", separator, hint),
+                    Style::default().fg(hint_color),
+                ));
+            }
+            lines.push(Line::from(line2_spans));
         }
     }
 }
 
+/// Truncate a string to fit within `max` display-width columns, appending "…" if truncated.
+/// Uses `unicode_width` for correct CJK / emoji / fullwidth handling.
+fn truncate_str(s: &str, max: usize) -> String {
+    if s.width() <= max {
+        return s.to_string();
+    }
+    if max <= 1 {
+        return "…".to_string();
+    }
+    let target = max - 1; // reserve 1 col for "…"
+    let mut width = 0;
+    let mut end = 0;
+    for (i, ch) in s.char_indices() {
+        let cw = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+        if width + cw > target {
+            break;
+        }
+        width += cw;
+        end = i + ch.len_utf8();
+    }
+    format!("{}…", &s[..end])
+}
+
 /// Format elapsed seconds as a compact duration string.
+#[allow(dead_code)]
 pub(crate) fn format_elapsed(secs: u64) -> String {
     if secs < 60 {
         format!("{}s", secs)
@@ -606,6 +690,197 @@ mod tests {
             agents.iter().any(|a| a.node_id == m.node_id && a.status == "busy")
         }).count();
         assert_eq!(busy, 2);
+    }
+
+    // --- truncate_str tests ---
+
+    #[test]
+    fn truncate_str_no_op_when_fits() {
+        assert_eq!(truncate_str("hello", 10), "hello");
+        assert_eq!(truncate_str("hello", 5), "hello");
+    }
+
+    #[test]
+    fn truncate_str_adds_ellipsis() {
+        assert_eq!(truncate_str("hello world", 6), "hello…");
+        assert_eq!(truncate_str("abcdef", 4), "abc…");
+    }
+
+    #[test]
+    fn truncate_str_min_width() {
+        assert_eq!(truncate_str("hello", 1), "…");
+        assert_eq!(truncate_str("hello", 0), "…"); // degenerate
+    }
+
+    #[test]
+    fn truncate_str_cjk_respects_display_width() {
+        // Each CJK char = 2 cols. "你好世界" = 8 cols
+        let s = "你好世界";
+        let result = truncate_str(s, 5); // room for 2 CJK chars (4 cols) + "…" (1 col) = 5
+        assert!(result.width() <= 5, "truncated CJK too wide: {} ({})", result, result.width());
+        assert!(result.contains('…'));
+    }
+
+    #[test]
+    fn truncate_str_empty() {
+        assert_eq!(truncate_str("", 5), "");
+    }
+
+    // --- agent_status_line tests ---
+
+    #[test]
+    fn status_line_idle_shows_adapter_only() {
+        let agent = AgentDisplay {
+            name: "worker".into(),
+            status: "idle".into(),
+            activity: None,
+            adapter: Some("claude/opus".into()),
+            node_id: "n1".into(),
+            transport: "stdio".into(),
+            capabilities: vec![],
+            usage: None,
+            tool_call_name: None,
+            tool_call_started: None,
+            waiting_for: None,
+        };
+        let line = StatusBar::agent_status_line(&agent, 20);
+        assert_eq!(line, "claude/opus");
+    }
+
+    #[test]
+    fn status_line_with_tool_call() {
+        let agent = AgentDisplay {
+            name: "worker".into(),
+            status: "busy".into(),
+            activity: None,
+            adapter: Some("claude/opus".into()),
+            node_id: "n1".into(),
+            transport: "stdio".into(),
+            capabilities: vec![],
+            usage: None,
+            tool_call_name: Some("Read".into()),
+            tool_call_started: None,
+            waiting_for: None,
+        };
+        let line = StatusBar::agent_status_line(&agent, 20);
+        assert!(line.contains("claude/opus"), "should have adapter: {}", line);
+        assert!(line.contains("[Read]"), "should have tool hint: {}", line);
+    }
+
+    #[test]
+    fn status_line_with_activity() {
+        let agent = AgentDisplay {
+            name: "worker".into(),
+            status: "busy".into(),
+            activity: Some("thinking".into()),
+            adapter: Some("claude/opus".into()),
+            node_id: "n1".into(),
+            transport: "stdio".into(),
+            capabilities: vec![],
+            usage: None,
+            tool_call_name: None,
+            tool_call_started: None,
+            waiting_for: None,
+        };
+        let line = StatusBar::agent_status_line(&agent, 20);
+        assert!(line.contains("[thinking]"), "should have activity: {}", line);
+    }
+
+    #[test]
+    fn status_line_tool_call_overrides_activity() {
+        let agent = AgentDisplay {
+            name: "worker".into(),
+            status: "busy".into(),
+            activity: Some("typing".into()),
+            adapter: Some("claude/opus".into()),
+            node_id: "n1".into(),
+            transport: "stdio".into(),
+            capabilities: vec![],
+            usage: None,
+            tool_call_name: Some("Write".into()),
+            tool_call_started: None,
+            waiting_for: None,
+        };
+        let line = StatusBar::agent_status_line(&agent, 25);
+        assert!(line.contains("[Write]"), "tool_call wins: {}", line);
+        assert!(!line.contains("typing"), "activity hidden: {}", line);
+    }
+
+    #[test]
+    fn status_line_waiting_for_ignored() {
+        let agent = AgentDisplay {
+            name: "reviewer".into(),
+            status: "busy".into(),
+            activity: None,
+            adapter: Some("claude/opus".into()),
+            node_id: "n1".into(),
+            transport: "stdio".into(),
+            capabilities: vec![],
+            usage: None,
+            tool_call_name: None,
+            tool_call_started: None,
+            waiting_for: Some("main".into()),
+        };
+        let line = StatusBar::agent_status_line(&agent, 25);
+        assert!(!line.contains("→main"), "waiting_for should not appear in sidebar: {}", line);
+        assert_eq!(line, "claude/opus", "should show adapter only: {}", line);
+    }
+
+    #[test]
+    fn status_line_no_adapter() {
+        let agent = AgentDisplay {
+            name: "mc".into(),
+            status: "busy".into(),
+            activity: Some("recording".into()),
+            adapter: None,
+            node_id: "n1".into(),
+            transport: "ws".into(),
+            capabilities: vec![],
+            usage: None,
+            tool_call_name: None,
+            tool_call_started: None,
+            waiting_for: None,
+        };
+        let line = StatusBar::agent_status_line(&agent, 20);
+        assert!(line.contains("[recording]"), "should have activity: {}", line);
+    }
+
+    #[test]
+    fn status_line_truncates_within_width() {
+        let agent = AgentDisplay {
+            name: "worker".into(),
+            status: "busy".into(),
+            activity: None,
+            adapter: Some("very-long-adapter/very-long-model".into()),
+            node_id: "n1".into(),
+            transport: "stdio".into(),
+            capabilities: vec![],
+            usage: None,
+            tool_call_name: Some("VeryLongToolCallName".into()),
+            tool_call_started: None,
+            waiting_for: None,
+        };
+        let line = StatusBar::agent_status_line(&agent, 15);
+        assert!(line.width() <= 15, "line too wide: {} ({})", line, line.width());
+    }
+
+    #[test]
+    fn status_line_cjk_width() {
+        let agent = AgentDisplay {
+            name: "测试".into(),
+            status: "busy".into(),
+            activity: None,
+            adapter: Some("模型".into()),  // 4 display cols
+            node_id: "n1".into(),
+            transport: "stdio".into(),
+            capabilities: vec![],
+            usage: None,
+            tool_call_name: Some("Read".into()),
+            tool_call_started: None,
+            waiting_for: None,
+        };
+        let line = StatusBar::agent_status_line(&agent, 12);
+        assert!(line.width() <= 12, "CJK status too wide: {} ({})", line, line.width());
     }
 
     // --- Tool call display tests ---

@@ -279,6 +279,20 @@ impl NerveClient {
         Ok(serde_json::from_value(r)?)
     }
 
+    pub async fn node_message(&self, node_id: &str, content: &str) -> Result<()> {
+        debug!(
+            node_id,
+            content_len = content.len(),
+            "requesting node.message"
+        );
+        self.request(
+            "node.message",
+            json!({ "nodeId": node_id, "content": content }),
+        )
+        .await?;
+        Ok(())
+    }
+
     pub async fn node_cancel(&self, node_id: &str) -> Result<()> {
         debug!(node_id, "requesting node.cancel");
         self.request("node.cancel", json!({ "nodeId": node_id }))
@@ -342,6 +356,32 @@ impl NerveClient {
             params["name"] = json!(n);
         }
         self.request("channel.addNode", params).await?;
+        Ok(())
+    }
+
+    // --- Scene API ---
+
+    pub async fn scene_list(&self) -> Result<Vec<Value>> {
+        let r = self.request("scene.list", json!({})).await?;
+        let scenes = r
+            .get("scenes")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        Ok(scenes)
+    }
+
+    pub async fn scene_start(&self, name: &str, cwd: Option<&str>) -> Result<Value> {
+        let mut params = json!({ "name": name });
+        if let Some(c) = cwd {
+            params["cwd"] = json!(c);
+        }
+        let r = self.request("scene.start", params).await?;
+        Ok(r)
+    }
+
+    pub async fn scene_stop(&self, name: &str) -> Result<()> {
+        self.request("scene.stop", json!({ "name": name })).await?;
         Ok(())
     }
 }

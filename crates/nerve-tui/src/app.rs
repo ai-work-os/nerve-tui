@@ -11,6 +11,7 @@ use std::path::Path;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
+use crate::clipboard;
 use crate::components::channel_view::{self, ChannelPanelState, ChannelView};
 use crate::components::dm_view::DmView;
 use crate::components::*;
@@ -94,6 +95,8 @@ pub struct App {
     last_channel_panel_x: Option<u16>,
     /// Dirty flag — skip redraw if nothing changed since last frame.
     needs_redraw: bool,
+    /// When true, clear terminal buffer before next draw (forces full repaint).
+    force_clear: bool,
 }
 
 impl App {
@@ -142,6 +145,7 @@ impl App {
             channel_panel_state: ChannelPanelState::new(),
             last_channel_panel_x: None,
             needs_redraw: true,
+            force_clear: false,
         }
     }
 
@@ -262,6 +266,11 @@ impl App {
         let mut redraw_interval = tokio::time::interval(tokio::time::Duration::from_millis(33));
 
         loop {
+            if self.force_clear {
+                terminal.clear()?;
+                self.force_clear = false;
+                self.needs_redraw = true;
+            }
             if self.needs_redraw {
                 terminal.draw(|frame| self.render(frame))?;
                 self.needs_redraw = false;
@@ -280,7 +289,7 @@ impl App {
                             self.handle_key(key).await;
                         }
                         Event::Mouse(mouse) => self.handle_mouse(mouse),
-                        Event::Paste(text) => self.input.insert_str(&text),
+                        Event::Paste(text) => self.handle_paste(&text).await,
                         _ => {}
                     }
                     self.needs_redraw = true;
@@ -535,6 +544,17 @@ impl App {
                 self.input.kill_to_line_start();
             }
 
+            // Ctrl+L: force full redraw (clear terminal + repaint)
+            KeyCode::Char('l') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.force_clear = true;
+                self.needs_redraw = true;
+            }
+
+            // Ctrl+V: check clipboard for image, fall back to text paste
+            KeyCode::Char('v') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.handle_paste_from_key().await;
+            }
+
             // Toggle sidebar
             KeyCode::Char('b') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.sidebar_visible = !self.sidebar_visible;
@@ -761,7 +781,11 @@ impl App {
             self.dm_view.push(&user_msg);
             self.dm_view.dm_history.push(user_msg);
 
-            // Send prompt in background — response comes via node.update
+            // Determine transport: program nodes use node.message, AI nodes use node.prompt
+            let is_program = self.agents.iter()
+                .any(|a| a.node_id == *node_id && a.transport != "stdio");
+
+            // Send in background — response comes via node.update or node.log
             let node_id = node_id.clone();
             let content = text.to_string();
             let client_ws_tx = self.client.ws_tx_clone();
@@ -769,8 +793,14 @@ impl App {
             let error_tx = self.error_tx.clone();
             tokio::spawn(async move {
                 let client = NerveClient::from_parts(client_ws_tx, pending);
-                if let Err(e) = client.node_prompt(&node_id, &content).await {
-                    warn!("node.prompt failed: {}", e);
+                let result = if is_program {
+                    client.node_message(&node_id, &content).await
+                } else {
+                    client.node_prompt(&node_id, &content).await.map(|_| ())
+                };
+                if let Err(e) = result {
+                    let method = if is_program { "node.message" } else { "node.prompt" };
+                    warn!("{} failed: {}", method, e);
                     let _ = error_tx.send(format!("发送失败: {}", e));
                 }
             });
@@ -913,6 +943,32 @@ impl App {
         self.push_contextual_system(&format!("已中断 {}", node_name));
     }
 
+    /// Handle Ctrl+V key: check clipboard for image only.
+    /// Text paste is handled separately by Event::Paste (bracketed paste).
+    async fn handle_paste_from_key(&mut self) {
+        if let Some(path) = clipboard::try_paste_image().await {
+            let path_str = path.to_string_lossy().to_string();
+            info!("clipboard image pasted via Ctrl+V: {}", path_str);
+            self.input.insert_str(&format!("[截图: {}]", path_str));
+            self.push_system_to_active(&format!("图片已保存: {}", path_str));
+        }
+        // No image — do nothing; text paste comes via Event::Paste
+    }
+
+    /// Handle bracketed paste event: check clipboard for image first, fall back to text.
+    pub async fn handle_paste(&mut self, text: &str) {
+        // Try clipboard image first (user may have copied an image)
+        if let Some(path) = clipboard::try_paste_image().await {
+            let path_str = path.to_string_lossy().to_string();
+            info!("clipboard image pasted: {}", path_str);
+            self.input.insert_str(&format!("[截图: {}]", path_str));
+            self.push_system_to_active(&format!("图片已保存: {}", path_str));
+            return;
+        }
+        // No image — insert text as before
+        self.input.insert_str(text);
+    }
+
     async fn handle_command(&mut self, text: &str) {
         let parts: Vec<&str> = text.splitn(3, ' ').collect();
         let cmd = parts[0];
@@ -923,6 +979,25 @@ impl App {
                     self.enter_dm(name).await;
                 } else {
                     self.push_system_to_active("用法: /dm <agent_name>");
+                }
+            }
+
+            "/ch" => {
+                let rest = text.strip_prefix("/ch ").map(str::trim);
+                if let Some(name) = rest.filter(|s| !s.is_empty()) {
+                    if let Some(ch) = self.channels.iter().find(|c| {
+                        c.name.as_deref() == Some(name) || c.id == name
+                    }) {
+                        let ch_id = ch.id.clone();
+                        if self.is_dm_mode() {
+                            self.exit_dm().await;
+                        }
+                        self.join_channel(&ch_id).await;
+                    } else {
+                        self.push_system_to_active(&format!("找不到频道: {}", name));
+                    }
+                } else {
+                    self.push_system_to_active("用法: /ch <channel_name>");
                 }
             }
 
@@ -1230,6 +1305,8 @@ impl App {
                 self.channel_view
                     .push_system("  /split [@agent]       分屏(频道或agent输出)");
                 self.channel_view
+                    .push_system("  /ch <name>            切换频道");
+                self.channel_view
                     .push_system("  /dm <name>            与 agent 1v1 对话");
                 self.channel_view
                     .push_system("  /back                 退出 DM 回频道");
@@ -1245,6 +1322,7 @@ impl App {
                 self.channel_view.push_system("  Ctrl+D/U    滚动消息 下/上（10行）");
                 self.channel_view.push_system("  PgDn/PgUp   翻页（20行）");
                 self.channel_view.push_system("  Ctrl+G      切换全局/项目模式");
+                self.channel_view.push_system("  Ctrl+L      强制刷新重绘");
                 self.channel_view.push_system("  Ctrl+Q      退出");
             }
 
@@ -1305,6 +1383,75 @@ impl App {
                     }
                 } else if arg.is_empty() {
                     self.push_contextual_system("用法: /split [@agent] 或在 DM 中 /split");
+                }
+            }
+
+            "/scene" => {
+                if let Some(sub) = parts.get(1) {
+                    match *sub {
+                        "stop" => {
+                            if let Some(name) = parts.get(2) {
+                                match self.client.scene_stop(name).await {
+                                    Ok(_) => self.push_contextual_system(&format!("场景已停止: {}", name)),
+                                    Err(e) => self.push_contextual_system(&format!("停止失败: {}", e)),
+                                }
+                            } else {
+                                self.push_contextual_system("用法: /scene stop <name>");
+                            }
+                        }
+                        "list" => {
+                            match self.client.scene_list().await {
+                                Ok(scenes) => {
+                                    if scenes.is_empty() {
+                                        self.push_contextual_system("没有可用场景");
+                                    } else {
+                                        for s in &scenes {
+                                            let name = s.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+                                            let running = s.get("running").and_then(|v| v.as_bool()).unwrap_or(false);
+                                            let status = if running { " [运行中]" } else { "" };
+                                            self.push_contextual_system(&format!("  {}{}", name, status));
+                                        }
+                                    }
+                                }
+                                Err(e) => self.push_contextual_system(&format!("获取失败: {}", e)),
+                            }
+                        }
+                        name => {
+                            // /scene <name> — start the scene
+                            self.push_contextual_system(&format!("启动场景: {}...", name));
+                            match self.client.scene_start(name, self.project_path.as_deref()).await {
+                                Ok(result) => {
+                                    let ch_id = result.get("channelId").and_then(|v| v.as_str());
+                                    self.push_contextual_system(&format!("场景 {} 已启动", name));
+                                    self.refresh_agents().await;
+                                    self.refresh_channels().await;
+                                    // Auto-join the scene's channel
+                                    if let Some(ch_id) = ch_id {
+                                        self.join_channel(ch_id).await;
+                                    }
+                                }
+                                Err(e) => self.push_contextual_system(&format!("启动失败: {}", e)),
+                            }
+                        }
+                    }
+                } else {
+                    // /scene with no args — list scenes
+                    match self.client.scene_list().await {
+                        Ok(scenes) => {
+                            if scenes.is_empty() {
+                                self.push_contextual_system("没有可用场景");
+                            } else {
+                                self.push_contextual_system("可用场景:");
+                                for s in &scenes {
+                                    let name = s.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+                                    let running = s.get("running").and_then(|v| v.as_bool()).unwrap_or(false);
+                                    let status = if running { " [运行中]" } else { "" };
+                                    self.push_contextual_system(&format!("  {}{}", name, status));
+                                }
+                            }
+                        }
+                        Err(e) => self.push_contextual_system(&format!("获取失败: {}", e)),
+                    }
                 }
             }
 
@@ -1533,7 +1680,6 @@ impl App {
     }
 
     fn handle_node_update(&mut self, node_id: &str, name: &str, detail: &serde_json::Value) {
-        let is_dm_active = self.is_dm_mode();
         let in_dm = self.dm_node_id() == Some(node_id);
 
         // Route updates to split node buffer if target matches
@@ -1551,21 +1697,49 @@ impl App {
             }
         }
 
+        // Always update sidebar tool_call status regardless of DM mode
+        if let Some(update) = detail.get("update") {
+            let kind = update.get("sessionUpdate").and_then(|v| v.as_str());
+            match kind {
+                Some("tool_call") => {
+                    let tc = update.get("toolCall").or_else(|| update.get("tool_call"));
+                    let tool_name = if let Some(tc) = tc {
+                        tc.get("name").and_then(|v| v.as_str()).unwrap_or("unknown")
+                    } else if let Some(tn) = update.pointer("/_meta/claudeCode/toolName").and_then(|v| v.as_str()) {
+                        tn
+                    } else if let Some(title) = update.get("title").and_then(|v| v.as_str()) {
+                        title.split(':').last().map(str::trim).unwrap_or(title)
+                    } else {
+                        "unknown"
+                    };
+                    info!(agent = name, tool = %tool_name, update = %update, "sidebar: tool_call raw");
+                    if let Some(agent) = self.agents.iter_mut().find(|a| a.name == name) {
+                        agent.tool_call_name = Some(tool_name.to_string());
+                        agent.tool_call_started = Some(std::time::Instant::now());
+                    }
+                }
+                Some("tool_call_update") => {
+                    let tcu = update.get("toolCallUpdate").or_else(|| update.get("tool_call_update"));
+                    let status = if let Some(tcu) = tcu {
+                        tcu.get("status").and_then(|v| v.as_str()).unwrap_or("")
+                    } else {
+                        update.get("status").and_then(|v| v.as_str()).unwrap_or("")
+                    };
+                    if status == "completed" || status == "failed" {
+                        if let Some(agent) = self.agents.iter_mut().find(|a| a.name == name) {
+                            agent.tool_call_name = None;
+                            agent.tool_call_started = None;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
         // Channel view: node.update should not render into message area.
         // Channel messages arrive via channel.message events only.
         // In DM mode: only process updates from the active DM node.
         if !in_dm {
-            if is_dm_active {
-                debug!(
-                    "node.update from {} ignored (DM active for different node)",
-                    name
-                );
-            } else {
-                debug!(
-                    "node.update from {} ignored (channel view, not in DM)",
-                    name
-                );
-            }
             return;
         }
 
@@ -1669,38 +1843,11 @@ impl App {
                 }
                 Some("tool_call") => {
                     self.dm_view.apply_streaming_event(name, "tool_call", update);
-
-                    // Update sidebar: extract tool name for display
-                    let tc = update.get("toolCall").or_else(|| update.get("tool_call"));
-                    let tool_name = if let Some(tc) = tc {
-                        tc.get("name").and_then(|v| v.as_str()).unwrap_or("unknown")
-                    } else {
-                        update.pointer("/_meta/claudeCode/toolName")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or_else(|| update.get("title").and_then(|v| v.as_str()).unwrap_or("unknown"))
-                    };
-                    if let Some(agent) = self.agents.iter_mut().find(|a| a.name == name) {
-                        agent.tool_call_name = Some(tool_name.to_string());
-                        agent.tool_call_started = Some(std::time::Instant::now());
-                        debug!(agent = name, tool = %tool_name, "sidebar: tool_call started");
-                    }
+                    // Sidebar update already handled above (before DM gate)
                 }
                 Some("tool_call_update") => {
                     self.dm_view.apply_streaming_event(name, "tool_call_update", update);
-
-                    // Update sidebar: clear tool call display on completion/failure
-                    let tcu = update.get("toolCallUpdate").or_else(|| update.get("tool_call_update"));
-                    let status = if let Some(tcu) = tcu {
-                        tcu.get("status").and_then(|v| v.as_str()).unwrap_or("")
-                    } else {
-                        update.get("status").and_then(|v| v.as_str()).unwrap_or("")
-                    };
-                    if status == "completed" || status == "failed" {
-                        if let Some(agent) = self.agents.iter_mut().find(|a| a.name == name) {
-                            agent.tool_call_name = None;
-                            agent.tool_call_started = None;
-                        }
-                    }
+                    // Sidebar update already handled above (before DM gate)
                 }
                 Some("usage_update") => {
                     let used = update.get("used").and_then(|v| v.as_f64()).unwrap_or(0.0);
@@ -1862,6 +2009,7 @@ impl App {
             "/stop".into(),
             "/cancel".into(),
             "/list".into(),
+            "/ch".into(),
             "/dm".into(),
             "/back".into(),
             "/help".into(),
@@ -1869,6 +2017,7 @@ impl App {
             "/clear".into(),
             "/compact".into(),
             "/split".into(),
+            "/scene".into(),
             "/quit".into(),
         ];
         for agent in &self.agents {
@@ -2340,6 +2489,127 @@ mod tests {
         );
     }
 
+    // --- Ctrl+L force redraw tests ---
+
+    #[tokio::test]
+    async fn ctrl_l_sets_force_clear() {
+        let mut app = make_app();
+        app.force_clear = false;
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL)).await;
+
+        assert!(app.force_clear, "Ctrl+L should set force_clear = true");
+        assert!(app.needs_redraw, "Ctrl+L should also set needs_redraw = true");
+    }
+
+    // --- /ch channel switch tests ---
+
+    #[test]
+    fn ch_command_finds_channel_by_name() {
+        // Test channel lookup logic without network (join_channel is async + needs server)
+        let channels = vec![
+            ChannelDisplay {
+                id: "ch1".into(),
+                name: Some("main".into()),
+                node_count: 2,
+                members: Vec::new(),
+                unread: 0,
+            },
+            ChannelDisplay {
+                id: "ch2".into(),
+                name: Some("ops".into()),
+                node_count: 1,
+                members: Vec::new(),
+                unread: 0,
+            },
+        ];
+
+        // Find by name
+        let found = channels.iter().find(|c| c.name.as_deref() == Some("ops") || c.id == "ops");
+        assert_eq!(found.unwrap().id, "ch2");
+
+        // Find by id
+        let found = channels.iter().find(|c| c.name.as_deref() == Some("ch1") || c.id == "ch1");
+        assert_eq!(found.unwrap().id, "ch1");
+
+        // Not found
+        let found = channels.iter().find(|c| c.name.as_deref() == Some("nope") || c.id == "nope");
+        assert!(found.is_none());
+    }
+
+    #[test]
+    fn ch_command_finds_channel_with_spaces() {
+        let channels = vec![ChannelDisplay {
+            id: "ch1".into(),
+            name: Some("team sync".into()),
+            node_count: 2,
+            members: Vec::new(),
+            unread: 0,
+        }];
+
+        // strip_prefix("/ch ") should yield "team sync"
+        let input = "/ch team sync";
+        let rest = input.strip_prefix("/ch ").map(str::trim).filter(|s| !s.is_empty());
+        assert_eq!(rest, Some("team sync"));
+
+        let found = channels.iter().find(|c| c.name.as_deref() == rest || c.id == rest.unwrap());
+        assert!(found.is_some(), "should find channel with space in name");
+    }
+
+    #[tokio::test]
+    async fn ch_command_unknown_channel_shows_error() {
+        let mut app = make_app();
+        app.channels = vec![ChannelDisplay {
+            id: "ch1".into(),
+            name: Some("main".into()),
+            node_count: 2,
+            members: Vec::new(),
+            unread: 0,
+        }];
+
+        app.handle_command("/ch nonexistent").await;
+
+        // Should show error message
+        let last_line = app.channel_view.last_system_content();
+        assert!(
+            last_line.map_or(false, |s| s.contains("找不到频道")),
+            "should show error for unknown channel"
+        );
+    }
+
+    #[tokio::test]
+    async fn ch_command_no_arg_shows_usage() {
+        let mut app = make_app();
+
+        app.handle_command("/ch").await;
+
+        let last_line = app.channel_view.last_system_content();
+        assert!(
+            last_line.map_or(false, |s| s.contains("/ch")),
+            "should show usage hint"
+        );
+    }
+
+    #[test]
+    fn completions_include_ch_command() {
+        let mut app = make_app();
+        app.update_completions();
+        assert!(
+            app.input.completions.iter().any(|c| c == "/ch"),
+            "completions should include /ch"
+        );
+    }
+
+    #[test]
+    fn completions_include_scene_command() {
+        let mut app = make_app();
+        app.update_completions();
+        assert!(
+            app.input.completions.iter().any(|c| c == "/scene"),
+            "completions should include /scene"
+        );
+    }
+
     #[test]
     fn agent_message_start_clears_previous_streaming() {
         let mut app = make_app();
@@ -2378,5 +2648,45 @@ mod tests {
         // Bob's streaming should still be there
         assert!(app.dm_view.streaming_messages.contains_key("bob"));
         assert!(!app.dm_view.streaming_messages.contains_key("alice"));
+    }
+
+    // --- clipboard image paste tests ---
+
+    #[test]
+    fn paste_text_fallback_inserts_directly() {
+        // When no clipboard image, text should be inserted via insert_str
+        let mut app = make_app();
+        // Directly test the text fallback path (skip clipboard check)
+        app.input.insert_str("hello world");
+        assert!(
+            app.input.text.contains("hello world"),
+            "text should be inserted: '{}'",
+            app.input.text
+        );
+    }
+
+    // --- tool_call name extraction tests ---
+
+    #[test]
+    fn tool_name_from_title_extracts_after_colon() {
+        // Simulate ACP title format: "tool: Read"
+        let title = "tool: Read";
+        let extracted = title.split(':').last().map(str::trim).unwrap_or(title);
+        assert_eq!(extracted, "Read");
+    }
+
+    #[test]
+    fn tool_name_from_title_no_colon() {
+        let title = "Read";
+        let extracted = title.split(':').last().map(str::trim).unwrap_or(title);
+        assert_eq!(extracted, "Read");
+    }
+
+    #[test]
+    fn tool_name_from_title_mcp_format() {
+        // MCP tools may have format "mcp: server_name: tool_name"
+        let title = "mcp: nerve: nerve_post";
+        let extracted = title.split(':').last().map(str::trim).unwrap_or(title);
+        assert_eq!(extracted, "nerve_post");
     }
 }

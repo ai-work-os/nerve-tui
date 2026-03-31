@@ -59,6 +59,11 @@ impl ChannelView {
         self.messages.len()
     }
 
+    /// Return the content of the last system message, if any.
+    pub fn last_system_content(&self) -> Option<&str> {
+        self.messages.iter().rev().find(|m| m.from == "系统").map(|m| m.content.as_str())
+    }
+
     pub fn push(&mut self, msg: &MessageInfo, _is_agent: bool) {
         let blocks = Message::content_to_blocks(&msg.content);
         debug!(from = %msg.from, block_count = blocks.len(), "channel push: parsed content to blocks");
