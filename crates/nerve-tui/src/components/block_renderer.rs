@@ -169,10 +169,14 @@ fn render_markdown(content: &str, out: &mut Vec<Line<'static>>) {
             Event::Start(Tag::Emphasis) => italic = true,
             Event::End(TagEnd::Emphasis) => italic = false,
             Event::Code(text) => {
-                current_spans.push(Span::styled(
-                    text.to_string(),
-                    Style::default().fg(Color::Yellow),
-                ));
+                if in_table {
+                    table_cell_buf.push_str(&text);
+                } else {
+                    current_spans.push(Span::styled(
+                        text.to_string(),
+                        Style::default().fg(Color::Yellow),
+                    ));
+                }
             }
             Event::Text(text) => {
                 if in_code_block {
@@ -1059,6 +1063,22 @@ mod tests {
         let body_w = UnicodeWidthStr::width(body_text.as_str());
         assert_eq!(header_w, body_w,
             "header and body should have same display width: header={}, body={}", header_w, body_w);
+    }
+
+    // --- Table with backtick code in cells ---
+
+    #[test]
+    fn table_backtick_code_in_cells() {
+        let md = "| 文件 | 用途 |\n|------|------|\n| `app.rs` | 应用主循环 |\n| `lib.rs` | 库入口 |";
+        let lines = render_text(md, 80);
+        // Content must appear inside table row lines (lines containing │), not leaked outside
+        let table_row_lines: Vec<String> = lines.iter()
+            .map(|l| line_to_text(l))
+            .filter(|t| t.contains("│") && !t.contains("├"))
+            .collect();
+        let table_text: String = table_row_lines.join("\n");
+        assert!(table_text.contains("app.rs"), "backtick content 'app.rs' should be inside table rows, got:\n{}", table_text);
+        assert!(table_text.contains("lib.rs"), "backtick content 'lib.rs' should be inside table rows, got:\n{}", table_text);
     }
 
     // --- @mention highlighting tests ---
