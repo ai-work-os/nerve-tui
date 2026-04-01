@@ -396,20 +396,8 @@ impl InputBox {
         } else {
             self.build_candidates();
             if !self.candidates.is_empty() {
-                // Multiple candidates: show popup for selection instead of auto-applying
-                if self.candidates.len() > 1 {
-                    self.popup_visible = true;
-                    self.selected = None;
-                } else {
-                    self.apply_candidate(0);
-                    if self.cursor_pos >= self.text.len()
-                        || !self.text[self.cursor_pos..].starts_with(' ')
-                    {
-                        self.text.insert(self.cursor_pos, ' ');
-                        self.cursor_pos += 1;
-                    }
-                    self.dismiss_popup();
-                }
+                self.popup_visible = true;
+                self.selected = None;
             } else {
                 self.dismiss_popup();
             }
@@ -479,6 +467,7 @@ impl InputBox {
         let word = self.current_word().to_lowercase();
         let before = &self.text[..self.cursor_pos];
 
+
         // Context-aware: if input starts with a command that takes a specific argument type,
         // filter candidates to only show relevant items.
         let context_prefix = if word.is_empty() {
@@ -502,8 +491,23 @@ impl InputBox {
                 None
             }
         } else {
-            None
+            // word is non-empty: check if text before the word ends with a command
+            let prefix_text = before[..before.len() - word.len()].trim_end();
+            if prefix_text == "/dm" {
+                Some("agent")
+            } else if prefix_text == "/stop" || prefix_text == "/cancel" {
+                Some("bare_agent")
+            } else if prefix_text == "/add" {
+                Some("adapter")
+            } else if prefix_text == "/split" {
+                Some("@")
+            } else if prefix_text == "/ch" {
+                Some("#")
+            } else {
+                None
+            }
         };
+
 
         self.candidates = self
             .completions
@@ -528,8 +532,12 @@ impl InputBox {
                         c.starts_with('@') && cl.starts_with(&word)
                     }
                     Some("#") => {
-                        // Show #channel names
-                        c.starts_with('#') && cl.starts_with(&word)
+                        // Show #channel names — match word against name with or without #
+                        if word.starts_with('#') {
+                            c.starts_with('#') && cl.starts_with(&word)
+                        } else {
+                            c.starts_with('#') && cl[1..].starts_with(&word)
+                        }
                     }
                     _ => cl.starts_with(&word),
                 }
@@ -1303,6 +1311,36 @@ mod tests {
         assert!(
             !input.candidates.iter().any(|c| c.contains("alice")),
             "candidates after '/ch ' should not include agents"
+        );
+    }
+
+    #[test]
+    fn ch_command_prefix_match_without_hash() {
+        // Bug: typing `/ch guar` should match `#guardians` via prefix,
+        // just like `/dm ali` matches `alice`. Currently fails because
+        // context_prefix is None when word is non-empty, so filter
+        // uses default `starts_with("guar")` which won't match `#guardians`.
+        let mut input = InputBox::new();
+        input.completions = vec![
+            "/ch".into(),
+            "#guardians".into(),
+            "#general".into(),
+            "#ops".into(),
+            "@alice".into(),
+        ];
+        input.insert_str("/ch guar");
+        input.tab();
+
+        assert!(
+            input.candidates.iter().any(|c| c == "#guardians"),
+            "typing '/ch guar' should match #guardians by prefix, got: {:?}",
+            input.candidates
+        );
+        assert_eq!(
+            input.candidates.len(),
+            1,
+            "only #guardians should match, got: {:?}",
+            input.candidates
         );
     }
 

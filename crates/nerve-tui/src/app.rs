@@ -1801,6 +1801,7 @@ impl App {
         self.dm_view.flushed_agents.insert(name.to_string());
         if self.dm_node_id() == Some(node_id) {
             self.dm_view.is_responding = false;
+            self.dm_view.summary_mode = true;
         }
     }
 
@@ -2233,6 +2234,32 @@ mod tests {
         assert!(!app.dm_view.is_responding);
         assert_eq!(app.dm_view.dm_history.len(), 1);
         assert_eq!(app.dm_view.dm_history[0].content, "partial");
+    }
+
+    #[test]
+    fn flush_sets_summary_mode_true_for_auto_collapse() {
+        // Bug: after output finishes (flush), thinking/tool_call blocks should
+        // default to collapsed (summary_mode=true), but currently they stay expanded.
+        let mut app = make_app();
+        app.dm_view = DmView::new("alice");
+        app.dm_view.is_responding = true;
+        app.dm_view.summary_mode = false; // starts expanded (during streaming)
+        app.view_mode = ViewMode::Dm { node_id: "n1".into(), node_name: "alice".into() };
+
+        // Simulate a streaming message with thinking + text blocks
+        app.dm_view.start_streaming_message("alice");
+        let think = serde_json::json!({ "content": { "text": "reasoning..." } });
+        app.dm_view.apply_streaming_event("alice", "agent_thought_chunk", &think);
+        let text = serde_json::json!({ "content": { "text": "answer" } });
+        app.dm_view.apply_streaming_event("alice", "agent_message_chunk", &text);
+
+        // Flush — output is done
+        app.flush_streaming_as_dm("n1", "alice");
+
+        assert!(
+            app.dm_view.summary_mode,
+            "after flush, summary_mode should be true (auto-collapse thinking/tool_call blocks)"
+        );
     }
 
     #[test]
