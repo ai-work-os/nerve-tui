@@ -395,6 +395,7 @@ impl ChannelView {
 }
 
 /// Scroll state for the channel panel in split view.
+#[derive(Debug, Clone, PartialEq)]
 pub struct ChannelPanelState {
     pub scroll_offset: u16,
     pub auto_scroll: bool,
