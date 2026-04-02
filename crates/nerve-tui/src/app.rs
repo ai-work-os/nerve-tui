@@ -58,6 +58,8 @@ enum SplitTarget {
 struct SplitPanel {
     target: SplitTarget,
     node_buffer: String,
+    /// Whether an AI message is currently streaming (between first chunk and message_end).
+    node_msg_pending: bool,
     panel_state: ChannelPanelState,
 }
 
@@ -505,6 +507,7 @@ impl App {
                             self.split_panels.push(SplitPanel {
                                 target: SplitTarget::Channel,
                                 node_buffer: String::new(),
+                                node_msg_pending: false,
                                 panel_state: ChannelPanelState::new(),
                             });
                             self.split_focus = SplitFocus::Dm;
@@ -1451,6 +1454,7 @@ impl App {
                             let mut new_panel = SplitPanel {
                                 target: SplitTarget::Node { node_id, node_name: node_name.clone() },
                                 node_buffer: String::new(),
+                                node_msg_pending: false,
                                 panel_state: ChannelPanelState::new(),
                             };
                             new_panel.panel_state.snap_to_bottom();
@@ -1470,6 +1474,7 @@ impl App {
                         let mut new_panel = SplitPanel {
                             target: SplitTarget::Channel,
                             node_buffer: String::new(),
+                            node_msg_pending: false,
                             panel_state: ChannelPanelState::new(),
                         };
                         new_panel.panel_state.snap_to_bottom();
@@ -1493,6 +1498,7 @@ impl App {
                             let mut new_panel = SplitPanel {
                                 target: SplitTarget::Channel,
                                 node_buffer: String::new(),
+                                node_msg_pending: false,
                                 panel_state: ChannelPanelState::new(),
                             };
                             new_panel.panel_state.snap_to_bottom();
@@ -1816,10 +1822,27 @@ impl App {
                     let kind = update.get("sessionUpdate").and_then(|v| v.as_str());
                     if kind == Some("agent_message_chunk") {
                         if let Some(text) = update.get("content").and_then(|c| c.get("text")).and_then(|v| v.as_str()) {
+                            // Prepend role+timestamp header on first chunk of a new message
+                            if !panel.node_msg_pending {
+                                panel.node_msg_pending = true;
+                                let ts = chrono::Local::now().format("%H:%M:%S");
+                                panel.node_buffer.push_str(&format!("assistant  {}\n", ts));
+                            }
                             panel.node_buffer.push_str(text);
                         }
                     } else if kind == Some("agent_message_end") || kind == Some("stop_reason") {
+                        panel.node_msg_pending = false;
                         panel.node_buffer.push('\n');
+                    } else if kind == Some("node_log") {
+                        if let Some(entries) = update.get("entries").and_then(|v| v.as_array()) {
+                            for entry in entries {
+                                let level = entry.get("level").and_then(|v| v.as_str()).unwrap_or("info");
+                                let message = entry.get("message").and_then(|v| v.as_str()).unwrap_or("");
+                                let ts_str = entry.get("ts").and_then(|v| v.as_str()).unwrap_or("");
+                                let time_display = ts_str.get(11..19).unwrap_or("??:??:??");
+                                panel.node_buffer.push_str(&format!("[{}] [{}] {}\n", time_display, level.to_uppercase(), message));
+                            }
+                        }
                     }
                 }
             }
@@ -2864,6 +2887,7 @@ mod tests {
         app.split_panels.push(SplitPanel {
             target: SplitTarget::Channel,
             node_buffer: String::new(),
+            node_msg_pending: false,
             panel_state: ChannelPanelState::new(),
         });
         assert!(app.is_split());
@@ -2875,6 +2899,7 @@ mod tests {
         app.split_panels.push(SplitPanel {
             target: SplitTarget::Channel,
             node_buffer: String::new(),
+            node_msg_pending: false,
             panel_state: ChannelPanelState::new(),
         });
         app.split_focus = SplitFocus::Panel(0);
@@ -2890,6 +2915,7 @@ mod tests {
         app.split_panels.push(SplitPanel {
             target: SplitTarget::Channel,
             node_buffer: String::new(),
+            node_msg_pending: false,
             panel_state: ChannelPanelState::new(),
         });
         app.split_focus = SplitFocus::Dm;
@@ -2903,6 +2929,7 @@ mod tests {
         app.split_panels.push(SplitPanel {
             target: SplitTarget::Channel,
             node_buffer: String::new(),
+            node_msg_pending: false,
             panel_state: ChannelPanelState::new(),
         });
         app.split_focus = SplitFocus::Panel(5);
@@ -2916,6 +2943,7 @@ mod tests {
         app.split_panels.push(SplitPanel {
             target: SplitTarget::Channel,
             node_buffer: String::new(),
+            node_msg_pending: false,
             panel_state: ChannelPanelState::new(),
         });
         app.split_focus = SplitFocus::Panel(0);
@@ -2937,6 +2965,7 @@ mod tests {
         let panel = SplitPanel {
             target: SplitTarget::Channel,
             node_buffer: String::new(),
+            node_msg_pending: false,
             panel_state: ChannelPanelState::new(),
         };
         assert_eq!(panel.target, SplitTarget::Channel);
@@ -2951,6 +2980,7 @@ mod tests {
                 node_name: "alice".into(),
             },
             node_buffer: String::new(),
+            node_msg_pending: false,
             panel_state: ChannelPanelState::new(),
         };
         assert!(matches!(panel.target, SplitTarget::Node { .. }));
@@ -2966,6 +2996,7 @@ mod tests {
         app.split_panels.push(SplitPanel {
             target: SplitTarget::Channel,
             node_buffer: String::new(),
+            node_msg_pending: false,
             panel_state: ChannelPanelState::new(),
         });
         app.split_panels.push(SplitPanel {
@@ -2974,6 +3005,7 @@ mod tests {
                 node_name: "alice".into(),
             },
             node_buffer: String::new(),
+            node_msg_pending: false,
             panel_state: ChannelPanelState::new(),
         });
 
@@ -2992,6 +3024,7 @@ mod tests {
         SplitPanel {
             target,
             node_buffer: String::new(),
+            node_msg_pending: false,
             panel_state: ChannelPanelState::new(),
         }
     }
@@ -3359,6 +3392,7 @@ mod tests {
         let new_panel = SplitPanel {
             target: SplitTarget::Node { node_id: "n1".into(), node_name: "alice".into() },
             node_buffer: String::new(),
+            node_msg_pending: false,
             panel_state: ChannelPanelState::new(),
         };
         app.split_panels.push(new_panel);
@@ -3379,6 +3413,7 @@ mod tests {
         app.split_panels.push(SplitPanel {
             target: SplitTarget::Node { node_id: "n1".into(), node_name: "alice".into() },
             node_buffer: String::new(),
+            node_msg_pending: false,
             panel_state: ChannelPanelState::new(),
         });
         app.split_panels.push(make_split_panel(SplitTarget::Channel));
@@ -3481,13 +3516,16 @@ mod tests {
         app.split_panels.push(SplitPanel {
             target: SplitTarget::Node { node_id: "n1".into(), node_name: "alice".into() },
             node_buffer: String::new(),
+            node_msg_pending: false,
             panel_state: ChannelPanelState::new(),
         });
 
         let detail = node_update_chunk("hello from alice");
         app.handle_node_update("n1", "alice", &detail);
 
-        assert_eq!(app.split_panels[0].node_buffer, "hello from alice");
+        // node_buffer now has a role+timestamp header before content
+        assert!(app.split_panels[0].node_buffer.contains("hello from alice"));
+        assert!(app.split_panels[0].node_buffer.starts_with("assistant"));
     }
 
     #[test]
@@ -3497,19 +3535,21 @@ mod tests {
         app.split_panels.push(SplitPanel {
             target: SplitTarget::Node { node_id: "n1".into(), node_name: "alice".into() },
             node_buffer: String::new(),
+            node_msg_pending: false,
             panel_state: ChannelPanelState::new(),
         });
         app.split_panels.push(SplitPanel {
             target: SplitTarget::Node { node_id: "n1".into(), node_name: "alice".into() },
             node_buffer: String::new(),
+            node_msg_pending: false,
             panel_state: ChannelPanelState::new(),
         });
 
         let detail = node_update_chunk("broadcast");
         app.handle_node_update("n1", "alice", &detail);
 
-        assert_eq!(app.split_panels[0].node_buffer, "broadcast");
-        assert_eq!(app.split_panels[1].node_buffer, "broadcast");
+        assert!(app.split_panels[0].node_buffer.contains("broadcast"));
+        assert!(app.split_panels[1].node_buffer.contains("broadcast"));
     }
 
     #[test]
@@ -3518,11 +3558,13 @@ mod tests {
         app.split_panels.push(SplitPanel {
             target: SplitTarget::Node { node_id: "n1".into(), node_name: "alice".into() },
             node_buffer: String::new(),
+            node_msg_pending: false,
             panel_state: ChannelPanelState::new(),
         });
         app.split_panels.push(SplitPanel {
             target: SplitTarget::Node { node_id: "n2".into(), node_name: "bob".into() },
             node_buffer: String::new(),
+            node_msg_pending: false,
             panel_state: ChannelPanelState::new(),
         });
 
@@ -3532,8 +3574,8 @@ mod tests {
         let detail_b = node_update_chunk("bob output");
         app.handle_node_update("n2", "bob", &detail_b);
 
-        assert_eq!(app.split_panels[0].node_buffer, "alice output");
-        assert_eq!(app.split_panels[1].node_buffer, "bob output");
+        assert!(app.split_panels[0].node_buffer.contains("alice output"));
+        assert!(app.split_panels[1].node_buffer.contains("bob output"));
     }
 
     #[test]
@@ -3542,6 +3584,7 @@ mod tests {
         app.split_panels.push(SplitPanel {
             target: SplitTarget::Node { node_id: "n1".into(), node_name: "alice".into() },
             node_buffer: String::new(),
+            node_msg_pending: false,
             panel_state: ChannelPanelState::new(),
         });
 
@@ -3559,6 +3602,7 @@ mod tests {
         app.split_panels.push(SplitPanel {
             target: SplitTarget::Node { node_id: "n1".into(), node_name: "alice".into() },
             node_buffer: String::new(),
+            node_msg_pending: false,
             panel_state: ChannelPanelState::new(),
         });
         assert!(app.split_panels[0].panel_state.auto_scroll);
@@ -3697,5 +3741,125 @@ mod tests {
 
         app.input.history_down(); // back to empty draft
         assert_eq!(app.input.text, "");
+    }
+
+    // --- Bug 5b: Split panel should render AI node messages with role labels and timestamps ---
+
+    #[test]
+    fn split_node_panel_render_includes_role_and_timestamp() {
+        // Bug 5b: /split @node right panel only shows raw text,
+        // missing role labels (user/assistant) and timestamps that DM view has.
+        //
+        // The split panel uses render_text_panel() which treats node_buffer as plain
+        // text. It should render structured messages with role headers like DM view.
+        use ratatui::buffer::Buffer;
+
+        let mut app = make_app();
+        app.split_panels.push(SplitPanel {
+            target: SplitTarget::Node {
+                node_id: "n1".into(),
+                node_name: "alice".into(),
+            },
+            node_buffer: String::new(),
+            node_msg_pending: false,
+            panel_state: ChannelPanelState::new(),
+        });
+
+        // Simulate AI node producing a message via agent_message_chunk + agent_message_end
+        let chunk = node_update_chunk("Hello from assistant");
+        app.handle_node_update("n1", "alice", &chunk);
+        let end_detail = serde_json::json!({
+            "update": { "sessionUpdate": "agent_message_end" }
+        });
+        app.handle_node_update("n1", "alice", &end_detail);
+
+        // Now render the split panel into a test buffer
+        let area = Rect::new(0, 0, 60, 20);
+        let mut buf = Buffer::empty(area);
+        let panel = &mut app.split_panels[0];
+        channel_view::render_text_panel(
+            &format!("@{}", "alice"),
+            &panel.node_buffer,
+            &mut panel.panel_state,
+            true,
+            area,
+            &mut buf,
+        );
+
+        // Extract all text from the rendered buffer
+        let rendered: String = (0..area.height)
+            .map(|y| {
+                (0..area.width)
+                    .map(|x| buf.cell((x, y)).map(|c| c.symbol().to_string()).unwrap_or_default())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        // The rendered content (excluding the border title) should contain a role label
+        // AND a timestamp, like DM view does. Currently render_text_panel just dumps raw
+        // text, so this WILL FAIL (red).
+        //
+        // We check the inner content lines (skip first/last border rows) for role+timestamp.
+        let inner_lines: Vec<&str> = rendered.lines().skip(1).collect();
+        let inner_text = inner_lines.join("\n");
+
+        // Must contain a timestamp pattern (HH:MM:SS) in the content area
+        let has_timestamp = regex::Regex::new(r"\d{2}:\d{2}:\d{2}")
+            .unwrap()
+            .is_match(&inner_text);
+        assert!(
+            has_timestamp,
+            "split panel should show timestamp like DM view, but inner content:\n{}",
+            inner_text
+        );
+    }
+
+    /// Bug 5a: node_log events should route to split panel's node_buffer,
+    /// not just the DM view. Currently, node_log is only handled inside
+    /// the `if in_dm` gate and never reaches split panels.
+    #[test]
+    fn node_log_routes_to_split_panel_node_buffer() {
+        let mut app = make_app();
+
+        // We are in channel view (NOT DM mode) with a split panel targeting node "n1"
+        app.active_channel = Some("ch1".into());
+        app.view_mode = ViewMode::Channel { channel_id: "ch1".into() };
+        app.split_panels.push(SplitPanel {
+            target: SplitTarget::Node {
+                node_id: "n1".into(),
+                node_name: "context-guardian".into(),
+            },
+            node_buffer: String::new(),
+            node_msg_pending: false,
+            panel_state: ChannelPanelState::new(),
+        });
+
+        // Simulate a node_log event arriving for node "n1"
+        let detail = serde_json::json!({
+            "update": {
+                "sessionUpdate": "node_log",
+                "entries": [
+                    {
+                        "level": "info",
+                        "message": "context window compacted",
+                        "ts": "2026-04-02T10:30:45.123Z"
+                    }
+                ]
+            }
+        });
+
+        app.handle_node_update("n1", "context-guardian", &detail);
+
+        // The split panel's node_buffer should contain the log entry
+        assert!(
+            !app.split_panels[0].node_buffer.is_empty(),
+            "Bug 5a: node_log event should populate split panel node_buffer, \
+             but it was empty. node_log is only routed to DM view, not split panels."
+        );
+        assert!(
+            app.split_panels[0].node_buffer.contains("context window compacted"),
+            "Split panel node_buffer should contain the log message"
+        );
     }
 }
