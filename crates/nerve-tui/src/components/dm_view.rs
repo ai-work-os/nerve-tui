@@ -43,6 +43,8 @@ pub struct DmView {
     pub dm_history: Vec<DmMessage>,
     /// Whether the agent is currently responding (blocks user input).
     pub is_responding: bool,
+    /// Summary mode: history messages show only text (no thinking/tool_call/code fences).
+    pub summary_mode: bool,
 }
 
 impl DmView {
@@ -62,6 +64,7 @@ impl DmView {
             flushed_agents: HashSet::new(),
             dm_history: Vec::new(),
             is_responding: false,
+            summary_mode: false,
         }
     }
 
@@ -76,6 +79,10 @@ impl DmView {
 
     pub fn is_active(&self) -> bool {
         !self.agent_name.is_empty()
+    }
+
+    pub fn toggle_summary_mode(&mut self) {
+        self.summary_mode = !self.summary_mode;
     }
 
     pub fn clear(&mut self) {
@@ -399,7 +406,11 @@ impl DmView {
             };
             let mut content_lines: Vec<Line<'static>> = Vec::new();
             for block in blocks {
-                content_lines.extend(block_renderer::render_block_collapsed(block, width));
+                if self.summary_mode {
+                    content_lines.extend(block_renderer::render_block_summary(block, width));
+                } else {
+                    content_lines.extend(block_renderer::render_block_collapsed(block, width));
+                }
             }
             compact_rendered_lines(&mut content_lines);
             out.extend(content_lines);

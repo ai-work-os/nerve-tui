@@ -110,6 +110,11 @@ pub struct InputBox {
     candidates: Vec<String>,
     selected: Option<usize>,
     popup_visible: bool,
+    // Input history (shell-style up/down navigation)
+    history_entries: Vec<String>,
+    history_cursor: Option<usize>,
+    history_draft: String,
+    history_max: usize,
 }
 
 impl InputBox {
@@ -121,6 +126,10 @@ impl InputBox {
             candidates: Vec::new(),
             selected: None,
             popup_visible: false,
+            history_entries: Vec::new(),
+            history_cursor: None,
+            history_draft: String::new(),
+            history_max: 100,
         }
     }
 
@@ -292,9 +301,79 @@ impl InputBox {
         self.auto_complete();
     }
 
+    // --- Input history (shell-style up/down) ---
+
+    /// Push a message into history. Skips empty and consecutive duplicates.
+    pub fn history_push(&mut self, text: &str) {
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+        if self.history_entries.last().map(|s| s.as_str()) == Some(trimmed) {
+            return;
+        }
+        self.history_entries.push(trimmed.to_string());
+        if self.history_entries.len() > self.history_max {
+            self.history_entries.remove(0);
+        }
+        self.history_cursor = None;
+    }
+
+    /// Number of history entries.
+    pub fn history_len(&self) -> usize {
+        self.history_entries.len()
+    }
+
+    /// Navigate to the previous (older) history entry. Returns true if text was changed.
+    pub fn history_up(&mut self) -> bool {
+        if self.history_entries.is_empty() {
+            return false;
+        }
+        let new_cursor = match self.history_cursor {
+            None => {
+                // Save current input as draft before entering history
+                self.history_draft = self.text.clone();
+                self.history_entries.len() - 1
+            }
+            Some(0) => return false, // already at oldest
+            Some(c) => c - 1,
+        };
+        self.history_cursor = Some(new_cursor);
+        self.text = self.history_entries[new_cursor].clone();
+        self.cursor_pos = self.text.len();
+        true
+    }
+
+    /// Navigate to the next (newer) history entry or restore draft. Returns true if text was changed.
+    pub fn history_down(&mut self) -> bool {
+        let cursor = match self.history_cursor {
+            None => return false, // not browsing history
+            Some(c) => c,
+        };
+        if cursor + 1 < self.history_entries.len() {
+            let new_cursor = cursor + 1;
+            self.history_cursor = Some(new_cursor);
+            self.text = self.history_entries[new_cursor].clone();
+            self.cursor_pos = self.text.len();
+        } else {
+            // Past newest entry — restore draft
+            self.history_cursor = None;
+            self.text = std::mem::take(&mut self.history_draft);
+            self.cursor_pos = self.text.len();
+        }
+        true
+    }
+
+    /// Reset history browsing state (called after sending a message).
+    pub fn history_reset(&mut self) {
+        self.history_cursor = None;
+        self.history_draft.clear();
+    }
+
     pub fn take(&mut self) -> String {
         self.cursor_pos = 0;
         self.dismiss_popup();
+        self.history_reset();
         std::mem::take(&mut self.text)
     }
 
@@ -317,15 +396,11 @@ impl InputBox {
         } else {
             self.build_candidates();
             if !self.candidates.is_empty() {
-                self.apply_candidate(0);
-                if self.cursor_pos >= self.text.len()
-                    || !self.text[self.cursor_pos..].starts_with(' ')
-                {
-                    self.text.insert(self.cursor_pos, ' ');
-                    self.cursor_pos += 1;
-                }
+                self.popup_visible = true;
+                self.selected = None;
+            } else {
+                self.dismiss_popup();
             }
-            self.dismiss_popup();
         }
     }
 
@@ -392,6 +467,7 @@ impl InputBox {
         let word = self.current_word().to_lowercase();
         let before = &self.text[..self.cursor_pos];
 
+
         // Context-aware: if input starts with a command that takes a specific argument type,
         // filter candidates to only show relevant items.
         let context_prefix = if word.is_empty() {
@@ -408,12 +484,30 @@ impl InputBox {
             } else if trimmed == "/split" {
                 // After /split: show @agent names
                 Some("@")
+            } else if trimmed == "/ch" {
+                // After /ch: show #channel names
+                Some("#")
             } else {
                 None
             }
         } else {
-            None
+            // word is non-empty: check if text before the word ends with a command
+            let prefix_text = before[..before.len() - word.len()].trim_end();
+            if prefix_text == "/dm" {
+                Some("agent")
+            } else if prefix_text == "/stop" || prefix_text == "/cancel" {
+                Some("bare_agent")
+            } else if prefix_text == "/add" {
+                Some("adapter")
+            } else if prefix_text == "/split" {
+                Some("@")
+            } else if prefix_text == "/ch" {
+                Some("#")
+            } else {
+                None
+            }
         };
+
 
         self.candidates = self
             .completions
@@ -436,6 +530,14 @@ impl InputBox {
                     Some("@") => {
                         // Show @agent names
                         c.starts_with('@') && cl.starts_with(&word)
+                    }
+                    Some("#") => {
+                        // Show #channel names — match word against name with or without #
+                        if word.starts_with('#') {
+                            c.starts_with('#') && cl.starts_with(&word)
+                        } else {
+                            c.starts_with('#') && cl[1..].starts_with(&word)
+                        }
                     }
                     _ => cl.starts_with(&word),
                 }
@@ -1178,5 +1280,235 @@ mod tests {
         input.kill_to_line_start();
         assert_eq!(input.text, "lo\nworld");
         assert_eq!(input.cursor_pos, 0);
+    }
+
+    // --- Task 4c: /ch channel name completion tests ---
+
+    #[test]
+    fn ch_command_triggers_context_completion() {
+        let mut input = InputBox::new();
+        input.completions = vec![
+            "/ch".into(),
+            "#main".into(),
+            "#ops".into(),
+            "@alice".into(),
+        ];
+        input.insert_str("/ch ");
+        input.tab();
+
+        // After "/ch ", candidates should show channel names (# prefixed)
+        assert!(
+            input.candidates.iter().any(|c| c == "#main"),
+            "candidates after '/ch ' should include #main, got: {:?}",
+            input.candidates
+        );
+        assert!(
+            input.candidates.iter().any(|c| c == "#ops"),
+            "candidates after '/ch ' should include #ops, got: {:?}",
+            input.candidates
+        );
+        // Should NOT include agent names
+        assert!(
+            !input.candidates.iter().any(|c| c.contains("alice")),
+            "candidates after '/ch ' should not include agents"
+        );
+    }
+
+    #[test]
+    fn ch_command_prefix_match_without_hash() {
+        // Bug: typing `/ch guar` should match `#guardians` via prefix,
+        // just like `/dm ali` matches `alice`. Currently fails because
+        // context_prefix is None when word is non-empty, so filter
+        // uses default `starts_with("guar")` which won't match `#guardians`.
+        let mut input = InputBox::new();
+        input.completions = vec![
+            "/ch".into(),
+            "#guardians".into(),
+            "#general".into(),
+            "#ops".into(),
+            "@alice".into(),
+        ];
+        input.insert_str("/ch guar");
+        input.tab();
+
+        assert!(
+            input.candidates.iter().any(|c| c == "#guardians"),
+            "typing '/ch guar' should match #guardians by prefix, got: {:?}",
+            input.candidates
+        );
+        assert_eq!(
+            input.candidates.len(),
+            1,
+            "only #guardians should match, got: {:?}",
+            input.candidates
+        );
+    }
+
+    #[test]
+    fn ch_command_filters_by_partial_input() {
+        let mut input = InputBox::new();
+        input.completions = vec![
+            "#main".into(),
+            "#ops".into(),
+            "#ops-dev".into(),
+        ];
+        input.insert_str("/ch #op");
+        input.tab();
+
+        // Should filter to only channels starting with "#op"
+        assert!(input.candidates.iter().all(|c| c.starts_with("#op")),
+            "candidates should be filtered by partial input, got: {:?}",
+            input.candidates
+        );
+        assert!(input.candidates.len() >= 1);
+    }
+
+    // --- Task 4e: Input history tests ---
+
+    #[test]
+    fn history_push_stores_message() {
+        let mut input = InputBox::new();
+        input.history_push("hello");
+        assert_eq!(input.history_len(), 1);
+    }
+
+    #[test]
+    fn history_push_ignores_empty() {
+        let mut input = InputBox::new();
+        input.history_push("");
+        input.history_push("   ");
+        assert_eq!(input.history_len(), 0);
+    }
+
+    #[test]
+    fn history_up_shows_previous() {
+        let mut input = InputBox::new();
+        input.history_push("first");
+        input.history_push("second");
+
+        assert!(input.history_up());
+        assert_eq!(input.text, "second");
+
+        assert!(input.history_up());
+        assert_eq!(input.text, "first");
+    }
+
+    #[test]
+    fn history_up_at_oldest_returns_false() {
+        let mut input = InputBox::new();
+        input.history_push("only");
+
+        assert!(input.history_up());
+        assert_eq!(input.text, "only");
+
+        // Already at oldest — should return false and stay
+        assert!(!input.history_up());
+        assert_eq!(input.text, "only");
+    }
+
+    #[test]
+    fn history_down_navigates_forward() {
+        let mut input = InputBox::new();
+        input.history_push("first");
+        input.history_push("second");
+
+        input.history_up(); // "second"
+        input.history_up(); // "first"
+
+        assert!(input.history_down());
+        assert_eq!(input.text, "second");
+    }
+
+    #[test]
+    fn history_down_past_newest_restores_draft() {
+        let mut input = InputBox::new();
+        input.history_push("old");
+        input.insert_str("draft");
+
+        input.history_up(); // "old", draft saved
+        assert_eq!(input.text, "old");
+
+        assert!(input.history_down()); // back to draft
+        assert_eq!(input.text, "draft");
+
+        // Past newest — no-op
+        assert!(!input.history_down());
+        assert_eq!(input.text, "draft");
+    }
+
+    #[test]
+    fn history_preserves_cursor_at_end() {
+        let mut input = InputBox::new();
+        input.history_push("hello");
+
+        input.history_up();
+        assert_eq!(input.text, "hello");
+        assert_eq!(input.cursor_pos, 5); // cursor at end
+    }
+
+    #[test]
+    fn history_up_with_no_history_returns_false() {
+        let mut input = InputBox::new();
+        assert!(!input.history_up());
+    }
+
+    #[test]
+    fn history_down_with_no_history_returns_false() {
+        let mut input = InputBox::new();
+        assert!(!input.history_down());
+    }
+
+    #[test]
+    fn history_cap_at_100() {
+        let mut input = InputBox::new();
+        for i in 0..150 {
+            input.history_push(&format!("msg{}", i));
+        }
+        assert_eq!(input.history_len(), 100);
+
+        // Oldest messages (0..50) should be dropped, newest kept
+        input.history_up();
+        assert_eq!(input.text, "msg149");
+    }
+
+    #[test]
+    fn history_not_triggered_in_multiline() {
+        // This tests the data structure constraint:
+        // move_up() returns true in multiline → app should NOT call history_up()
+        let mut input = InputBox::new();
+        input.history_push("old");
+        input.insert_str("line1\nline2");
+
+        // In multiline, move_up works for line navigation
+        assert!(input.is_multiline());
+        assert!(input.move_up()); // moves cursor, not history
+
+        // Text should still be the multiline content, not history
+        assert_eq!(input.text, "line1\nline2");
+    }
+
+    #[test]
+    fn history_reset_on_send() {
+        let mut input = InputBox::new();
+        input.history_push("first");
+        input.history_push("second");
+
+        input.history_up(); // browsing history
+        assert_eq!(input.text, "second");
+
+        // Simulate send: take() should reset history index
+        let _ = input.take();
+
+        // Next history_up should start from newest again
+        input.history_up();
+        assert_eq!(input.text, "second");
+    }
+
+    #[test]
+    fn history_does_not_duplicate_consecutive() {
+        let mut input = InputBox::new();
+        input.history_push("same");
+        input.history_push("same");
+        assert_eq!(input.history_len(), 1);
     }
 }

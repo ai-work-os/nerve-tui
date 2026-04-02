@@ -67,17 +67,31 @@ fn render_block_inner(block: &ContentBlock, width: u16, collapsed: bool) -> Vec<
     }
 }
 
+/// Render a ContentBlock in summary mode: only Text blocks (with code fences stripped).
+pub fn render_block_summary(block: &ContentBlock, width: u16) -> Vec<Line<'static>> {
+    match block {
+        ContentBlock::Text { text } => render_text_summary(text, width),
+        _ => vec![], // non-text blocks hidden in summary mode
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Text block: pulldown-cmark + syntect for code highlighting
 // ---------------------------------------------------------------------------
 
 fn render_text(content: &str, _width: u16) -> Vec<Line<'static>> {
     let mut out = Vec::new();
-    render_markdown(content, &mut out);
+    render_markdown(content, &mut out, false);
     out
 }
 
-fn render_markdown(content: &str, out: &mut Vec<Line<'static>>) {
+fn render_text_summary(content: &str, _width: u16) -> Vec<Line<'static>> {
+    let mut out = Vec::new();
+    render_markdown(content, &mut out, true);
+    out
+}
+
+fn render_markdown(content: &str, out: &mut Vec<Line<'static>>, skip_code_blocks: bool) {
     let opts = Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TABLES;
     let parser = Parser::new_ext(content, opts);
 
@@ -95,9 +109,25 @@ fn render_markdown(content: &str, out: &mut Vec<Line<'static>>) {
     let mut table_cell_buf = String::new();
     let mut in_table_head = false;
     let mut table_rows: Vec<(Vec<String>, bool)> = Vec::new(); // (cells, is_header)
+    let mut in_skipped_code = false;
 
     for event in parser {
+        // In summary mode, skip code block events entirely
+        if in_skipped_code {
+            if matches!(event, Event::End(TagEnd::CodeBlock)) {
+                in_skipped_code = false;
+            }
+            continue;
+        }
+
         match event {
+            Event::Start(Tag::CodeBlock(kind)) if skip_code_blocks => {
+                // Flush current line before skipping
+                if !current_spans.is_empty() {
+                    out.push(Line::from(std::mem::take(&mut current_spans)));
+                }
+                in_skipped_code = true;
+            }
             Event::Start(Tag::CodeBlock(kind)) => {
                 // Flush current line
                 if !current_spans.is_empty() {
@@ -1229,5 +1259,64 @@ mod tests {
         let expanded = render_block(&block, 80);
         let collapsed = render_block_collapsed(&block, 80);
         assert_eq!(expanded.len(), collapsed.len());
+    }
+
+    // --- Task 4d: summary mode rendering tests ---
+
+    #[test]
+    fn summary_mode_hides_thinking_block() {
+        let block = ContentBlock::Thinking {
+            text: "deep thought about the problem".into(),
+            started_at: Some(Instant::now()),
+            finished_at: Some(Instant::now()),
+        };
+        let lines = render_block_summary(&block, 80);
+        // In summary mode, thinking blocks should not render (empty)
+        assert!(
+            lines.is_empty(),
+            "summary mode should hide thinking blocks, got {} lines",
+            lines.len()
+        );
+    }
+
+    #[test]
+    fn summary_mode_hides_tool_call_block() {
+        let block = ContentBlock::ToolCall {
+            id: "tc1".into(),
+            name: "Read".into(),
+            input: r#"{"path": "/tmp/file.rs"}"#.into(),
+            status: ToolStatus::Completed,
+        };
+        let lines = render_block_summary(&block, 80);
+        assert!(
+            lines.is_empty(),
+            "summary mode should hide tool_call blocks, got {} lines",
+            lines.len()
+        );
+    }
+
+    #[test]
+    fn summary_mode_hides_code_fence_in_text() {
+        let text_with_code = "Here is some text\n```rust\nfn main() {}\n```\nMore text after";
+        let block = ContentBlock::Text { text: text_with_code.into() };
+        let lines = render_block_summary(&block, 80);
+        let rendered: String = lines.iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
+            .collect();
+        // Code fence content should be hidden
+        assert!(!rendered.contains("fn main"), "summary mode should hide code fences");
+        // Plain text should remain
+        assert!(rendered.contains("Here is some text"), "summary mode should keep plain text");
+        assert!(rendered.contains("More text after"), "summary mode should keep text after code fence");
+    }
+
+    #[test]
+    fn summary_mode_renders_plain_text() {
+        let block = ContentBlock::Text { text: "simple plain text".into() };
+        let lines = render_block_summary(&block, 80);
+        let rendered: String = lines.iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
+            .collect();
+        assert!(rendered.contains("simple plain text"));
     }
 }
