@@ -136,6 +136,9 @@ impl Window {
 mod tests {
     use super::*;
 
+    // NOTE: unsubscribe 调用测试在 Phase 2 App 集成测试中覆盖
+    // Phase 1 只测 buffer/pool 数据结构层，不涉及 client mock
+
     // ========== 1. BufferId 相等性 ==========
 
     #[test]
