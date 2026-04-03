@@ -16,19 +16,19 @@ pub struct ChannelViewStub {
 
 impl ChannelViewStub {
     pub fn new() -> Self {
-        todo!()
+        Self { messages: Vec::new() }
     }
 
     pub fn push(&mut self, msg: &str) {
-        todo!()
+        self.messages.push(msg.to_string());
     }
 
     pub fn clear(&mut self) {
-        todo!()
+        self.messages.clear();
     }
 
     pub fn messages(&self) -> &[String] {
-        todo!()
+        &self.messages
     }
 }
 
@@ -40,19 +40,19 @@ pub struct DmViewStub {
 
 impl DmViewStub {
     pub fn new() -> Self {
-        todo!()
+        Self { messages: Vec::new() }
     }
 
     pub fn push(&mut self, msg: &str) {
-        todo!()
+        self.messages.push(msg.to_string());
     }
 
     pub fn clear(&mut self) {
-        todo!()
+        self.messages.clear();
     }
 
     pub fn messages(&self) -> &[String] {
-        todo!()
+        &self.messages
     }
 }
 
@@ -74,17 +74,25 @@ pub struct BufferEntry {
 impl BufferEntry {
     /// 创建新 buffer entry
     pub fn new(id: BufferId, content: BufferContent) -> Self {
-        todo!()
+        Self { id, content, content_version: 0 }
     }
 
     /// 内容变更时调用，递增版本号
     pub fn bump_version(&mut self) {
-        todo!()
+        self.content_version += 1;
     }
 
     /// 清空内容并重置 content_version 为 0
     pub fn clear(&mut self) {
-        todo!()
+        match &mut self.content {
+            BufferContent::Channel(cv) => cv.clear(),
+            BufferContent::Dm(dv) => dv.clear(),
+            BufferContent::NodeLog { text, pending } => {
+                text.clear();
+                *pending = false;
+            }
+        }
+        self.content_version = 0;
     }
 }
 
@@ -95,22 +103,29 @@ pub struct BufferPool {
 
 impl BufferPool {
     pub fn new() -> Self {
-        todo!()
+        Self { buffers: HashMap::new() }
     }
 
     /// 获取已有 buffer 的不可变引用
     pub fn get(&self, id: &BufferId) -> Option<&BufferEntry> {
-        todo!()
+        self.buffers.get(id)
     }
 
     /// 获取已有 buffer 的可变引用
     pub fn get_mut(&mut self, id: &BufferId) -> Option<&mut BufferEntry> {
-        todo!()
+        self.buffers.get_mut(id)
     }
 
     /// 获取或创建 buffer，根据 BufferId variant 创建对应的 BufferContent
     pub fn get_or_create(&mut self, id: BufferId) -> &mut BufferEntry {
-        todo!()
+        self.buffers.entry(id.clone()).or_insert_with(|| {
+            let content = match &id {
+                BufferId::Channel { .. } => BufferContent::Channel(ChannelViewStub::new()),
+                BufferId::Dm { .. } => BufferContent::Dm(DmViewStub::new()),
+                BufferId::NodeLog { .. } => BufferContent::NodeLog { text: String::new(), pending: false },
+            };
+            BufferEntry::new(id, content)
+        })
     }
 }
 
@@ -128,7 +143,13 @@ pub struct Window {
 impl Window {
     /// 创建新窗口，last_seen_version 初始化为 buffer 当前版本
     pub fn new(buffer_id: BufferId, current_content_version: u64) -> Self {
-        todo!()
+        Self {
+            buffer_id,
+            scroll_offset: 0,
+            auto_scroll: true,
+            has_new_messages: false,
+            last_seen_version: current_content_version,
+        }
     }
 }
 
