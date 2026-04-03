@@ -177,6 +177,7 @@ impl Window {
     /// 向下滚动 n 行（不低于 0）
     pub fn scroll_down(&mut self, n: u16) {
         self.scroll_offset = self.scroll_offset.saturating_sub(n);
+        self.auto_scroll = false;
     }
 
     /// 跳到底部：设置正确的 offset，恢复 auto_scroll，清除 has_new_messages
