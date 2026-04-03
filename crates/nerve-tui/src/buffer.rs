@@ -211,7 +211,7 @@ impl WindowLayout {
             return;
         }
         self.panels.remove(index);
-        self.panel_x_boundaries.pop();
+        self.panel_x_boundaries.remove(index);
         if self.panels.is_empty() {
             self.focus = WindowFocus::Primary;
         } else if let WindowFocus::Panel(i) = self.focus {
