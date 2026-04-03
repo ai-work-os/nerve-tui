@@ -170,27 +170,30 @@ impl Window {
 
     /// 向上滚动 n 行，关闭 auto_scroll
     pub fn scroll_up(&mut self, n: u16) {
-        todo!()
+        self.scroll_offset = self.scroll_offset.saturating_add(n);
+        self.auto_scroll = false;
     }
 
     /// 向下滚动 n 行（不低于 0）
     pub fn scroll_down(&mut self, n: u16) {
-        todo!()
+        self.scroll_offset = self.scroll_offset.saturating_sub(n);
     }
 
     /// 跳到底部：设置正确的 offset，恢复 auto_scroll，清除 has_new_messages
     pub fn snap_to_bottom(&mut self, total_lines: u16, visible_height: u16) {
-        todo!()
+        self.scroll_offset = total_lines.saturating_sub(visible_height);
+        self.auto_scroll = true;
+        self.has_new_messages = false;
     }
 
     /// 上翻一页
     pub fn page_up(&mut self, visible_height: u16) {
-        todo!()
+        self.scroll_up(visible_height);
     }
 
     /// 下翻一页（不低于 0）
     pub fn page_down(&mut self, visible_height: u16) {
-        todo!()
+        self.scroll_down(visible_height);
     }
 }
 
