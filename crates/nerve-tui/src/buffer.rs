@@ -167,6 +167,31 @@ impl Window {
             false
         }
     }
+
+    /// 向上滚动 n 行，关闭 auto_scroll
+    pub fn scroll_up(&mut self, n: u16) {
+        todo!()
+    }
+
+    /// 向下滚动 n 行（不低于 0）
+    pub fn scroll_down(&mut self, n: u16) {
+        todo!()
+    }
+
+    /// 跳到底部：设置正确的 offset，恢复 auto_scroll，清除 has_new_messages
+    pub fn snap_to_bottom(&mut self, total_lines: u16, visible_height: u16) {
+        todo!()
+    }
+
+    /// 上翻一页
+    pub fn page_up(&mut self, visible_height: u16) {
+        todo!()
+    }
+
+    /// 下翻一页（不低于 0）
+    pub fn page_down(&mut self, visible_height: u16) {
+        todo!()
+    }
 }
 
 /// 焦点位置
@@ -939,5 +964,155 @@ mod tests {
         layout.remove_panel(0);
         layout.remove_panel(0);
         assert_eq!(layout.panel_count(), 0);
+    }
+
+    // ==========================================================
+    // Phase 3: 滚动状态外移测试
+    // ==========================================================
+
+    // ========== 22. scroll_up ==========
+
+    #[test]
+    fn scroll_up_increases_offset_and_disables_auto_scroll() {
+        let mut w = Window::new(BufferId::Channel { channel_id: "ch1".into() }, 0);
+        assert!(w.auto_scroll);
+        assert_eq!(w.scroll_offset, 0);
+
+        w.scroll_up(3);
+        assert_eq!(w.scroll_offset, 3);
+        assert!(!w.auto_scroll, "scroll_up should disable auto_scroll");
+
+        w.scroll_up(2);
+        assert_eq!(w.scroll_offset, 5);
+    }
+
+    // ========== 23. scroll_down ==========
+
+    #[test]
+    fn scroll_down_decreases_offset_not_below_zero() {
+        let mut w = Window::new(BufferId::Channel { channel_id: "ch1".into() }, 0);
+        w.scroll_up(5);
+        assert_eq!(w.scroll_offset, 5);
+
+        w.scroll_down(3);
+        assert_eq!(w.scroll_offset, 2);
+
+        // 不低于 0
+        w.scroll_down(10);
+        assert_eq!(w.scroll_offset, 0);
+    }
+
+    // ========== 24. snap_to_bottom ==========
+
+    #[test]
+    fn snap_to_bottom_sets_correct_offset() {
+        let mut w = Window::new(BufferId::Channel { channel_id: "ch1".into() }, 0);
+        w.scroll_up(10);
+        w.has_new_messages = true;
+        assert!(!w.auto_scroll);
+
+        // total_lines=50, visible_height=20 → offset 应使底部可见
+        w.snap_to_bottom(50, 20);
+        assert!(w.auto_scroll, "snap should restore auto_scroll");
+        assert!(!w.has_new_messages, "snap should clear has_new_messages");
+        // offset 应为 total_lines - visible_height = 30，或 0 如果 total ≤ visible
+        assert_eq!(w.scroll_offset, 30);
+    }
+
+    #[test]
+    fn snap_to_bottom_when_content_fits_in_view() {
+        let mut w = Window::new(BufferId::Channel { channel_id: "ch1".into() }, 0);
+        w.scroll_up(5);
+
+        // total_lines=10, visible_height=20 → 内容不超过视口，offset=0
+        w.snap_to_bottom(10, 20);
+        assert_eq!(w.scroll_offset, 0);
+        assert!(w.auto_scroll);
+    }
+
+    // ========== 25. page_up / page_down ==========
+
+    #[test]
+    fn page_up_scrolls_by_visible_height() {
+        let mut w = Window::new(BufferId::Channel { channel_id: "ch1".into() }, 0);
+
+        w.page_up(20);
+        assert_eq!(w.scroll_offset, 20);
+        assert!(!w.auto_scroll);
+
+        w.page_up(20);
+        assert_eq!(w.scroll_offset, 40);
+    }
+
+    #[test]
+    fn page_down_scrolls_by_visible_height_not_below_zero() {
+        let mut w = Window::new(BufferId::Channel { channel_id: "ch1".into() }, 0);
+        w.scroll_up(50);
+
+        w.page_down(20);
+        assert_eq!(w.scroll_offset, 30);
+
+        w.page_down(20);
+        assert_eq!(w.scroll_offset, 10);
+
+        // 不低于 0
+        w.page_down(20);
+        assert_eq!(w.scroll_offset, 0);
+    }
+
+    // ========== 26. streaming 场景：连续 bump + check ==========
+
+    #[test]
+    fn streaming_continuous_snap_with_auto_scroll() {
+        let mut w = Window::new(BufferId::Channel { channel_id: "ch1".into() }, 0);
+
+        // 模拟 streaming：连续 5 次 content_version 递增
+        for v in 1..=5u64 {
+            let should_snap = w.check_content_version(v);
+            assert!(should_snap, "auto_scroll=true should snap at version {v}");
+            assert_eq!(w.last_seen_version, v);
+        }
+        assert!(w.auto_scroll);
+        assert!(!w.has_new_messages);
+    }
+
+    // ========== 27. 用户滚动后 streaming 继续 ==========
+
+    #[test]
+    fn user_scroll_then_streaming_sets_new_messages_no_snap() {
+        let mut w = Window::new(BufferId::Channel { channel_id: "ch1".into() }, 0);
+
+        // 用户向上滚动 → auto_scroll=false
+        w.scroll_up(5);
+        assert!(!w.auto_scroll);
+
+        // streaming 继续产生新内容
+        let snap1 = w.check_content_version(1);
+        assert!(!snap1, "should not snap when user scrolled up");
+        assert!(w.has_new_messages, "should mark has_new_messages");
+        assert_eq!(w.last_seen_version, 1);
+
+        let snap2 = w.check_content_version(2);
+        assert!(!snap2);
+        assert!(w.has_new_messages);
+        assert_eq!(w.last_seen_version, 2);
+    }
+
+    #[test]
+    fn user_snap_back_clears_new_messages_resumes_auto_scroll() {
+        let mut w = Window::new(BufferId::Channel { channel_id: "ch1".into() }, 0);
+        w.scroll_up(5);
+        w.check_content_version(3);
+        assert!(w.has_new_messages);
+        assert!(!w.auto_scroll);
+
+        // 用户 snap_to_bottom
+        w.snap_to_bottom(100, 20);
+        assert!(w.auto_scroll);
+        assert!(!w.has_new_messages);
+
+        // 后续 streaming 应恢复 snap
+        let should_snap = w.check_content_version(4);
+        assert!(should_snap);
     }
 }
