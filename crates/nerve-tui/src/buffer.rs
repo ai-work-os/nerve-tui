@@ -865,4 +865,40 @@ mod tests {
         layout.primary = Window::new(BufferId::Channel { channel_id: "ch2".into() }, 0);
         assert_eq!(layout.panel_count(), 1);
     }
+
+    // ========== 20. panel_x_boundaries 缓存 ==========
+
+    #[test]
+    fn panel_x_boundaries_length_matches_panels() {
+        let primary = Window::new(BufferId::Channel { channel_id: "ch1".into() }, 0);
+        let mut layout = WindowLayout::new(primary);
+        assert_eq!(layout.panel_x_boundaries.len(), 0);
+
+        layout.add_panel(Window::new(BufferId::NodeLog { node_id: "n1".into() }, 0));
+        assert_eq!(layout.panel_x_boundaries.len(), layout.panel_count());
+
+        layout.add_panel(Window::new(BufferId::NodeLog { node_id: "n2".into() }, 0));
+        assert_eq!(layout.panel_x_boundaries.len(), layout.panel_count());
+
+        layout.remove_panel(0);
+        assert_eq!(layout.panel_x_boundaries.len(), layout.panel_count());
+    }
+
+    // ========== 21. 越界 remove 边界 ==========
+
+    #[test]
+    fn remove_panel_out_of_bounds_is_noop() {
+        let primary = Window::new(BufferId::Channel { channel_id: "ch1".into() }, 0);
+        let mut layout = WindowLayout::new(primary);
+        layout.add_panel(Window::new(BufferId::NodeLog { node_id: "n1".into() }, 0));
+
+        // remove 超出范围的 index 不应 panic，panel 数不变
+        layout.remove_panel(5);
+        assert_eq!(layout.panel_count(), 1);
+
+        // 空 panels 时 remove 也不应 panic
+        layout.remove_panel(0);
+        layout.remove_panel(0);
+        assert_eq!(layout.panel_count(), 0);
+    }
 }
