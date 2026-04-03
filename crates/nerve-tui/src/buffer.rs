@@ -151,6 +151,63 @@ impl Window {
             last_seen_version: current_content_version,
         }
     }
+
+    /// 检查 buffer 的 content_version，决定是否 snap_to_bottom 或标记 has_new_messages
+    /// 返回 true 表示需要 snap_to_bottom
+    pub fn check_content_version(&mut self, buffer_version: u64) -> bool {
+        todo!()
+    }
+}
+
+/// 焦点位置
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum WindowFocus {
+    Primary,
+    Panel(usize),
+}
+
+/// 窗口布局：primary + panels
+pub struct WindowLayout {
+    /// 主窗口（左侧，始终存在）
+    pub primary: Window,
+    /// 右侧面板（0..N）
+    pub panels: Vec<Window>,
+    /// 焦点位置
+    pub focus: WindowFocus,
+    /// 面板左边界 x 坐标缓存
+    pub panel_x_boundaries: Vec<u16>,
+}
+
+impl WindowLayout {
+    /// 创建新布局，primary 窗口必须提供
+    pub fn new(primary: Window) -> Self {
+        todo!()
+    }
+
+    /// 添加 panel 窗口
+    pub fn add_panel(&mut self, window: Window) {
+        todo!()
+    }
+
+    /// 关闭指定 panel，focus 自动 clamp
+    pub fn remove_panel(&mut self, index: usize) {
+        todo!()
+    }
+
+    /// panel 数量
+    pub fn panel_count(&self) -> usize {
+        todo!()
+    }
+
+    /// 焦点循环：Primary → Panel(0) → Panel(1) → ... → Primary
+    pub fn cycle_focus_forward(&mut self) {
+        todo!()
+    }
+
+    /// 检查 panels 中是否还有引用指定 buffer_id 的窗口
+    pub fn has_panel_for_buffer(&self, buffer_id: &BufferId) -> bool {
+        todo!()
+    }
 }
 
 #[cfg(test)]
@@ -599,5 +656,213 @@ mod tests {
             }
             _ => panic!("expected NodeLog variant"),
         }
+    }
+
+    // ==========================================================
+    // Phase 2: Window + WindowLayout 测试
+    // NOTE: unsubscribe 调用测试在 App 集成测试中覆盖
+    // ==========================================================
+
+    // ========== 11. WindowLayout 基础 ==========
+
+    #[test]
+    fn window_layout_new_has_primary_and_empty_panels() {
+        let primary = Window::new(BufferId::Channel { channel_id: "ch1".into() }, 0);
+        let layout = WindowLayout::new(primary);
+        assert_eq!(layout.panel_count(), 0);
+        assert_eq!(layout.focus, WindowFocus::Primary);
+        assert_eq!(layout.primary.buffer_id, BufferId::Channel { channel_id: "ch1".into() });
+    }
+
+    // ========== 12. 添加 panel window ==========
+
+    #[test]
+    fn layout_add_panel_increments_count() {
+        let primary = Window::new(BufferId::Channel { channel_id: "ch1".into() }, 0);
+        let mut layout = WindowLayout::new(primary);
+
+        let panel = Window::new(BufferId::NodeLog { node_id: "n1".into() }, 0);
+        layout.add_panel(panel);
+        assert_eq!(layout.panel_count(), 1);
+
+        let panel2 = Window::new(BufferId::NodeLog { node_id: "n2".into() }, 0);
+        layout.add_panel(panel2);
+        assert_eq!(layout.panel_count(), 2);
+    }
+
+    // ========== 13. WindowFocus 循环 ==========
+
+    #[test]
+    fn focus_cycle_with_no_panels() {
+        let primary = Window::new(BufferId::Channel { channel_id: "ch1".into() }, 0);
+        let mut layout = WindowLayout::new(primary);
+        assert_eq!(layout.focus, WindowFocus::Primary);
+        // 无 panel 时 cycle 应停留在 Primary
+        layout.cycle_focus_forward();
+        assert_eq!(layout.focus, WindowFocus::Primary);
+    }
+
+    #[test]
+    fn focus_cycle_through_panels_and_back() {
+        let primary = Window::new(BufferId::Channel { channel_id: "ch1".into() }, 0);
+        let mut layout = WindowLayout::new(primary);
+
+        layout.add_panel(Window::new(BufferId::NodeLog { node_id: "n1".into() }, 0));
+        layout.add_panel(Window::new(BufferId::NodeLog { node_id: "n2".into() }, 0));
+
+        assert_eq!(layout.focus, WindowFocus::Primary);
+        layout.cycle_focus_forward();
+        assert_eq!(layout.focus, WindowFocus::Panel(0));
+        layout.cycle_focus_forward();
+        assert_eq!(layout.focus, WindowFocus::Panel(1));
+        layout.cycle_focus_forward();
+        assert_eq!(layout.focus, WindowFocus::Primary);
+    }
+
+    // ========== 14. 关闭 panel → focus clamp ==========
+
+    #[test]
+    fn remove_panel_clamps_focus_to_primary() {
+        let primary = Window::new(BufferId::Channel { channel_id: "ch1".into() }, 0);
+        let mut layout = WindowLayout::new(primary);
+        layout.add_panel(Window::new(BufferId::NodeLog { node_id: "n1".into() }, 0));
+
+        // focus 在 Panel(0)，关闭该 panel 后 focus 应回到 Primary
+        layout.cycle_focus_forward();
+        assert_eq!(layout.focus, WindowFocus::Panel(0));
+        layout.remove_panel(0);
+        assert_eq!(layout.panel_count(), 0);
+        assert_eq!(layout.focus, WindowFocus::Primary);
+    }
+
+    #[test]
+    fn remove_panel_clamps_focus_index() {
+        let primary = Window::new(BufferId::Channel { channel_id: "ch1".into() }, 0);
+        let mut layout = WindowLayout::new(primary);
+        layout.add_panel(Window::new(BufferId::NodeLog { node_id: "n1".into() }, 0));
+        layout.add_panel(Window::new(BufferId::NodeLog { node_id: "n2".into() }, 0));
+
+        // focus 在 Panel(1)，关闭 Panel(1) 后 focus 应 clamp 到 Panel(0)
+        layout.cycle_focus_forward(); // Panel(0)
+        layout.cycle_focus_forward(); // Panel(1)
+        assert_eq!(layout.focus, WindowFocus::Panel(1));
+        layout.remove_panel(1);
+        assert_eq!(layout.panel_count(), 1);
+        assert_eq!(layout.focus, WindowFocus::Panel(0));
+    }
+
+    // ========== 15. content_version 驱动 auto_scroll ==========
+
+    #[test]
+    fn check_version_with_auto_scroll_returns_snap() {
+        let mut window = Window::new(BufferId::Channel { channel_id: "ch1".into() }, 0);
+        assert!(window.auto_scroll);
+
+        // buffer version 递增到 3
+        let should_snap = window.check_content_version(3);
+        assert!(should_snap, "auto_scroll=true + new version should snap");
+        assert_eq!(window.last_seen_version, 3);
+        assert!(!window.has_new_messages);
+    }
+
+    #[test]
+    fn check_version_same_version_no_snap() {
+        let mut window = Window::new(BufferId::Channel { channel_id: "ch1".into() }, 5);
+        let should_snap = window.check_content_version(5);
+        assert!(!should_snap, "same version should not snap");
+        assert!(!window.has_new_messages);
+    }
+
+    // ========== 16. content_version 驱动 has_new_messages ==========
+
+    #[test]
+    fn check_version_without_auto_scroll_sets_has_new_messages() {
+        let mut window = Window::new(BufferId::Channel { channel_id: "ch1".into() }, 0);
+        window.auto_scroll = false;
+
+        let should_snap = window.check_content_version(2);
+        assert!(!should_snap, "auto_scroll=false should not snap");
+        assert!(window.has_new_messages, "should mark has_new_messages");
+        assert_eq!(window.last_seen_version, 2);
+    }
+
+    // ========== 17. 已有历史 buffer 新开 window 不误报 ==========
+
+    #[test]
+    fn window_on_existing_buffer_no_false_new_messages() {
+        let mut pool = BufferPool::new();
+        let id = BufferId::Channel { channel_id: "ch1".into() };
+        let entry = pool.get_or_create(id.clone());
+        // 模拟已有 10 条消息
+        for _ in 0..10 {
+            if let BufferContent::Channel(ref mut cv) = entry.content {
+                cv.push("msg");
+            }
+            entry.bump_version();
+        }
+        assert_eq!(entry.content_version, 10);
+
+        // 新开 window，用 buffer 当前 version
+        let mut window = Window::new(id, entry.content_version);
+        // check 同版本不应触发任何指示
+        let should_snap = window.check_content_version(10);
+        assert!(!should_snap);
+        assert!(!window.has_new_messages);
+    }
+
+    // ========== 18. NodeLog window 全关闭检测 ==========
+
+    #[test]
+    fn has_panel_for_buffer_after_all_removed() {
+        let primary = Window::new(BufferId::Channel { channel_id: "ch1".into() }, 0);
+        let mut layout = WindowLayout::new(primary);
+        let log_id = BufferId::NodeLog { node_id: "n1".into() };
+
+        layout.add_panel(Window::new(log_id.clone(), 0));
+        layout.add_panel(Window::new(log_id.clone(), 0));
+        assert!(layout.has_panel_for_buffer(&log_id));
+
+        // 关闭第一个，还有引用
+        layout.remove_panel(0);
+        assert!(layout.has_panel_for_buffer(&log_id));
+
+        // 关闭最后一个，无引用
+        layout.remove_panel(0);
+        assert!(!layout.has_panel_for_buffer(&log_id), "no panels should reference this buffer");
+    }
+
+    // ========== 19. primary buffer_id 跟随切换 ==========
+
+    #[test]
+    fn primary_buffer_id_follows_channel_switch() {
+        let primary = Window::new(BufferId::Channel { channel_id: "ch1".into() }, 0);
+        let mut layout = WindowLayout::new(primary);
+
+        // 模拟切频道：更新 primary.buffer_id
+        let new_id = BufferId::Channel { channel_id: "ch2".into() };
+        layout.primary = Window::new(new_id.clone(), 0);
+        assert_eq!(layout.primary.buffer_id, new_id);
+    }
+
+    #[test]
+    fn primary_buffer_id_follows_dm_enter() {
+        let primary = Window::new(BufferId::Channel { channel_id: "ch1".into() }, 0);
+        let mut layout = WindowLayout::new(primary);
+
+        // 模拟进 DM：更新 primary.buffer_id
+        let dm_id = BufferId::Dm { node_id: "node1".into() };
+        layout.primary = Window::new(dm_id.clone(), 0);
+        assert_eq!(layout.primary.buffer_id, dm_id);
+    }
+
+    #[test]
+    fn primary_switch_preserves_panels() {
+        let primary = Window::new(BufferId::Channel { channel_id: "ch1".into() }, 0);
+        let mut layout = WindowLayout::new(primary);
+        layout.add_panel(Window::new(BufferId::NodeLog { node_id: "n1".into() }, 0));
+
+        // 切频道后 panels 不受影响
+        layout.primary = Window::new(BufferId::Channel { channel_id: "ch2".into() }, 0);
+        assert_eq!(layout.panel_count(), 1);
     }
 }
