@@ -155,7 +155,17 @@ impl Window {
     /// 检查 buffer 的 content_version，决定是否 snap_to_bottom 或标记 has_new_messages
     /// 返回 true 表示需要 snap_to_bottom
     pub fn check_content_version(&mut self, buffer_version: u64) -> bool {
-        todo!()
+        if buffer_version > self.last_seen_version {
+            self.last_seen_version = buffer_version;
+            if self.auto_scroll {
+                true
+            } else {
+                self.has_new_messages = true;
+                false
+            }
+        } else {
+            false
+        }
     }
 }
 
@@ -181,32 +191,61 @@ pub struct WindowLayout {
 impl WindowLayout {
     /// 创建新布局，primary 窗口必须提供
     pub fn new(primary: Window) -> Self {
-        todo!()
+        Self {
+            primary,
+            panels: Vec::new(),
+            focus: WindowFocus::Primary,
+            panel_x_boundaries: Vec::new(),
+        }
     }
 
     /// 添加 panel 窗口
     pub fn add_panel(&mut self, window: Window) {
-        todo!()
+        self.panels.push(window);
+        self.panel_x_boundaries.push(0);
     }
 
     /// 关闭指定 panel，focus 自动 clamp
     pub fn remove_panel(&mut self, index: usize) {
-        todo!()
+        if index >= self.panels.len() {
+            return;
+        }
+        self.panels.remove(index);
+        self.panel_x_boundaries.pop();
+        if self.panels.is_empty() {
+            self.focus = WindowFocus::Primary;
+        } else if let WindowFocus::Panel(i) = self.focus {
+            if i >= self.panels.len() {
+                self.focus = WindowFocus::Panel(self.panels.len() - 1);
+            }
+        }
     }
 
     /// panel 数量
     pub fn panel_count(&self) -> usize {
-        todo!()
+        self.panels.len()
     }
 
     /// 焦点循环：Primary → Panel(0) → Panel(1) → ... → Primary
     pub fn cycle_focus_forward(&mut self) {
-        todo!()
+        if self.panels.is_empty() {
+            return;
+        }
+        self.focus = match self.focus {
+            WindowFocus::Primary => WindowFocus::Panel(0),
+            WindowFocus::Panel(i) => {
+                if i + 1 < self.panels.len() {
+                    WindowFocus::Panel(i + 1)
+                } else {
+                    WindowFocus::Primary
+                }
+            }
+        };
     }
 
     /// 检查 panels 中是否还有引用指定 buffer_id 的窗口
     pub fn has_panel_for_buffer(&self, buffer_id: &BufferId) -> bool {
-        todo!()
+        self.panels.iter().any(|w| &w.buffer_id == buffer_id)
     }
 }
 
