@@ -788,6 +788,15 @@ impl App {
     }
 
     async fn confirm_selected_navigation(&mut self) {
+        // Check if selected item is a section header → toggle collapse
+        let items = self.status_bar.visible_items(&self.channels, &self.agents);
+        if let Some(SidebarItem::SectionHeader(ref name)) = items.get(self.status_bar.selected_nav)
+        {
+            let name = name.clone();
+            self.status_bar.toggle_section(&name);
+            return;
+        }
+
         match self
             .status_bar
             .selected_target(&self.channels, &self.agents)
@@ -2335,6 +2344,8 @@ mod tests {
 
         app.sync_navigation_selection();
 
+        // visible: Channel(ch1), Channel(ch2), SectionHeader, Agent
+        // ch2 is at visible index 1
         assert_eq!(app.status_bar.selected_nav, 1);
     }
 
@@ -2381,7 +2392,9 @@ mod tests {
 
         app.sync_navigation_selection();
 
-        assert_eq!(app.status_bar.selected_nav, 2);
+        // visible: Channel(ch1), SectionHeader("AI Agents"), Agent(alice), Agent(bob)
+        // bob is Agent(1) at visible index 3
+        assert_eq!(app.status_bar.selected_nav, 3);
     }
 
     #[tokio::test]
@@ -3861,5 +3874,52 @@ mod tests {
             app.split_panels[0].node_buffer.contains("context window compacted"),
             "Split panel node_buffer should contain the log message"
         );
+    }
+
+    #[tokio::test]
+    async fn enter_on_section_header_toggles_collapse() {
+        let mut app = make_app();
+        app.channels = vec![ChannelDisplay {
+            id: "ch1".into(),
+            name: Some("main".into()),
+            node_count: 2,
+            members: Vec::new(),
+            unread: 0,
+        }];
+        app.agents = vec![
+            AgentDisplay {
+                name: "ai-1".into(), status: "idle".into(), activity: None,
+                adapter: Some("claude".into()), node_id: "n1".into(),
+                transport: "stdio".into(), capabilities: vec![],
+                usage: None, tool_call_name: None, tool_call_started: None, waiting_for: None,
+            },
+            AgentDisplay {
+                name: "ai-2".into(), status: "idle".into(), activity: None,
+                adapter: Some("claude".into()), node_id: "n2".into(),
+                transport: "stdio".into(), capabilities: vec![],
+                usage: None, tool_call_name: None, tool_call_started: None, waiting_for: None,
+            },
+        ];
+
+        // visible: Channel(0), SectionHeader("AI Agents"), Agent(0), Agent(1) = 4 items
+        assert_eq!(app.status_bar.nav_count(&app.channels, &app.agents), 4);
+        assert!(!app.status_bar.collapsed_sections.contains("AI Agents"));
+
+        // Navigate to section header (index 1)
+        app.status_bar.selected_nav = 1;
+
+        // Pressing Enter on section header should toggle collapse
+        app.confirm_selected_navigation().await;
+        assert!(app.status_bar.collapsed_sections.contains("AI Agents"),
+                "Enter on SectionHeader should collapse the section");
+
+        // After collapse: Channel(0), SectionHeader("AI Agents") = 2 items
+        assert_eq!(app.status_bar.nav_count(&app.channels, &app.agents), 2);
+
+        // Toggle again to expand
+        app.confirm_selected_navigation().await;
+        assert!(!app.status_bar.collapsed_sections.contains("AI Agents"),
+                "Enter again should expand the section");
+        assert_eq!(app.status_bar.nav_count(&app.channels, &app.agents), 4);
     }
 }
