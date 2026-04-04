@@ -481,3 +481,43 @@ pub fn render_text_panel(
     let para = para.scroll((state.scroll_offset, 0));
     para.render(inner, buf);
 }
+
+/// Render a DM split panel with pre-built Lines (from DmView.build_text).
+pub fn render_dm_panel(
+    title: &str,
+    lines: Vec<Line<'static>>,
+    state: &mut ChannelPanelState,
+    focused: bool,
+    area: Rect,
+    buf: &mut Buffer,
+) {
+    let title = format!(" {} ", title);
+    let border_color = if focused { theme::BORDER } else { theme::TIMESTAMP };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(border_color))
+        .title(title)
+        .title_style(Style::default().fg(border_color));
+
+    let inner = block.inner(area);
+    state.visible_height = inner.height;
+    block.render(area, buf);
+
+    let para = Paragraph::new(lines)
+        .wrap(Wrap { trim: false });
+    let total_visual = (para.line_count(inner.width) as u32).min(u16::MAX as u32) as u16;
+    let max_offset = total_visual.saturating_sub(state.visible_height);
+
+    if state.auto_scroll {
+        state.scroll_offset = max_offset;
+    } else {
+        state.scroll_offset = state.scroll_offset.min(max_offset);
+        if state.scroll_offset >= max_offset {
+            state.auto_scroll = true;
+        }
+    }
+
+    let para = para.scroll((state.scroll_offset, 0));
+    para.render(inner, buf);
+}

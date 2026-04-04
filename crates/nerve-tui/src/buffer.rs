@@ -32,35 +32,13 @@ impl ChannelViewStub {
     }
 }
 
-/// 简化版 DmView 桩 — 只保留 messages + push + clear
-/// Phase 2 时替换为真实 DmView（含 streaming pipeline）
-pub struct DmViewStub {
-    pub messages: Vec<String>,
-}
-
-impl DmViewStub {
-    pub fn new() -> Self {
-        Self { messages: Vec::new() }
-    }
-
-    pub fn push(&mut self, msg: &str) {
-        self.messages.push(msg.to_string());
-    }
-
-    pub fn clear(&mut self) {
-        self.messages.clear();
-    }
-
-    pub fn messages(&self) -> &[String] {
-        &self.messages
-    }
-}
 
 /// Buffer 内容，三种类型各自独立
-/// Channel/Dm 使用 Stub 桩（Phase 2 替换为真实 View）
+/// Channel 使用 Stub 桩（Phase 2 替换为真实 View）
+/// Dm 为标记型 unit variant，数据在 App.dm_view 中
 pub enum BufferContent {
     Channel(ChannelViewStub),
-    Dm(DmViewStub),
+    Dm,
     NodeLog { text: String, pending: bool },
 }
 
@@ -86,7 +64,7 @@ impl BufferEntry {
     pub fn clear(&mut self) {
         match &mut self.content {
             BufferContent::Channel(cv) => cv.clear(),
-            BufferContent::Dm(dv) => dv.clear(),
+            BufferContent::Dm => {} // no-op: data lives in App.dm_view
             BufferContent::NodeLog { text, pending } => {
                 text.clear();
                 *pending = false;
@@ -121,7 +99,7 @@ impl BufferPool {
         self.buffers.entry(id.clone()).or_insert_with(|| {
             let content = match &id {
                 BufferId::Channel { .. } => BufferContent::Channel(ChannelViewStub::new()),
-                BufferId::Dm { .. } => BufferContent::Dm(DmViewStub::new()),
+                BufferId::Dm { .. } => BufferContent::Dm,
                 BufferId::NodeLog { .. } => BufferContent::NodeLog { text: String::new(), pending: false },
             };
             BufferEntry::new(id, content)
@@ -358,7 +336,7 @@ mod tests {
         assert_eq!(entry.id, id);
         assert_eq!(entry.content_version, 0);
         match &entry.content {
-            BufferContent::Dm(dv) => assert!(dv.messages().is_empty()),
+            BufferContent::Dm => {}
             _ => panic!("expected Dm variant"),
         }
     }
@@ -465,50 +443,39 @@ mod tests {
     // ========== 4. DM buffer 生命周期 ==========
 
     #[test]
-    fn dm_reenter_clears_messages_and_resets_version() {
+    fn dm_reenter_resets_version() {
         let mut pool = BufferPool::new();
         let id = BufferId::Dm { node_id: "node1".into() };
 
-        // 首次进入，push 一些消息
+        // 首次进入，bump 一些版本
         let entry = pool.get_or_create(id.clone());
-        if let BufferContent::Dm(ref mut dv) = entry.content {
-            dv.push("old msg 1");
-            dv.push("old msg 2");
-        }
         entry.bump_version();
         entry.bump_version();
         assert_eq!(entry.content_version, 2);
 
-        // 模拟 enter_dm：按 BufferId::Dm 找到已有 buffer，清空
+        // 模拟 enter_dm：按 BufferId::Dm 找到已有 buffer，清空（no-op for Dm content）
         let entry = pool.get_mut(&id).unwrap();
         entry.clear();
         assert_eq!(entry.content_version, 0);
         match &entry.content {
-            BufferContent::Dm(dv) => {
-                assert!(dv.messages().is_empty(), "DM messages should be empty after clear");
-            }
+            BufferContent::Dm => {}
             _ => panic!("expected Dm variant"),
         }
     }
 
     #[test]
-    fn exit_dm_clear_buffer_and_verify_empty() {
+    fn exit_dm_clear_buffer_and_verify() {
         let mut pool = BufferPool::new();
         let id = BufferId::Dm { node_id: "node1".into() };
         let entry = pool.get_or_create(id.clone());
-        if let BufferContent::Dm(ref mut dv) = entry.content {
-            dv.push("msg");
-        }
         entry.bump_version();
 
-        // exit_dm: 清空
+        // exit_dm: 清空（Dm is unit variant, clear is no-op for content）
         let entry = pool.get_mut(&id).unwrap();
         entry.clear();
         assert_eq!(entry.content_version, 0);
         match &entry.content {
-            BufferContent::Dm(dv) => {
-                assert!(dv.messages().is_empty(), "DM messages should be empty after exit");
-            }
+            BufferContent::Dm => {}
             _ => panic!("expected Dm variant"),
         }
     }
@@ -1118,5 +1085,63 @@ mod tests {
         // 后续 streaming 应恢复 snap
         let should_snap = w.check_content_version(4);
         assert!(should_snap);
+    }
+
+    // ==========================================================
+    // Buffer Unify: Dm marker variant tests
+    // Design: BufferContent::Dm becomes unit variant (no DmViewStub)
+    // See: notes/tasks/tui-split/buffer-unify-design.md
+    // ==========================================================
+
+    // RED (compile error): BufferContent::Dm is currently Dm(DmViewStub),
+    // should become unit variant after implementation.
+    #[test]
+    fn dm_get_or_create_returns_marker_variant() {
+        let mut pool = BufferPool::new();
+        let id = BufferId::Dm { node_id: "node1".into() };
+        let entry = pool.get_or_create(id);
+        // After refactor: Dm is unit variant, data lives in App.dm_view
+        match &entry.content {
+            BufferContent::Dm => {}
+            _ => panic!("expected Dm marker variant (unit)"),
+        }
+    }
+
+    // RED (compile error): clear() on Dm unit variant should be no-op for content,
+    // only resetting content_version to 0.
+    #[test]
+    fn dm_clear_is_noop_resets_version() {
+        let mut pool = BufferPool::new();
+        let id = BufferId::Dm { node_id: "node1".into() };
+        let entry = pool.get_or_create(id.clone());
+        entry.bump_version();
+        entry.bump_version();
+        assert_eq!(entry.content_version, 2);
+
+        let entry = pool.get_mut(&id).unwrap();
+        entry.clear();
+        assert_eq!(entry.content_version, 0);
+        // Dm is unit variant — clear is no-op for content
+        match &entry.content {
+            BufferContent::Dm => {}
+            _ => panic!("expected Dm marker variant after clear"),
+        }
+    }
+
+    // GREEN (infrastructure): has_panel_for_buffer correctly distinguishes
+    // BufferId::Dm from BufferId::NodeLog with same node_id.
+    #[test]
+    fn has_panel_for_dm_buffer_matches_correctly() {
+        let primary = Window::new(BufferId::Channel { channel_id: "ch1".into() }, 0);
+        let mut layout = WindowLayout::new(primary);
+        let dm_id = BufferId::Dm { node_id: "n1".into() };
+        layout.add_panel(Window::new(dm_id.clone(), 0));
+
+        assert!(layout.has_panel_for_buffer(&dm_id));
+        // Dm and NodeLog with same node_id are different buffer ids
+        assert!(
+            !layout.has_panel_for_buffer(&BufferId::NodeLog { node_id: "n1".into() }),
+            "Dm and NodeLog should be distinct buffer ids"
+        );
     }
 }

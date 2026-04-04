@@ -3,6 +3,9 @@ name = "nerve-tui-core"
 version = "0.1.0"
 edition.workspace = true
 
+[features]
+integration = []
+
 [dependencies]
 nerve-tui-protocol.workspace = true
 tokio.workspace = true
@@ -12,3 +15,6 @@ serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
 anyhow.workspace = true
+
+[dev-dependencies]
+dirs = "5"

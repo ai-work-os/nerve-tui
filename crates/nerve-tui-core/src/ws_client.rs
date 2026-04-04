@@ -8,9 +8,12 @@ use tokio::sync::{mpsc, Mutex};
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{debug, error, info, warn};
 
+use crate::Transport;
+
 pub type PendingMap = Arc<Mutex<HashMap<u64, tokio::sync::oneshot::Sender<Result<Value>>>>>;
 
 /// WebSocket client for nerve server.
+#[derive(Clone)]
 pub struct NerveClient {
     /// Send JSON text to WS
     ws_tx: mpsc::UnboundedSender<String>,
@@ -383,6 +386,16 @@ impl NerveClient {
     pub async fn scene_stop(&self, name: &str) -> Result<()> {
         self.request("scene.stop", json!({ "name": name })).await?;
         Ok(())
+    }
+}
+
+impl Transport for NerveClient {
+    async fn request(&self, method: &str, params: Value) -> Result<Value> {
+        self.request(method, params).await
+    }
+
+    fn node_name(&self) -> &str {
+        &self.node_name
     }
 }
 
