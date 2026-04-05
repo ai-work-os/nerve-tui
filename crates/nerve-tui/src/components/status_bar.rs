@@ -392,7 +392,14 @@ impl StatusBar {
     /// Build the second line for an agent: `adapter [hint]` or just `adapter`.
     /// Hint: tool_call > activity. Fits within `max_width` columns.
     pub fn agent_status_line(agent: &AgentDisplay, max_width: usize) -> String {
-        let adapter = agent.adapter.as_deref().unwrap_or("");
+        // Combine adapter and model: "adapter/model" or just "adapter" or just "model"
+        let adapter = match (&agent.adapter, &agent.model) {
+            (Some(a), Some(m)) => format!("{}/{}", a, m),
+            (Some(a), None) => a.clone(),
+            (None, Some(m)) => m.clone(),
+            (None, None) => String::new(),
+        };
+        let adapter = adapter.as_str();
 
         // Determine hint: tool_call > activity > none
         let hint = if let Some(ref tool) = agent.tool_call_name {
@@ -835,6 +842,46 @@ mod tests {
         };
         let line = StatusBar::agent_status_line(&agent, 20);
         assert_eq!(line, "claude/opus");
+    }
+
+    #[test]
+    fn status_line_adapter_with_model() {
+        let agent = AgentDisplay {
+            name: "worker".into(),
+            status: "idle".into(),
+            activity: None,
+            adapter: Some("claude".into()),
+            model: Some("opus-4".into()),
+            node_id: "n1".into(),
+            transport: "stdio".into(),
+            capabilities: vec![],
+            usage: None,
+            tool_call_name: None,
+            tool_call_started: None,
+            waiting_for: None,
+        };
+        let line = StatusBar::agent_status_line(&agent, 30);
+        assert_eq!(line, "claude/opus-4");
+    }
+
+    #[test]
+    fn status_line_model_only() {
+        let agent = AgentDisplay {
+            name: "worker".into(),
+            status: "idle".into(),
+            activity: None,
+            adapter: None,
+            model: Some("opus-4".into()),
+            node_id: "n1".into(),
+            transport: "stdio".into(),
+            capabilities: vec![],
+            usage: None,
+            tool_call_name: None,
+            tool_call_started: None,
+            waiting_for: None,
+        };
+        let line = StatusBar::agent_status_line(&agent, 20);
+        assert_eq!(line, "opus-4");
     }
 
     #[test]
