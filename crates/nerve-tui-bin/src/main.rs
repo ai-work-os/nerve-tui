@@ -153,9 +153,8 @@ async fn main() -> Result<()> {
         let mut terminal = Terminal::new(backend)?;
 
         let mut app = App::new_with_project(client, event_rx, project);
-        let mut event_source = CrosstermEventSource::new();
         app.init().await?;
-        app.run(&mut terminal, &mut event_source).await
+        app.run(&mut terminal).await
     }
     .await;
 
