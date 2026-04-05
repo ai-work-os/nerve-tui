@@ -5,6 +5,7 @@ edition.workspace = true
 
 [features]
 integration = []
+test-utils = []
 
 [dependencies]
 nerve-tui-protocol.workspace = true

@@ -21,3 +21,6 @@ pulldown-cmark = "0.12"
 syntect.workspace = true
 arboard.workspace = true
 image.workspace = true
+
+[dev-dependencies]
+nerve-tui-core = { workspace = true, features = ["test-utils"] }
