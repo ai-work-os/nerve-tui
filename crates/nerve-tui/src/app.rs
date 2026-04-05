@@ -501,6 +501,11 @@ impl<T: Transport> App<T> {
                         || self.split_panels.iter().any(|p| matches!(p.target, SplitTarget::Node { .. }));
                     if has_target {
                         if self.is_split() {
+                            for panel in &self.split_panels {
+                                if let SplitTarget::Node { ref node_id, .. } = panel.target {
+                                    let _ = self.client.node_unsubscribe(node_id).await;
+                                }
+                            }
                             self.split_panels.clear();
                             self.split_focus = SplitFocus::Dm;
                         } else {
@@ -1736,12 +1741,6 @@ impl<T: Transport> App<T> {
                 ..
             } => {
                 info!("NodeRegistered: name={}", name);
-                // Show in both channel and DM views
-                self.channel_view
-                    .push_system(&format!("{} 已注册", name));
-                if self.is_dm_mode() {
-                    self.dm_view.push_system(&format!("{} 已注册", name));
-                }
                 self.refresh_agents().await;
                 info!(
                     "NodeRegistered: after refresh, agents count={}, names=[{}]",
@@ -1813,8 +1812,7 @@ impl<T: Transport> App<T> {
         }
         self.dm_view.flushed_agents.insert(name.to_string());
         if self.dm_node_id() == Some(node_id) {
-            self.dm_view.is_responding = false;
-            self.dm_view.summary_mode = true;
+            self.dm_view.set_responding(false);
         }
     }
 
@@ -1966,7 +1964,7 @@ impl<T: Transport> App<T> {
                         self.dm_view.dm_history.push(dm_msg);
                     }
                     if self.dm_node_id() == Some(node_id) {
-                        self.dm_view.is_responding = false;
+                        self.dm_view.set_responding(false);
                     }
                 }
                 Some("agent_thought_chunk") => {

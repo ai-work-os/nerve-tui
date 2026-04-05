@@ -81,6 +81,13 @@ impl DmView {
         !self.agent_name.is_empty()
     }
 
+    pub fn set_responding(&mut self, responding: bool) {
+        self.is_responding = responding;
+        if !responding {
+            self.summary_mode = true;
+        }
+    }
+
     pub fn toggle_summary_mode(&mut self) {
         self.summary_mode = !self.summary_mode;
     }
@@ -737,6 +744,27 @@ mod tests {
         dm.toggle_summary_mode();
         assert!(dm.summary_mode);
         dm.toggle_summary_mode();
+        assert!(!dm.summary_mode);
+    }
+
+    // --- set_responding ---
+
+    #[test]
+    fn set_responding_false_enables_summary_mode() {
+        let mut dm = DmView::new("alice");
+        dm.is_responding = true;
+        dm.summary_mode = false;
+        dm.set_responding(false);
+        assert!(!dm.is_responding);
+        assert!(dm.summary_mode);
+    }
+
+    #[test]
+    fn set_responding_true_keeps_summary_mode() {
+        let mut dm = DmView::new("alice");
+        dm.summary_mode = false;
+        dm.set_responding(true);
+        assert!(dm.is_responding);
         assert!(!dm.summary_mode);
     }
 
