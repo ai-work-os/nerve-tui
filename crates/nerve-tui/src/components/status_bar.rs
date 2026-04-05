@@ -3,6 +3,7 @@ use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Widget};
+use std::collections::HashSet;
 use std::time::Instant;
 
 use unicode_width::UnicodeWidthStr;
@@ -15,6 +16,7 @@ pub struct AgentDisplay {
     pub status: String,
     pub activity: Option<String>,
     pub adapter: Option<String>,
+    pub model: Option<String>,
     pub node_id: String,
     pub transport: String,
     pub capabilities: Vec<String>,
@@ -53,29 +55,110 @@ pub enum NavigationTarget {
     Agent(usize),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SidebarItem {
+    Channel(usize),
+    Agent(usize),
+    SectionHeader(String),
+}
+
 pub struct StatusBar {
-    /// Unified navigation selection: channels first, then agents.
+    /// Navigation index into visible_items().
     pub selected_nav: usize,
+    /// Collapsed section names (e.g. "AI Agents", "Programs", "Clients").
+    pub collapsed_sections: HashSet<String>,
 }
 
 impl StatusBar {
     pub fn new() -> Self {
-        Self { selected_nav: 0 }
+        Self {
+            selected_nav: 0,
+            collapsed_sections: HashSet::new(),
+        }
     }
 
-    pub fn nav_count(channels: &[ChannelDisplay], agents: &[AgentDisplay]) -> usize {
-        channels.len() + agents.len()
+    pub fn toggle_section(&mut self, section: &str) {
+        if !self.collapsed_sections.remove(section) {
+            self.collapsed_sections.insert(section.to_string());
+        }
+    }
+
+    /// Build the list of visible sidebar items, respecting collapsed sections.
+    pub fn visible_items(
+        &self,
+        channels: &[ChannelDisplay],
+        agents: &[AgentDisplay],
+    ) -> Vec<SidebarItem> {
+        let mut items = Vec::new();
+
+        for i in 0..channels.len() {
+            items.push(SidebarItem::Channel(i));
+        }
+
+        let groups: [(&str, Vec<usize>); 3] = [
+            (
+                "AI Agents",
+                agents
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, a)| a.transport == "stdio")
+                    .map(|(i, _)| i)
+                    .collect(),
+            ),
+            (
+                "Programs",
+                agents
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, a)| {
+                        a.transport != "stdio"
+                            && a.capabilities.iter().any(|c| c == "monitor")
+                    })
+                    .map(|(i, _)| i)
+                    .collect(),
+            ),
+            (
+                "Clients",
+                agents
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, a)| {
+                        a.transport != "stdio"
+                            && !a.capabilities.iter().any(|c| c == "monitor")
+                    })
+                    .map(|(i, _)| i)
+                    .collect(),
+            ),
+        ];
+
+        for (name, indices) in &groups {
+            if indices.is_empty() {
+                continue;
+            }
+            items.push(SidebarItem::SectionHeader(name.to_string()));
+            if !self.collapsed_sections.contains(*name) {
+                for &i in indices {
+                    items.push(SidebarItem::Agent(i));
+                }
+            }
+        }
+
+        items
+    }
+
+    pub fn nav_count(&self, channels: &[ChannelDisplay], agents: &[AgentDisplay]) -> usize {
+        self.visible_items(channels, agents).len()
     }
 
     pub fn select_next_item(&mut self, channels: &[ChannelDisplay], agents: &[AgentDisplay]) {
-        let total = Self::nav_count(channels, agents);
+        let total = self.nav_count(channels, agents);
         if total > 0 {
             self.selected_nav = (self.selected_nav + 1) % total;
         }
     }
 
     pub fn select_prev_item(&mut self, channels: &[ChannelDisplay], agents: &[AgentDisplay]) {
-        let total = Self::nav_count(channels, agents);
+        let total = self.nav_count(channels, agents);
         if total > 0 {
             self.selected_nav = if self.selected_nav == 0 {
                 total - 1
@@ -90,15 +173,11 @@ impl StatusBar {
         channels: &[ChannelDisplay],
         agents: &[AgentDisplay],
     ) -> Option<NavigationTarget> {
-        if self.selected_nav < channels.len() {
-            Some(NavigationTarget::Channel(self.selected_nav))
-        } else {
-            let agent_idx = self.selected_nav.checked_sub(channels.len())?;
-            if agent_idx < agents.len() {
-                Some(NavigationTarget::Agent(agent_idx))
-            } else {
-                None
-            }
+        let items = self.visible_items(channels, agents);
+        match items.get(self.selected_nav)? {
+            SidebarItem::Channel(i) => Some(NavigationTarget::Channel(*i)),
+            SidebarItem::Agent(i) => Some(NavigationTarget::Agent(*i)),
+            SidebarItem::SectionHeader(_) => None,
         }
     }
 
@@ -109,20 +188,32 @@ impl StatusBar {
         agents: &[AgentDisplay],
         active_dm: Option<&str>,
     ) {
+        let items = self.visible_items(channels, agents);
+
         if let Some(dm_name) = active_dm {
             if let Some(agent_idx) = agents.iter().position(|a| a.name == dm_name) {
-                self.selected_nav = channels.len() + agent_idx;
-                return;
+                if let Some(pos) = items
+                    .iter()
+                    .position(|item| matches!(item, SidebarItem::Agent(i) if *i == agent_idx))
+                {
+                    self.selected_nav = pos;
+                    return;
+                }
             }
         }
         if let Some(channel_id) = active_channel {
-            if let Some(channel_idx) = channels.iter().position(|c| c.id == channel_id) {
-                self.selected_nav = channel_idx;
-                return;
+            if let Some(ch_idx) = channels.iter().position(|c| c.id == channel_id) {
+                if let Some(pos) = items
+                    .iter()
+                    .position(|item| matches!(item, SidebarItem::Channel(i) if *i == ch_idx))
+                {
+                    self.selected_nav = pos;
+                    return;
+                }
             }
         }
 
-        let total = Self::nav_count(channels, agents);
+        let total = items.len();
         if total == 0 {
             self.selected_nav = 0;
         } else if self.selected_nav >= total {
@@ -185,125 +276,113 @@ impl StatusBar {
             return;
         }
 
+        let items = self.visible_items(channels, agents);
         let selected = self.selected_target(channels, agents);
 
-        for (i, ch) in channels.iter().enumerate() {
-            let is_selected = selected == Some(NavigationTarget::Channel(i));
-            let is_active = active_channel == Some(ch.id.as_str()) && active_dm.is_none();
-            let marker = if is_selected { "▸" } else { " " };
-            let base_style = if is_active {
-                Style::default()
-                    .fg(theme::CHANNEL_ACTIVE)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(theme::CHANNEL_INACTIVE)
-            };
-            let name_style = if is_selected {
-                base_style.add_modifier(Modifier::BOLD)
-            } else {
-                base_style
-            };
+        // Pre-compute section counts for headers (total, not just visible)
+        let section_counts: std::collections::HashMap<&str, usize> = [
+            ("AI Agents", agents.iter().filter(|a| a.transport == "stdio").count()),
+            ("Programs", agents.iter().filter(|a| a.transport != "stdio" && a.capabilities.iter().any(|c| c == "monitor")).count()),
+            ("Clients", agents.iter().filter(|a| a.transport != "stdio" && !a.capabilities.iter().any(|c| c == "monitor")).count()),
+        ].into_iter().collect();
 
-            let display = ch.display_name();
-            let max_w = inner.width.saturating_sub(6) as usize;
-            let char_count = display.chars().count();
-            let truncated = if char_count > max_w {
-                let s: String = display.chars().take(max_w.saturating_sub(1)).collect();
-                format!("{}…", s)
-            } else {
-                display.to_string()
-            };
+        let mut has_prev = false;
 
-            let busy_count = ch.members.iter().filter(|m| {
-                agents.iter().any(|a| a.node_id == m.node_id && a.status == "busy")
-            }).count();
-            let count_text = if busy_count > 0 {
-                format!(" ({}/{}busy)", ch.node_count, busy_count)
-            } else {
-                format!(" ({})", ch.node_count)
-            };
-            let mut spans = vec![
-                Span::raw(format!("{} ", marker)),
-                Span::styled(format!("#{}", truncated), name_style),
-                Span::styled(count_text, Style::default().fg(theme::TIMESTAMP)),
-            ];
-            if ch.unread > 0 {
-                spans.push(Span::styled(
-                    format!(" {}", ch.unread),
-                    Style::default()
-                        .fg(Color::White)
-                        .bg(Color::Red)
-                        .add_modifier(Modifier::BOLD),
-                ));
-            }
-            lines.push(Line::from(spans));
-            // Show members under active/selected channel
-            if is_active || is_selected {
-                for member in &ch.members {
-                    let agent = agents.iter().find(|a| a.node_id == member.node_id);
-                    let status = agent.map(|a| a.status.as_str()).unwrap_or("idle");
-                    let name = agent.map(|a| a.name.as_str()).unwrap_or("?");
-                    let icon = theme::status_icon(status);
-                    let color = theme::status_color(status);
-                    lines.push(Line::from(vec![
-                        Span::raw("    "),
-                        Span::styled(
-                            format!("{} {}", icon, name),
-                            Style::default().fg(color),
-                        ),
-                    ]));
+        for (item_idx, item) in items.iter().enumerate() {
+            match item {
+                SidebarItem::Channel(idx) => {
+                    let i = *idx;
+                    let ch = &channels[i];
+                    let is_selected = selected == Some(NavigationTarget::Channel(i));
+                    let is_active = active_channel == Some(ch.id.as_str()) && active_dm.is_none();
+                    let marker = if is_selected { "▸" } else { " " };
+                    let base_style = if is_active {
+                        Style::default()
+                            .fg(theme::CHANNEL_ACTIVE)
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(theme::CHANNEL_INACTIVE)
+                    };
+                    let name_style = if is_selected {
+                        base_style.add_modifier(Modifier::BOLD)
+                    } else {
+                        base_style
+                    };
+
+                    let display = ch.display_name();
+                    let max_w = inner.width.saturating_sub(6) as usize;
+                    let char_count = display.chars().count();
+                    let truncated = if char_count > max_w {
+                        let s: String = display.chars().take(max_w.saturating_sub(1)).collect();
+                        format!("{}…", s)
+                    } else {
+                        display.to_string()
+                    };
+
+                    let busy_count = ch.members.iter().filter(|m| {
+                        agents.iter().any(|a| a.node_id == m.node_id && a.status == "busy")
+                    }).count();
+                    let count_text = if busy_count > 0 {
+                        format!(" ({}/{}busy)", ch.node_count, busy_count)
+                    } else {
+                        format!(" ({})", ch.node_count)
+                    };
+                    let mut spans = vec![
+                        Span::raw(format!("{} ", marker)),
+                        Span::styled(format!("#{}", truncated), name_style),
+                        Span::styled(count_text, Style::default().fg(theme::TIMESTAMP)),
+                    ];
+                    if ch.unread > 0 {
+                        spans.push(Span::styled(
+                            format!(" {}", ch.unread),
+                            Style::default()
+                                .fg(Color::White)
+                                .bg(Color::Red)
+                                .add_modifier(Modifier::BOLD),
+                        ));
+                    }
+                    lines.push(Line::from(spans));
+                    // Show members under active/selected channel
+                    if is_active || is_selected {
+                        for member in &ch.members {
+                            let agent = agents.iter().find(|a| a.node_id == member.node_id);
+                            let status = agent.map(|a| a.status.as_str()).unwrap_or("idle");
+                            let name = agent.map(|a| a.name.as_str()).unwrap_or("?");
+                            let icon = theme::status_icon(status);
+                            let color = theme::status_color(status);
+                            lines.push(Line::from(vec![
+                                Span::raw("    "),
+                                Span::styled(
+                                    format!("{} {}", icon, name),
+                                    Style::default().fg(color),
+                                ),
+                            ]));
+                        }
+                    }
+                    has_prev = true;
                 }
-            }
-        }
-
-        // Group agents by type: AI (stdio), Programs (ws + monitor cap), Clients (ws other)
-        let ai_agents: Vec<(usize, &AgentDisplay)> = agents.iter().enumerate()
-            .filter(|(_, a)| a.transport == "stdio")
-            .collect();
-        let program_agents: Vec<(usize, &AgentDisplay)> = agents.iter().enumerate()
-            .filter(|(_, a)| a.transport != "stdio" && a.capabilities.iter().any(|c| c == "monitor"))
-            .collect();
-        let client_agents: Vec<(usize, &AgentDisplay)> = agents.iter().enumerate()
-            .filter(|(_, a)| a.transport != "stdio" && !a.capabilities.iter().any(|c| c == "monitor"))
-            .collect();
-
-        let mut has_prev = !channels.is_empty();
-
-        // Render AI agents section
-        if !ai_agents.is_empty() {
-            if has_prev { lines.push(Line::from("")); }
-            lines.push(Line::from(Span::styled(
-                "AI Agents",
-                Style::default().fg(theme::TIMESTAMP).add_modifier(Modifier::BOLD),
-            )));
-            for (i, agent) in &ai_agents {
-                Self::render_agent_item(&mut lines, *i, agent, &selected, active_dm, inner.width);
-            }
-            has_prev = true;
-        }
-
-        // Render program nodes section
-        if !program_agents.is_empty() {
-            if has_prev { lines.push(Line::from("")); }
-            lines.push(Line::from(Span::styled(
-                "Programs",
-                Style::default().fg(theme::TIMESTAMP).add_modifier(Modifier::BOLD),
-            )));
-            for (i, agent) in &program_agents {
-                Self::render_agent_item(&mut lines, *i, agent, &selected, active_dm, inner.width);
-            }
-            has_prev = true;
-        }
-
-        // Render client nodes section
-        if !client_agents.is_empty() {
-            if has_prev { lines.push(Line::from("")); }
-            lines.push(Line::from(Span::styled(
-                "Clients",
-                Style::default().fg(theme::TIMESTAMP).add_modifier(Modifier::BOLD),
-            )));
-            for (i, agent) in &client_agents {
-                Self::render_agent_item(&mut lines, *i, agent, &selected, active_dm, inner.width);
+                SidebarItem::SectionHeader(name) => {
+                    if has_prev { lines.push(Line::from("")); }
+                    let is_selected = item_idx == self.selected_nav;
+                    let collapsed = self.collapsed_sections.contains(name.as_str());
+                    let arrow = if collapsed { "▸" } else { "▾" };
+                    let count = section_counts.get(name.as_str()).copied().unwrap_or(0);
+                    let marker = if is_selected { "▸" } else { " " };
+                    let mut style = Style::default().fg(theme::TIMESTAMP).add_modifier(Modifier::BOLD);
+                    if is_selected {
+                        style = style.bg(theme::BORDER).fg(Color::White);
+                    }
+                    lines.push(Line::from(Span::styled(
+                        format!("{}{} {} ({})", marker, arrow, name, count),
+                        style,
+                    )));
+                    has_prev = true;
+                }
+                SidebarItem::Agent(idx) => {
+                    let i = *idx;
+                    let agent = &agents[i];
+                    Self::render_agent_item(&mut lines, i, agent, &selected, active_dm, inner.width);
+                }
             }
         }
 
@@ -489,6 +568,7 @@ mod tests {
                 status: "idle".to_string(),
                 activity: None,
                 adapter: Some("claude".to_string()),
+                model: None,
                 node_id: format!("n{}", i),
                 transport: "stdio".to_string(),
                 capabilities: vec![],
@@ -520,10 +600,12 @@ mod tests {
 
     #[test]
     fn nav_count_counts_channels_and_agents() {
+        let bar = StatusBar::new();
         let channels = make_channels(2);
         let agents = make_agents(3);
-        assert_eq!(StatusBar::nav_count(&channels, &agents), 5);
-        assert_eq!(StatusBar::nav_count(&[], &[]), 0);
+        // 2 channels + 1 header ("AI Agents") + 3 agents = 6
+        assert_eq!(bar.nav_count(&channels, &agents), 6);
+        assert_eq!(bar.nav_count(&[], &[]), 0);
     }
 
     #[test]
@@ -531,13 +613,16 @@ mod tests {
         let mut bar = StatusBar::new();
         let channels = make_channels(1);
         let agents = make_agents(2);
+        // visible: Channel(0), SectionHeader, Agent(0), Agent(1) = 4 items
 
         bar.select_next_item(&channels, &agents);
-        assert_eq!(bar.selected_nav, 1);
+        assert_eq!(bar.selected_nav, 1); // SectionHeader
         bar.select_next_item(&channels, &agents);
-        assert_eq!(bar.selected_nav, 2);
+        assert_eq!(bar.selected_nav, 2); // Agent(0)
         bar.select_next_item(&channels, &agents);
-        assert_eq!(bar.selected_nav, 0);
+        assert_eq!(bar.selected_nav, 3); // Agent(1)
+        bar.select_next_item(&channels, &agents);
+        assert_eq!(bar.selected_nav, 0); // wrap
     }
 
     #[test]
@@ -545,11 +630,12 @@ mod tests {
         let mut bar = StatusBar::new();
         let channels = make_channels(1);
         let agents = make_agents(2);
+        // visible: Channel(0), SectionHeader, Agent(0), Agent(1) = 4
 
         bar.select_prev_item(&channels, &agents);
-        assert_eq!(bar.selected_nav, 2);
+        assert_eq!(bar.selected_nav, 3); // Agent(1)
         bar.select_prev_item(&channels, &agents);
-        assert_eq!(bar.selected_nav, 1);
+        assert_eq!(bar.selected_nav, 2); // Agent(0)
     }
 
     #[test]
@@ -557,13 +643,14 @@ mod tests {
         let mut bar = StatusBar::new();
         let channels = make_channels(2);
         let agents = make_agents(2);
+        // visible: Channel(0), Channel(1), SectionHeader, Agent(0), Agent(1)
 
         assert_eq!(
             bar.selected_target(&channels, &agents),
             Some(NavigationTarget::Channel(0))
         );
 
-        bar.selected_nav = 2;
+        bar.selected_nav = 3; // Agent(0)
         assert_eq!(
             bar.selected_target(&channels, &agents),
             Some(NavigationTarget::Agent(0))
@@ -575,10 +662,12 @@ mod tests {
         let mut bar = StatusBar::new();
         let channels = make_channels(2);
         let agents = make_agents(2);
+        // visible: Channel(0), Channel(1), SectionHeader, Agent(0), Agent(1)
 
         bar.sync_to_context(&channels, Some("ch1"), &agents, Some("agent-0"));
 
-        assert_eq!(bar.selected_nav, channels.len());
+        // agent-0 is at visible index 3
+        assert_eq!(bar.selected_nav, 3);
     }
 
     #[test]
@@ -682,9 +771,9 @@ mod tests {
             unread: 0,
         };
         let agents = vec![
-            AgentDisplay { name: "a".into(), status: "idle".into(), activity: None, adapter: None, node_id: "n1".into(), transport: "stdio".into(), capabilities: vec![], usage: None, tool_call_name: None, tool_call_started: None, waiting_for: None },
-            AgentDisplay { name: "b".into(), status: "busy".into(), activity: None, adapter: None, node_id: "n2".into(), transport: "stdio".into(), capabilities: vec![], usage: None, tool_call_name: None, tool_call_started: None, waiting_for: None },
-            AgentDisplay { name: "c".into(), status: "busy".into(), activity: None, adapter: None, node_id: "n3".into(), transport: "stdio".into(), capabilities: vec![], usage: None, tool_call_name: None, tool_call_started: None, waiting_for: None },
+            AgentDisplay { name: "a".into(), status: "idle".into(), activity: None, adapter: None, model: None, node_id: "n1".into(), transport: "stdio".into(), capabilities: vec![], usage: None, tool_call_name: None, tool_call_started: None, waiting_for: None },
+            AgentDisplay { name: "b".into(), status: "busy".into(), activity: None, adapter: None, model: None, node_id: "n2".into(), transport: "stdio".into(), capabilities: vec![], usage: None, tool_call_name: None, tool_call_started: None, waiting_for: None },
+            AgentDisplay { name: "c".into(), status: "busy".into(), activity: None, adapter: None, model: None, node_id: "n3".into(), transport: "stdio".into(), capabilities: vec![], usage: None, tool_call_name: None, tool_call_started: None, waiting_for: None },
         ];
         let busy = ch.members.iter().filter(|m| {
             agents.iter().any(|a| a.node_id == m.node_id && a.status == "busy")
@@ -735,6 +824,7 @@ mod tests {
             status: "idle".into(),
             activity: None,
             adapter: Some("claude/opus".into()),
+            model: None,
             node_id: "n1".into(),
             transport: "stdio".into(),
             capabilities: vec![],
@@ -754,6 +844,7 @@ mod tests {
             status: "busy".into(),
             activity: None,
             adapter: Some("claude/opus".into()),
+            model: None,
             node_id: "n1".into(),
             transport: "stdio".into(),
             capabilities: vec![],
@@ -774,6 +865,7 @@ mod tests {
             status: "busy".into(),
             activity: Some("thinking".into()),
             adapter: Some("claude/opus".into()),
+            model: None,
             node_id: "n1".into(),
             transport: "stdio".into(),
             capabilities: vec![],
@@ -793,6 +885,7 @@ mod tests {
             status: "busy".into(),
             activity: Some("typing".into()),
             adapter: Some("claude/opus".into()),
+            model: None,
             node_id: "n1".into(),
             transport: "stdio".into(),
             capabilities: vec![],
@@ -813,6 +906,7 @@ mod tests {
             status: "busy".into(),
             activity: None,
             adapter: Some("claude/opus".into()),
+            model: None,
             node_id: "n1".into(),
             transport: "stdio".into(),
             capabilities: vec![],
@@ -833,6 +927,7 @@ mod tests {
             status: "busy".into(),
             activity: Some("recording".into()),
             adapter: None,
+            model: None,
             node_id: "n1".into(),
             transport: "ws".into(),
             capabilities: vec![],
@@ -852,6 +947,7 @@ mod tests {
             status: "busy".into(),
             activity: None,
             adapter: Some("very-long-adapter/very-long-model".into()),
+            model: None,
             node_id: "n1".into(),
             transport: "stdio".into(),
             capabilities: vec![],
@@ -871,6 +967,7 @@ mod tests {
             status: "busy".into(),
             activity: None,
             adapter: Some("模型".into()),  // 4 display cols
+            model: None,
             node_id: "n1".into(),
             transport: "stdio".into(),
             capabilities: vec![],
@@ -881,6 +978,220 @@ mod tests {
         };
         let line = StatusBar::agent_status_line(&agent, 12);
         assert!(line.width() <= 12, "CJK status too wide: {} ({})", line, line.width());
+    }
+
+    // --- Phase 1: Collapse tests ---
+
+    /// Helper: create agents spanning all 3 groups (AI/Programs/Clients).
+    fn make_mixed_agents() -> Vec<AgentDisplay> {
+        vec![
+            // AI Agents (transport = "stdio")
+            AgentDisplay {
+                name: "ai-1".into(), status: "idle".into(), activity: None,
+                adapter: Some("claude".into()), model: None, node_id: "n1".into(),
+                transport: "stdio".into(), capabilities: vec![],
+                usage: None, tool_call_name: None, tool_call_started: None, waiting_for: None,
+            },
+            AgentDisplay {
+                name: "ai-2".into(), status: "busy".into(), activity: None,
+                adapter: Some("claude".into()), model: None, node_id: "n2".into(),
+                transport: "stdio".into(), capabilities: vec![],
+                usage: None, tool_call_name: None, tool_call_started: None, waiting_for: None,
+            },
+            // Programs (transport != "stdio", has "monitor" capability)
+            AgentDisplay {
+                name: "prog-1".into(), status: "idle".into(), activity: None,
+                adapter: None, model: None, node_id: "n3".into(),
+                transport: "ws".into(), capabilities: vec!["monitor".into()],
+                usage: None, tool_call_name: None, tool_call_started: None, waiting_for: None,
+            },
+            // Clients (transport != "stdio", no "monitor" capability)
+            AgentDisplay {
+                name: "client-1".into(), status: "idle".into(), activity: None,
+                adapter: None, model: None, node_id: "n4".into(),
+                transport: "ws".into(), capabilities: vec![],
+                usage: None, tool_call_name: None, tool_call_started: None, waiting_for: None,
+            },
+            AgentDisplay {
+                name: "client-2".into(), status: "idle".into(), activity: None,
+                adapter: None, model: None, node_id: "n5".into(),
+                transport: "ws".into(), capabilities: vec![],
+                usage: None, tool_call_name: None, tool_call_started: None, waiting_for: None,
+            },
+        ]
+    }
+
+    #[test]
+    fn default_no_sections_collapsed() {
+        let bar = StatusBar::new();
+        assert!(bar.collapsed_sections.is_empty());
+    }
+
+    #[test]
+    fn visible_items_all_expanded_equals_total() {
+        let bar = StatusBar::new();
+        let channels = make_channels(2);
+        let agents = make_mixed_agents(); // 2 AI + 1 Program + 2 Clients = 5
+        let items = bar.visible_items(&channels, &agents);
+        // Channels(2) + SectionHeaders(3) + Agents(5) = 10
+        let channel_count = items.iter().filter(|i| matches!(i, SidebarItem::Channel(_))).count();
+        let agent_count = items.iter().filter(|i| matches!(i, SidebarItem::Agent(_))).count();
+        assert_eq!(channel_count, 2);
+        assert_eq!(agent_count, 5);
+    }
+
+    #[test]
+    fn collapse_ai_agents_hides_members_keeps_header() {
+        let mut bar = StatusBar::new();
+        bar.toggle_section("AI Agents");
+        let channels = make_channels(0);
+        let agents = make_mixed_agents();
+        let items = bar.visible_items(&channels, &agents);
+
+        // Header still visible
+        assert!(items.iter().any(|i| matches!(i, SidebarItem::SectionHeader(s) if s == "AI Agents")));
+
+        // AI agents (indices 0,1) should be hidden
+        assert!(!items.iter().any(|i| matches!(i, SidebarItem::Agent(0))));
+        assert!(!items.iter().any(|i| matches!(i, SidebarItem::Agent(1))));
+
+        // Other agents still visible
+        assert!(items.iter().any(|i| matches!(i, SidebarItem::Agent(2)))); // prog-1
+        assert!(items.iter().any(|i| matches!(i, SidebarItem::Agent(3)))); // client-1
+    }
+
+    #[test]
+    fn expand_after_collapse_restores_all() {
+        let mut bar = StatusBar::new();
+        let channels = make_channels(1);
+        let agents = make_mixed_agents();
+
+        let before = bar.visible_items(&channels, &agents);
+        bar.toggle_section("AI Agents");
+        bar.toggle_section("AI Agents"); // toggle back
+        let after = bar.visible_items(&channels, &agents);
+
+        assert_eq!(before.len(), after.len());
+        let agent_count = after.iter().filter(|i| matches!(i, SidebarItem::Agent(_))).count();
+        assert_eq!(agent_count, agents.len());
+    }
+
+    #[test]
+    fn all_sections_collapsed_shows_only_headers_and_channels() {
+        let mut bar = StatusBar::new();
+        bar.toggle_section("AI Agents");
+        bar.toggle_section("Programs");
+        bar.toggle_section("Clients");
+
+        let channels = make_channels(1);
+        let agents = make_mixed_agents();
+        let items = bar.visible_items(&channels, &agents);
+
+        // No agent items
+        let agent_count = items.iter().filter(|i| matches!(i, SidebarItem::Agent(_))).count();
+        assert_eq!(agent_count, 0);
+
+        // All 3 section headers still present
+        let header_count = items.iter().filter(|i| matches!(i, SidebarItem::SectionHeader(_))).count();
+        assert_eq!(header_count, 3);
+
+        // Channel still visible
+        let channel_count = items.iter().filter(|i| matches!(i, SidebarItem::Channel(_))).count();
+        assert_eq!(channel_count, 1);
+    }
+
+    #[test]
+    fn select_next_skips_collapsed_items() {
+        let mut bar = StatusBar::new();
+        bar.toggle_section("AI Agents");
+
+        let channels = make_channels(1);
+        let agents = make_mixed_agents();
+
+        // Start at channel (index 0)
+        bar.selected_nav = 0;
+        assert_eq!(bar.selected_target(&channels, &agents),
+                   Some(NavigationTarget::Channel(0)));
+
+        // Next should skip AI Agents header and collapsed AI items,
+        // land on Programs header or first Program agent
+        bar.select_next_item(&channels, &agents);
+        let target = bar.selected_target(&channels, &agents);
+        // Should NOT be an AI agent (index 0 or 1)
+        assert!(
+            !matches!(target, Some(NavigationTarget::Agent(0)) | Some(NavigationTarget::Agent(1))),
+            "should skip collapsed AI agents, got {:?}", target
+        );
+    }
+
+    #[test]
+    fn selected_target_correct_after_collapse() {
+        let mut bar = StatusBar::new();
+        bar.toggle_section("AI Agents");
+
+        let channels = make_channels(0);
+        let agents = make_mixed_agents();
+        let items = bar.visible_items(&channels, &agents);
+
+        // Navigate to each visible item and verify selected_target maps correctly
+        for (nav_idx, item) in items.iter().enumerate() {
+            bar.selected_nav = nav_idx;
+            match item {
+                SidebarItem::Channel(i) => {
+                    assert_eq!(bar.selected_target(&channels, &agents),
+                               Some(NavigationTarget::Channel(*i)));
+                }
+                SidebarItem::Agent(i) => {
+                    assert_eq!(bar.selected_target(&channels, &agents),
+                               Some(NavigationTarget::Agent(*i)));
+                }
+                SidebarItem::SectionHeader(_) => {
+                    // Section headers are navigable but don't map to Channel/Agent
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn empty_group_no_header() {
+        let bar = StatusBar::new();
+        let channels = make_channels(0);
+        // Only AI agents, no Programs or Clients
+        let agents = vec![
+            AgentDisplay {
+                name: "ai-only".into(), status: "idle".into(), activity: None,
+                adapter: Some("claude".into()), model: None, node_id: "n1".into(),
+                transport: "stdio".into(), capabilities: vec![],
+                usage: None, tool_call_name: None, tool_call_started: None, waiting_for: None,
+            },
+        ];
+        let items = bar.visible_items(&channels, &agents);
+
+        // Should have "AI Agents" header but NOT "Programs" or "Clients"
+        assert!(items.iter().any(|i| matches!(i, SidebarItem::SectionHeader(s) if s == "AI Agents")));
+        assert!(!items.iter().any(|i| matches!(i, SidebarItem::SectionHeader(s) if s == "Programs")));
+        assert!(!items.iter().any(|i| matches!(i, SidebarItem::SectionHeader(s) if s == "Clients")));
+    }
+
+    #[test]
+    fn select_next_wraps_with_collapsed_sections() {
+        let mut bar = StatusBar::new();
+        bar.toggle_section("AI Agents");
+        bar.toggle_section("Programs");
+        bar.toggle_section("Clients");
+
+        let channels = make_channels(1);
+        let agents = make_mixed_agents();
+        // All collapsed: Channel(0), Header, Header, Header = 4 items
+        let total = bar.nav_count(&channels, &agents);
+        assert_eq!(total, 4);
+
+        bar.selected_nav = total - 1;
+        bar.select_next_item(&channels, &agents);
+        assert_eq!(bar.selected_nav, 0, "should wrap around to 0");
+
+        bar.select_prev_item(&channels, &agents);
+        assert_eq!(bar.selected_nav, total - 1, "should wrap back to last");
     }
 
     // --- Tool call display tests ---
@@ -912,6 +1223,7 @@ mod tests {
             status: "busy".into(),
             activity: None,
             adapter: None,
+            model: None,
             node_id: "n1".into(),
             transport: "stdio".into(),
             capabilities: vec![],
@@ -933,6 +1245,7 @@ mod tests {
             status: "busy".into(),
             activity: None,
             adapter: None,
+            model: None,
             node_id: "n1".into(),
             transport: "stdio".into(),
             capabilities: vec![],

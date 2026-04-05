@@ -9,7 +9,7 @@ pub mod status_bar;
 
 pub use channel_view::ChannelPanelState;
 pub use input::InputBox;
-pub use status_bar::{AgentDisplay, ChannelDisplay, MemberDisplay, NavigationTarget, StatusBar};
+pub use status_bar::{AgentDisplay, ChannelDisplay, MemberDisplay, NavigationTarget, SidebarItem, StatusBar};
 
 /// Explicit view mode state machine — replaces scattered `dm_view.is_some()` checks.
 #[derive(Debug, Clone, PartialEq)]

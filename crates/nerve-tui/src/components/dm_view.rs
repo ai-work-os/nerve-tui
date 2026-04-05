@@ -45,6 +45,8 @@ pub struct DmView {
     pub is_responding: bool,
     /// Summary mode: history messages show only text (no thinking/tool_call/code fences).
     pub summary_mode: bool,
+    /// Model name for display in title bar.
+    model: Option<String>,
 }
 
 impl DmView {
@@ -65,6 +67,7 @@ impl DmView {
             dm_history: Vec::new(),
             is_responding: false,
             summary_mode: false,
+            model: None,
         }
     }
 
@@ -83,6 +86,19 @@ impl DmView {
 
     pub fn toggle_summary_mode(&mut self) {
         self.summary_mode = !self.summary_mode;
+    }
+
+    /// Unified responding state change.
+    /// When responding ends (false), auto-enables summary_mode for collapsed blocks.
+    pub fn set_responding(&mut self, responding: bool) {
+        self.is_responding = responding;
+        if !responding {
+            self.summary_mode = true;
+        }
+    }
+
+    pub fn update_model(&mut self, model: Option<String>) {
+        self.model = model;
     }
 
     pub fn clear(&mut self) {
@@ -247,7 +263,11 @@ impl DmView {
     // --- Rendering ---
 
     pub fn render(&mut self, area: Rect, buf: &mut Buffer) {
-        let title = format!(" 与 {} 的对话 ", self.agent_name);
+        let title = if let Some(ref model) = self.model {
+            format!(" 与 {} 的对话 ({}) ", self.agent_name, model)
+        } else {
+            format!(" 与 {} 的对话 ", self.agent_name)
+        };
         let usage_span = self.usage_label.as_ref().map(|label| {
             let color = if self.usage_ratio >= 0.9 {
                 Color::Red
@@ -525,5 +545,84 @@ fn format_tokens(n: f64) -> String {
         format!("{:.1}k", n / 1_000.0)
     } else {
         format!("{}", n as u64)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::buffer::Buffer;
+    use ratatui::layout::Rect;
+
+    #[test]
+    fn set_responding_false_enables_summary_mode() {
+        let mut view = DmView::new("alice");
+        view.summary_mode = false;
+        view.is_responding = true;
+
+        view.set_responding(false);
+
+        assert!(!view.is_responding);
+        assert!(view.summary_mode, "summary_mode should be true when responding ends");
+    }
+
+    #[test]
+    fn set_responding_true_does_not_change_summary_mode() {
+        let mut view = DmView::new("alice");
+        view.summary_mode = true;
+
+        view.set_responding(true);
+
+        assert!(view.is_responding);
+        assert!(view.summary_mode, "summary_mode should not be changed when responding starts");
+    }
+
+    #[test]
+    fn update_model_changes_render_title() {
+        let mut view = DmView::new("alice");
+
+        // Set model
+        view.update_model(Some("opus[1m]".to_string()));
+
+        // Render into a buffer and check title contains model
+        let area = Rect::new(0, 0, 60, 10);
+        let mut buf = Buffer::empty(area);
+        view.render(area, &mut buf);
+
+        // Extract rendered text from buffer
+        let rendered: String = (0..area.width)
+            .map(|x| buf.cell((x, 0)).map(|c| c.symbol().chars().next().unwrap_or(' ')).unwrap_or(' '))
+            .collect();
+
+        assert!(
+            rendered.contains("opus[1m]"),
+            "title should contain model, got: {:?}",
+            rendered,
+        );
+    }
+
+    #[test]
+    fn render_title_without_model() {
+        let mut view = DmView::new("bob");
+
+        let area = Rect::new(0, 0, 60, 10);
+        let mut buf = Buffer::empty(area);
+        view.render(area, &mut buf);
+
+        let rendered: String = (0..area.width)
+            .map(|x| buf.cell((x, 0)).map(|c| c.symbol().chars().next().unwrap_or(' ')).unwrap_or(' '))
+            .collect();
+
+        assert!(
+            rendered.contains("bob"),
+            "title should contain agent name, got: {:?}",
+            rendered,
+        );
+        // Should not contain bracket notation when no model set
+        assert!(
+            !rendered.contains("["),
+            "title should not contain brackets when no model, got: {:?}",
+            rendered,
+        );
     }
 }

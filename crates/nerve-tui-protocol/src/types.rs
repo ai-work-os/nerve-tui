@@ -18,6 +18,7 @@ pub struct NodeInfo {
     #[serde(default)]
     pub transport: String,
     pub adapter: Option<String>,
+    pub model: Option<String>,
     pub activity: Option<String>,
     #[serde(default)]
     pub channels: Vec<String>,
@@ -71,6 +72,7 @@ pub struct DmState {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ChannelInfo {
+    #[serde(alias = "channelId")]
     pub id: String,
     pub name: Option<String>,
     pub cwd: String,
@@ -633,6 +635,33 @@ mod tests {
     }
 
     #[test]
+    fn node_info_deserialize_with_model() {
+        let json = json!({
+            "id": "n3",
+            "name": "claude-agent",
+            "status": "idle",
+            "adapter": "claude",
+            "model": "opus[1m]",
+            "channels": [],
+        });
+        let node: NodeInfo = serde_json::from_value(json).unwrap();
+        assert_eq!(node.id, "n3");
+        assert_eq!(node.model, Some("opus[1m]".to_string()));
+    }
+
+    #[test]
+    fn node_info_deserialize_without_model() {
+        let json = json!({
+            "id": "n4",
+            "name": "mock-agent",
+            "status": "idle",
+            "channels": [],
+        });
+        let node: NodeInfo = serde_json::from_value(json).unwrap();
+        assert!(node.model.is_none());
+    }
+
+    #[test]
     fn channel_info_deserialize() {
         let json = json!({
             "id": "ch1",
@@ -698,6 +727,7 @@ mod tests {
             permissions: "operator".into(),
             transport: "websocket".into(),
             adapter: None,
+            model: None,
             activity: None,
             channels: vec![],
             created_at: 0.0,
