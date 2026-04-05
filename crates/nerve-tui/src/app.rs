@@ -352,7 +352,7 @@ impl<T: Transport> App<T> {
         self.dm_view.tick_blink();
 
         let area = frame.area();
-        let panel_count = if self.is_dm_mode() { self.split_panels.len() } else { 0 };
+        let panel_count = self.split_panels.len();
         let input_inner_w = AppLayout::input_inner_width(area, self.sidebar_visible, panel_count);
         let input_lines = self.input.visual_line_count(input_inner_w) + 2;
         let layout = AppLayout::build(area, input_lines, self.sidebar_visible, panel_count);
@@ -992,16 +992,16 @@ impl<T: Transport> App<T> {
     async fn exit_dm(&mut self) {
         if let ViewMode::Dm { ref node_id, ref node_name } = self.view_mode.clone() {
             debug!("exiting DM with {}", node_name);
-            if let Err(e) = self.client.node_unsubscribe(node_id).await {
-                warn!("unsubscribe failed: {}", e);
-            }
-            // Clean up split node subscriptions
-            for panel in &self.split_panels {
-                if let SplitTarget::Node { ref node_id, .. } = panel.target {
-                    let _ = self.client.node_unsubscribe(node_id).await;
+            // Only unsubscribe the DM node if no split panel is also watching it
+            let split_has_node = self.split_panels.iter().any(|p| {
+                matches!(&p.target, SplitTarget::Node { node_id: sid, .. } if sid == node_id)
+            });
+            if !split_has_node {
+                if let Err(e) = self.client.node_unsubscribe(node_id).await {
+                    warn!("unsubscribe failed: {}", e);
                 }
             }
-            self.split_panels.clear();
+            // Preserve split panels — they are independent of the DM session
             self.dm_view.clear();
             self.view_mode = ViewMode::Channel {
                 channel_id: self.active_channel.clone().unwrap_or_default(),
@@ -3455,6 +3455,62 @@ mod tests {
 
         assert!(app.split_panels.is_empty());
         assert_eq!(app.split_focus, SplitFocus::Dm);
+    }
+
+    #[tokio::test]
+    async fn exit_dm_preserves_split_panels() {
+        let mut app = make_dm_app();
+        app.split_panels.push(make_split_panel(SplitTarget::Channel));
+        app.split_panels.push(make_split_panel(SplitTarget::Node {
+            node_id: "n2".into(),
+            node_name: "bob".into(),
+        }));
+        assert_eq!(app.split_panels.len(), 2);
+
+        app.exit_dm().await;
+
+        // Split panels should survive DM exit
+        assert_eq!(app.split_panels.len(), 2, "split panels should persist after exit_dm");
+    }
+
+    #[tokio::test]
+    async fn split_renders_in_channel_mode() {
+        let mut app = make_app();
+        app.view_mode = ViewMode::Channel { channel_id: "ch1".into() };
+        app.split_panels.push(make_split_panel(SplitTarget::Node {
+            node_id: "n1".into(),
+            node_name: "alice".into(),
+        }));
+
+        // panel_count should include split panels even in channel mode
+        assert!(!app.is_dm_mode());
+        assert_eq!(app.split_panel_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn switch_dm_preserves_split_panels() {
+        let mut app = make_dm_app();
+        app.split_panels.push(make_split_panel(SplitTarget::Channel));
+        app.agents.push(AgentDisplay {
+            name: "bob".into(),
+            status: "idle".into(),
+            activity: None,
+            adapter: None,
+            model: None,
+            node_id: "n2".into(),
+            transport: "stdio".into(),
+            capabilities: vec![],
+            usage: None,
+            tool_call_name: None,
+            tool_call_started: None,
+            waiting_for: None,
+        });
+        assert_eq!(app.split_panels.len(), 1);
+
+        app.enter_dm("bob").await;
+
+        // Split panels should survive DM-to-DM switch
+        assert_eq!(app.split_panels.len(), 1, "split panels should persist after DM switch");
     }
 
     #[tokio::test]
