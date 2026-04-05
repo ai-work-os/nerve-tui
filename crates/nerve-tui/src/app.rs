@@ -977,8 +977,10 @@ impl<T: Transport> App<T> {
         self.dm_view = DmView::new(&node_name);
         self.view_mode = ViewMode::Dm { node_id, node_name: node_name.clone() };
 
-        // Initialize usage display from agent snapshot
+        // Initialize model + usage display from agent snapshot
         if let Some(agent) = self.agents.iter().find(|a| a.name == node_name) {
+            let token_size = agent.usage.map(|(_, size, _)| size);
+            self.dm_view.set_model_label(agent.model.as_deref(), token_size);
             if let Some((used, size, cost)) = agent.usage {
                 self.dm_view.update_usage(used, size, cost);
             }
@@ -3312,6 +3314,48 @@ mod tests {
             waiting_for: None,
         }];
         app
+    }
+
+    #[tokio::test]
+    async fn enter_dm_sets_model_label() {
+        let mut app = make_app();
+        app.agents = vec![AgentDisplay {
+            name: "alice".into(),
+            status: "idle".into(),
+            activity: None,
+            adapter: Some("claude".into()),
+            model: Some("opus[1m]".into()),
+            node_id: "n1".into(),
+            transport: "stdio".into(),
+            capabilities: vec![],
+            usage: Some((50_000.0, 200_000.0, 1.5)),
+            tool_call_name: None,
+            tool_call_started: None,
+            waiting_for: None,
+        }];
+        app.enter_dm("alice").await;
+        assert_eq!(app.dm_view.model_label.as_deref(), Some("opus[1m] / 200.0k"));
+    }
+
+    #[tokio::test]
+    async fn enter_dm_no_model_sets_none() {
+        let mut app = make_app();
+        app.agents = vec![AgentDisplay {
+            name: "bob".into(),
+            status: "idle".into(),
+            activity: None,
+            adapter: None,
+            model: None,
+            node_id: "n2".into(),
+            transport: "stdio".into(),
+            capabilities: vec![],
+            usage: None,
+            tool_call_name: None,
+            tool_call_started: None,
+            waiting_for: None,
+        }];
+        app.enter_dm("bob").await;
+        assert!(app.dm_view.model_label.is_none());
     }
 
     #[tokio::test]
