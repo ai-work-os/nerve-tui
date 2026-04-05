@@ -1,7 +1,7 @@
 use anyhow::Result;
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 use futures_util::StreamExt;
-use nerve_tui_core::NerveClient;
+use nerve_tui_core::Transport;
 use nerve_tui_protocol::*;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Span;
@@ -63,8 +63,8 @@ struct SplitPanel {
     panel_state: ChannelPanelState,
 }
 
-pub struct App {
-    pub client: NerveClient,
+pub struct App<T: Transport> {
+    pub client: T,
     event_rx: mpsc::UnboundedReceiver<NerveEvent>,
 
     // UI components — direct view fields (replaces MessagesView proxy)
@@ -105,13 +105,13 @@ pub struct App {
     force_clear: bool,
 }
 
-impl App {
-    pub fn new(client: NerveClient, event_rx: mpsc::UnboundedReceiver<NerveEvent>) -> Self {
+impl<T: Transport> App<T> {
+    pub fn new(client: T, event_rx: mpsc::UnboundedReceiver<NerveEvent>) -> Self {
         Self::new_with_project(client, event_rx, None)
     }
 
     pub fn new_with_project(
-        client: NerveClient,
+        client: T,
         event_rx: mpsc::UnboundedReceiver<NerveEvent>,
         project_path: Option<String>,
     ) -> Self {
@@ -875,11 +875,9 @@ impl App {
             // Send in background — response comes via node.update or node.log
             let node_id = node_id.clone();
             let content = text.to_string();
-            let client_ws_tx = self.client.ws_tx_clone();
-            let pending = self.client.pending_clone();
+            let client = self.client.clone();
             let error_tx = self.error_tx.clone();
             tokio::spawn(async move {
-                let client = NerveClient::from_parts(client_ws_tx, pending);
                 let result = if is_program {
                     client.node_message(&node_id, &content).await
                 } else {
@@ -1612,8 +1610,8 @@ impl App {
                 // Only show messages that @mention me or that I sent.
                 // Token-level match: @name must be preceded by whitespace and followed
                 // by whitespace, punctuation, or EOF (mirrors server router.ts:parseMentions).
-                let dominated = message.from == self.client.node_name
-                    || mentions_name(&message.content, &self.client.node_name);
+                let dominated = message.from == self.client.node_name()
+                    || mentions_name(&message.content, self.client.node_name());
                 if dominated {
                     let is_active = self.active_channel.as_deref() == Some(&channel_id);
                     if is_active {
@@ -2199,38 +2197,32 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nerve_tui_core::mock::MockTransport;
     use ratatui::layout::Rect;
-    use std::collections::HashMap;
-    use std::sync::Arc;
-    use tokio::sync::Mutex;
 
-    fn make_app() -> App {
-        let (ws_tx, _ws_rx) = mpsc::unbounded_channel::<String>();
-        let pending = Arc::new(Mutex::new(HashMap::new()));
-        let client = NerveClient::from_parts(ws_tx, pending);
+    fn make_app() -> App<MockTransport> {
+        let transport = MockTransport::new("test-user");
         let (_event_tx, event_rx) = mpsc::unbounded_channel();
-        App::new(client, event_rx)
+        App::new(transport, event_rx)
     }
 
     #[test]
     fn project_name_uses_last_path_segment() {
         assert_eq!(
-            App::project_name_from_path("/tmp/demo-project"),
+            App::<MockTransport>::project_name_from_path("/tmp/demo-project"),
             Some("demo-project".to_string())
         );
         assert_eq!(
-            App::project_name_from_path("/tmp/demo-project/"),
+            App::<MockTransport>::project_name_from_path("/tmp/demo-project/"),
             Some("demo-project".to_string())
         );
     }
 
     #[test]
     fn new_with_project_sets_project_context() {
-        let (ws_tx, _ws_rx) = mpsc::unbounded_channel::<String>();
-        let pending = Arc::new(Mutex::new(HashMap::new()));
-        let client = NerveClient::from_parts(ws_tx, pending);
+        let transport = MockTransport::new("test-user");
         let (_event_tx, event_rx) = mpsc::unbounded_channel();
-        let app = App::new_with_project(client, event_rx, Some("/tmp/demo-project".into()));
+        let app = App::new_with_project(transport, event_rx, Some("/tmp/demo-project".into()));
 
         assert_eq!(app.project_path.as_deref(), Some("/tmp/demo-project"));
         assert_eq!(app.project_name.as_deref(), Some("demo-project"));
@@ -2462,11 +2454,9 @@ mod tests {
 
     #[test]
     fn cwd_filter_respects_global_mode() {
-        let (ws_tx, _ws_rx) = mpsc::unbounded_channel::<String>();
-        let pending = Arc::new(Mutex::new(HashMap::new()));
-        let client = NerveClient::from_parts(ws_tx, pending);
+        let transport = MockTransport::new("test-user");
         let (_event_tx, event_rx) = mpsc::unbounded_channel();
-        let mut app = App::new_with_project(client, event_rx, Some("/tmp/project".into()));
+        let mut app = App::new_with_project(transport, event_rx, Some("/tmp/project".into()));
 
         // Default: project mode
         assert_eq!(app.cwd_filter(), Some("/tmp/project"));
@@ -3206,7 +3196,7 @@ mod tests {
     // --- Split Step 4: keyboard interaction tests ---
 
     /// Helper: simulate the Ctrl+W focus cycling logic (extracted from handle_key).
-    fn cycle_split_focus(app: &mut App) {
+    fn cycle_split_focus(app: &mut App<MockTransport>) {
         if app.is_split() {
             app.split_focus = match app.split_focus {
                 SplitFocus::Dm => SplitFocus::Panel(0),
@@ -3351,7 +3341,7 @@ mod tests {
     // --- Split Step 5: /split command extension tests ---
 
     /// Helper: set up app in DM mode with an active channel.
-    fn make_dm_app() -> App {
+    fn make_dm_app() -> App<MockTransport> {
         let mut app = make_app();
         app.dm_view = DmView::new("alice");
         app.view_mode = ViewMode::Dm { node_id: "n1".into(), node_name: "alice".into() };
@@ -3921,5 +3911,162 @@ mod tests {
         assert!(!app.status_bar.collapsed_sections.contains("AI Agents"),
                 "Enter again should expand the section");
         assert_eq!(app.status_bar.nav_count(&app.channels, &app.agents), 4);
+    }
+
+    // ── Render tests (Phase 3) ──────────────────────────────────
+
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    /// Extract all text content from a ratatui Buffer as a single string.
+    fn buffer_text(buf: &ratatui::buffer::Buffer) -> String {
+        let area = buf.area;
+        let mut text = String::new();
+        for y in area.y..area.y + area.height {
+            for x in area.x..area.x + area.width {
+                let cell = &buf[(x, y)];
+                text.push_str(cell.symbol());
+            }
+        }
+        text
+    }
+
+    /// Like buffer_text but collapse all whitespace — useful for matching CJK text
+    /// where full-width chars leave filler cells rendered as spaces.
+    fn buffer_text_compact(buf: &ratatui::buffer::Buffer) -> String {
+        buffer_text(buf).split_whitespace().collect::<Vec<_>>().join("")
+    }
+
+    #[test]
+    fn render_empty_channel_shows_messages_border() {
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = make_app();
+
+        terminal.draw(|f| app.render(f)).unwrap();
+
+        let text = buffer_text(terminal.backend().buffer());
+        assert!(text.contains("Messages"), "buffer should contain 'Messages' title");
+    }
+
+    #[test]
+    fn render_channel_with_messages() {
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = make_app();
+        app.channel_view.push_system("hello world test msg");
+
+        terminal.draw(|f| app.render(f)).unwrap();
+
+        let text = buffer_text(terminal.backend().buffer());
+        assert!(text.contains("hello world test msg"), "buffer should contain pushed message");
+    }
+
+    #[test]
+    fn render_dm_view_shows_agent_name() {
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = make_app();
+        app.view_mode = ViewMode::Dm { node_id: "n1".into(), node_name: "alice".into() };
+        app.dm_view = DmView::new("alice");
+
+        terminal.draw(|f| app.render(f)).unwrap();
+
+        let text = buffer_text_compact(terminal.backend().buffer());
+        assert!(text.contains("与alice的对话"), "buffer should contain agent name in DM title");
+    }
+
+    #[test]
+    fn render_dm_responding_shows_indicator() {
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = make_app();
+        app.view_mode = ViewMode::Dm { node_id: "n1".into(), node_name: "alice".into() };
+        app.dm_view = DmView::new("alice");
+        app.dm_view.is_responding = true;
+
+        terminal.draw(|f| app.render(f)).unwrap();
+
+        let text = buffer_text_compact(terminal.backend().buffer());
+        assert!(text.contains("回复中..."), "buffer should show responding indicator");
+    }
+
+    #[test]
+    fn render_dm_ready_shows_ready() {
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = make_app();
+        app.view_mode = ViewMode::Dm { node_id: "n1".into(), node_name: "alice".into() };
+        app.dm_view = DmView::new("alice");
+        app.dm_view.is_responding = false;
+
+        terminal.draw(|f| app.render(f)).unwrap();
+
+        let text = buffer_text_compact(terminal.backend().buffer());
+        assert!(text.contains("就绪"), "buffer should show ready indicator");
+    }
+
+    #[test]
+    fn render_sidebar_hidden_uses_full_width() {
+        let backend = TestBackend::new(80, 24);
+        let mut terminal_visible = Terminal::new(backend).unwrap();
+        let mut app_visible = make_app();
+        app_visible.sidebar_visible = true;
+        terminal_visible.draw(|f| app_visible.render(f)).unwrap();
+
+        let backend2 = TestBackend::new(80, 24);
+        let mut terminal_hidden = Terminal::new(backend2).unwrap();
+        let mut app_hidden = make_app();
+        app_hidden.sidebar_visible = false;
+        terminal_hidden.draw(|f| app_hidden.render(f)).unwrap();
+
+        // When sidebar is hidden, the Messages border should start at x=0
+        // When visible, it starts further right. We check that "Messages" appears
+        // earlier (at a smaller x position) when sidebar is hidden.
+        let buf_visible = terminal_visible.backend().buffer();
+        let buf_hidden = terminal_hidden.backend().buffer();
+
+        let find_messages_x = |buf: &ratatui::buffer::Buffer| -> Option<u16> {
+            let area = buf.area;
+            for y in area.y..area.y + area.height {
+                let mut row = String::new();
+                for x in area.x..area.x + area.width {
+                    row.push_str(buf[(x, y)].symbol());
+                }
+                if let Some(pos) = row.find("Messages") {
+                    return Some(pos as u16);
+                }
+            }
+            None
+        };
+
+        let x_visible = find_messages_x(buf_visible).expect("Messages title with sidebar");
+        let x_hidden = find_messages_x(buf_hidden).expect("Messages title without sidebar");
+        assert!(x_hidden < x_visible, "Messages should start further left when sidebar is hidden (hidden={}, visible={})", x_hidden, x_visible);
+    }
+
+    #[test]
+    fn render_input_area_exists() {
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = make_app();
+
+        terminal.draw(|f| app.render(f)).unwrap();
+
+        // The input area renders a bordered block at the bottom of the screen.
+        // Check that the bottom rows contain border characters (─ or │).
+        let buf = terminal.backend().buffer();
+        let area = buf.area;
+        let bottom_y = area.y + area.height - 1;
+        let mut bottom_row = String::new();
+        for x in area.x..area.x + area.width {
+            bottom_row.push_str(buf[(x, bottom_y)].symbol());
+        }
+        // Input box border uses box-drawing characters
+        assert!(
+            bottom_row.contains('─') || bottom_row.contains('└') || bottom_row.contains('┘'),
+            "bottom row should contain input area border characters, got: {}",
+            bottom_row
+        );
     }
 }

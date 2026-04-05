@@ -521,3 +521,230 @@ pub fn render_dm_panel(
     let para = para.scroll((state.scroll_offset, 0));
     para.render(inner, buf);
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nerve_tui_protocol::MessageInfo;
+
+    fn make_msg(from: &str, content: &str) -> MessageInfo {
+        MessageInfo {
+            id: "m1".to_string(),
+            channel_id: "ch1".to_string(),
+            from: from.to_string(),
+            content: content.to_string(),
+            timestamp: 1000.0,
+            metadata: None,
+        }
+    }
+
+    // --- Message management ---
+
+    #[test]
+    fn new_creates_empty_view() {
+        let v = ChannelView::new();
+        assert_eq!(v.line_count(), 0);
+        assert!(v.auto_scroll);
+        assert_eq!(v.scroll_offset, 0);
+        assert!(v.filter.is_none());
+    }
+
+    #[test]
+    fn push_adds_message() {
+        let mut v = ChannelView::new();
+        v.push(&make_msg("alice", "hello"), false);
+        assert_eq!(v.line_count(), 1);
+        assert_eq!(v.messages[0].from, "alice");
+        assert_eq!(v.messages[0].content, "hello");
+    }
+
+    #[test]
+    fn push_system_adds_system_message() {
+        let mut v = ChannelView::new();
+        v.push_system("connected");
+        assert_eq!(v.line_count(), 1);
+        assert_eq!(v.messages[0].from, "系统");
+        assert_eq!(v.messages[0].content, "connected");
+    }
+
+    #[test]
+    fn clear_removes_all_messages() {
+        let mut v = ChannelView::new();
+        v.push_system("a");
+        v.push_system("b");
+        assert_eq!(v.line_count(), 2);
+        v.clear();
+        assert_eq!(v.line_count(), 0);
+    }
+
+    #[test]
+    fn last_system_content_returns_last() {
+        let mut v = ChannelView::new();
+        v.push_system("first");
+        v.push(&make_msg("bob", "hi"), false);
+        v.push_system("second");
+        assert_eq!(v.last_system_content(), Some("second"));
+    }
+
+    #[test]
+    fn last_system_content_none_when_empty() {
+        let v = ChannelView::new();
+        assert_eq!(v.last_system_content(), None);
+    }
+
+    // --- Scrolling ---
+
+    #[test]
+    fn scroll_down_increases_offset() {
+        let mut v = ChannelView::new();
+        v.scroll_offset = 0;
+        v.scroll_down(5);
+        assert_eq!(v.scroll_offset, 5);
+    }
+
+    #[test]
+    fn scroll_up_decreases_offset() {
+        let mut v = ChannelView::new();
+        v.scroll_offset = 10;
+        v.scroll_up(3);
+        assert_eq!(v.scroll_offset, 7);
+    }
+
+    #[test]
+    fn scroll_down_disables_auto_scroll() {
+        let mut v = ChannelView::new();
+        assert!(v.auto_scroll);
+        v.scroll_down(1);
+        assert!(!v.auto_scroll);
+    }
+
+    #[test]
+    fn scroll_up_disables_auto_scroll() {
+        let mut v = ChannelView::new();
+        assert!(v.auto_scroll);
+        v.scroll_up(1);
+        assert!(!v.auto_scroll);
+    }
+
+    #[test]
+    fn snap_to_bottom_enables_auto_scroll() {
+        let mut v = ChannelView::new();
+        v.scroll_down(5);
+        assert!(!v.auto_scroll);
+        v.snap_to_bottom();
+        assert!(v.auto_scroll);
+        assert_eq!(v.scroll_offset, u16::MAX);
+        assert!(!v.has_new_messages);
+    }
+
+    #[test]
+    fn page_up_scrolls_by_visible_height() {
+        let mut v = ChannelView::new();
+        v.visible_height = 20;
+        v.scroll_offset = 50;
+        v.page_up();
+        assert_eq!(v.scroll_offset, 30);
+    }
+
+    // --- Channel cache ---
+
+    #[test]
+    fn save_and_load_channel_round_trips() {
+        let mut v = ChannelView::new();
+        v.push_system("msg1");
+        v.push_system("msg2");
+        assert_eq!(v.line_count(), 2);
+
+        v.save_channel("ch-a");
+        assert_eq!(v.line_count(), 0);
+
+        let loaded = v.load_channel("ch-a");
+        assert!(loaded);
+        assert_eq!(v.line_count(), 2);
+        assert_eq!(v.messages[0].content, "msg1");
+    }
+
+    #[test]
+    fn load_returns_false_when_no_cache() {
+        let mut v = ChannelView::new();
+        assert!(!v.load_channel("nonexistent"));
+    }
+
+    #[test]
+    fn save_preserves_scroll_state() {
+        let mut v = ChannelView::new();
+        v.auto_scroll = false;
+        v.scroll_offset = 0;
+        v.push_system("x");
+        // push_system does NOT snap because auto_scroll is false
+        v.scroll_down(7);
+        assert!(!v.auto_scroll);
+        assert_eq!(v.scroll_offset, 7);
+
+        v.save_channel("ch-s");
+        v.auto_scroll = true;
+        v.scroll_offset = 0;
+
+        v.load_channel("ch-s");
+        assert_eq!(v.scroll_offset, 7);
+        assert!(!v.auto_scroll);
+    }
+
+    #[test]
+    fn push_to_channel_increments_unread() {
+        let mut v = ChannelView::new();
+        let msg = make_msg("alice", "hello");
+        v.push_to_channel("ch-b", &msg);
+        assert_eq!(v.unread_count("ch-b"), 1);
+        v.push_to_channel("ch-b", &msg);
+        assert_eq!(v.unread_count("ch-b"), 2);
+    }
+
+    // --- Unread ---
+
+    #[test]
+    fn unread_count_zero_by_default() {
+        let v = ChannelView::new();
+        assert_eq!(v.unread_count("any"), 0);
+    }
+
+    #[test]
+    fn clear_unread_resets_count() {
+        let mut v = ChannelView::new();
+        v.push_to_channel("ch-c", &make_msg("a", "b"));
+        v.push_to_channel("ch-c", &make_msg("a", "c"));
+        assert_eq!(v.unread_count("ch-c"), 2);
+        v.clear_unread("ch-c");
+        assert_eq!(v.unread_count("ch-c"), 0);
+    }
+
+    #[test]
+    fn load_channel_clears_unread() {
+        let mut v = ChannelView::new();
+        v.push_to_channel("ch-d", &make_msg("a", "x"));
+        assert_eq!(v.unread_count("ch-d"), 1);
+        v.load_channel("ch-d");
+        assert_eq!(v.unread_count("ch-d"), 0);
+    }
+
+    // --- Filter ---
+
+    #[test]
+    fn filter_affects_build_text_output() {
+        let mut v = ChannelView::new();
+        v.push(&make_msg("alice", "hello from alice"), false);
+        v.push(&make_msg("bob", "hello from bob"), false);
+        v.push(&make_msg("alice", "second from alice"), false);
+
+        let lines_all = v.build_text_pub(80);
+        let all_text: String = lines_all.iter().map(|l| format!("{:?}", l)).collect();
+        assert!(all_text.contains("alice"));
+        assert!(all_text.contains("bob"));
+
+        v.filter = Some("alice".to_string());
+        let lines_filtered = v.build_text_pub(80);
+        let filtered_text: String = lines_filtered.iter().map(|l| format!("{:?}", l)).collect();
+        assert!(filtered_text.contains("alice"));
+        assert!(!filtered_text.contains("bob"));
+    }
+}

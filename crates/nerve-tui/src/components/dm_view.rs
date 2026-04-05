@@ -527,3 +527,293 @@ fn format_tokens(n: f64) -> String {
         format!("{}", n as u64)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nerve_tui_protocol::{ContentBlock, DmMessage};
+    use serde_json::json;
+
+    fn make_dm(role: &str, content: &str) -> DmMessage {
+        DmMessage {
+            role: role.to_string(),
+            content: content.to_string(),
+            timestamp: 1000,
+        }
+    }
+
+    // --- Basics ---
+
+    #[test]
+    fn new_sets_agent_name() {
+        let dm = DmView::new("alice");
+        assert_eq!(dm.agent_name(), "alice");
+    }
+
+    #[test]
+    fn inactive_is_not_active() {
+        let dm = DmView::inactive();
+        assert!(!dm.is_active());
+    }
+
+    #[test]
+    fn new_is_active() {
+        let dm = DmView::new("alice");
+        assert!(dm.is_active());
+    }
+
+    // --- Messages ---
+
+    #[test]
+    fn push_adds_message() {
+        let mut dm = DmView::new("alice");
+        assert_eq!(dm.messages.len(), 0);
+        dm.push(&make_dm("user", "hello"));
+        assert_eq!(dm.messages.len(), 1);
+        assert_eq!(dm.messages[0].from, "user");
+    }
+
+    #[test]
+    fn push_system_adds_system_message() {
+        let mut dm = DmView::new("alice");
+        dm.push_system("connected");
+        assert_eq!(dm.messages.len(), 1);
+        assert_eq!(dm.messages[0].from, "系统");
+        assert_eq!(dm.messages[0].content, "connected");
+    }
+
+    #[test]
+    fn clear_resets_all_state() {
+        let mut dm = DmView::new("alice");
+        dm.push(&make_dm("user", "hi"));
+        dm.start_streaming_message("alice");
+        dm.dm_history.push(make_dm("user", "hi"));
+        dm.is_responding = true;
+
+        dm.clear();
+
+        assert!(dm.messages.is_empty());
+        assert!(dm.streaming_messages.is_empty());
+        assert!(dm.dm_history.is_empty());
+        assert!(!dm.is_responding);
+        assert!(dm.auto_scroll);
+    }
+
+    // --- Streaming ---
+
+    #[test]
+    fn start_streaming_creates_message() {
+        let mut dm = DmView::new("alice");
+        dm.start_streaming_message("alice");
+        assert!(dm.streaming_messages.contains_key("alice"));
+    }
+
+    #[test]
+    fn apply_streaming_accumulates_text() {
+        let mut dm = DmView::new("alice");
+        dm.start_streaming_message("alice");
+        let update = json!({ "content": { "text": "hello" } });
+        dm.apply_streaming_event("alice", "agent_message_chunk", &update);
+        let update2 = json!({ "content": { "text": " world" } });
+        dm.apply_streaming_event("alice", "agent_message_chunk", &update2);
+
+        let msg = dm.streaming_messages.get("alice").unwrap();
+        let text: String = msg.blocks.iter().filter_map(|b| match b {
+            ContentBlock::Text { text } => Some(text.clone()),
+            _ => None,
+        }).collect();
+        assert!(text.contains("hello"));
+        assert!(text.contains("world"));
+    }
+
+    #[test]
+    fn apply_streaming_accumulates_thinking() {
+        let mut dm = DmView::new("alice");
+        dm.start_streaming_message("alice");
+        let update = json!({ "content": { "text": "hmm" } });
+        dm.apply_streaming_event("alice", "agent_thought_chunk", &update);
+
+        let msg = dm.streaming_messages.get("alice").unwrap();
+        let has_thinking = msg.blocks.iter().any(|b| matches!(b, ContentBlock::Thinking { .. }));
+        assert!(has_thinking);
+    }
+
+    #[test]
+    fn apply_auto_starts_streaming() {
+        let mut dm = DmView::new("alice");
+        // No start_streaming_message call
+        let update = json!({ "content": { "text": "auto" } });
+        dm.apply_streaming_event("bob", "agent_message_chunk", &update);
+        assert!(dm.streaming_messages.contains_key("bob"));
+    }
+
+    #[test]
+    fn take_streaming_returns_message() {
+        let mut dm = DmView::new("alice");
+        dm.start_streaming_message("alice");
+        let result = dm.take_streaming_message("alice");
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn take_streaming_removes_from_map() {
+        let mut dm = DmView::new("alice");
+        dm.start_streaming_message("alice");
+        dm.take_streaming_message("alice");
+        assert!(dm.streaming_messages.is_empty());
+    }
+
+    #[test]
+    fn take_streaming_sets_partial_false() {
+        let mut dm = DmView::new("alice");
+        dm.start_streaming_message("alice");
+        let msg = dm.take_streaming_message("alice").unwrap();
+        assert!(!msg.meta.partial);
+    }
+
+    // --- Blink ---
+
+    #[test]
+    fn tick_blink_increments() {
+        let mut dm = DmView::new("alice");
+        assert_eq!(dm.blink_tick, 0);
+        dm.tick_blink();
+        assert_eq!(dm.blink_tick, 1);
+        dm.tick_blink();
+        assert_eq!(dm.blink_tick, 2);
+    }
+
+    #[test]
+    fn cursor_visible_alternates() {
+        let mut dm = DmView::new("alice");
+        // blink_tick=0 -> (0/15)%2==0 -> visible
+        assert!(dm.cursor_visible());
+        // Advance to tick 15 -> (15/15)%2==1 -> not visible
+        for _ in 0..15 {
+            dm.tick_blink();
+        }
+        assert!(!dm.cursor_visible());
+        // Advance to tick 30 -> (30/15)%2==0 -> visible again
+        for _ in 0..15 {
+            dm.tick_blink();
+        }
+        assert!(dm.cursor_visible());
+    }
+
+    // --- Scrolling ---
+
+    #[test]
+    fn scroll_down_disables_auto_scroll() {
+        let mut dm = DmView::new("alice");
+        assert!(dm.auto_scroll);
+        dm.scroll_down(1);
+        assert!(!dm.auto_scroll);
+    }
+
+    #[test]
+    fn scroll_up_disables_auto_scroll() {
+        let mut dm = DmView::new("alice");
+        assert!(dm.auto_scroll);
+        dm.scroll_up(1);
+        assert!(!dm.auto_scroll);
+    }
+
+    #[test]
+    fn snap_to_bottom_enables_auto_scroll() {
+        let mut dm = DmView::new("alice");
+        dm.scroll_down(5);
+        assert!(!dm.auto_scroll);
+        dm.snap_to_bottom();
+        assert!(dm.auto_scroll);
+        assert_eq!(dm.scroll_offset, u16::MAX);
+    }
+
+    // --- Summary mode ---
+
+    #[test]
+    fn toggle_summary_mode_flips() {
+        let mut dm = DmView::new("alice");
+        assert!(!dm.summary_mode);
+        dm.toggle_summary_mode();
+        assert!(dm.summary_mode);
+        dm.toggle_summary_mode();
+        assert!(!dm.summary_mode);
+    }
+
+    // --- Usage ---
+
+    #[test]
+    fn update_usage_sets_label() {
+        let mut dm = DmView::new("alice");
+        assert!(dm.usage_label.is_none());
+        dm.update_usage(50000.0, 100000.0, 1.23);
+        assert!(dm.usage_label.is_some());
+        let label = dm.usage_label.as_ref().unwrap();
+        assert!(label.contains("50%"));
+        assert!(label.contains("$1.23"));
+    }
+
+    // --- blocks_to_text ---
+
+    #[test]
+    fn blocks_to_text_filters_thinking() {
+        let blocks = vec![
+            ContentBlock::Thinking {
+                text: "internal thought".to_string(),
+                started_at: None,
+                finished_at: None,
+            },
+            ContentBlock::Text { text: "visible".to_string() },
+        ];
+        let result = blocks_to_text(&blocks);
+        assert!(!result.contains("internal thought"));
+        assert!(result.contains("visible"));
+    }
+
+    #[test]
+    fn blocks_to_text_includes_text() {
+        let blocks = vec![
+            ContentBlock::Text { text: "hello".to_string() },
+            ContentBlock::Text { text: "world".to_string() },
+        ];
+        let result = blocks_to_text(&blocks);
+        assert_eq!(result, "hello\nworld");
+    }
+
+    // --- format_tokens ---
+
+    #[test]
+    fn format_tokens_small() {
+        assert_eq!(format_tokens(500.0), "500");
+    }
+
+    #[test]
+    fn format_tokens_thousands() {
+        assert_eq!(format_tokens(1500.0), "1.5k");
+    }
+
+    #[test]
+    fn format_tokens_millions() {
+        assert_eq!(format_tokens(2_500_000.0), "2.5M");
+    }
+
+    // --- extract_channel_origin ---
+
+    #[test]
+    fn extract_channel_origin_no_prefix() {
+        let (origin, text) = extract_channel_origin("plain message");
+        assert!(origin.is_none());
+        assert_eq!(text, "plain message");
+    }
+
+    #[test]
+    fn extract_channel_origin_with_prefix() {
+        let input = "[channel:general] from:bob\n\nactual content";
+        let (origin, text) = extract_channel_origin(input);
+        assert!(origin.is_some());
+        let o = origin.unwrap();
+        assert_eq!(o.channel, "general");
+        assert_eq!(o.from, "bob");
+        assert_eq!(text, "actual content");
+    }
+}
