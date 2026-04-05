@@ -189,13 +189,6 @@ impl<T: Transport> App<T> {
         self.split_panels.len()
     }
 
-    fn focused_panel(&self) -> Option<&SplitPanel> {
-        match self.split_focus {
-            SplitFocus::Panel(i) => self.split_panels.get(i),
-            _ => None,
-        }
-    }
-
     fn focused_panel_mut(&mut self) -> Option<&mut SplitPanel> {
         match self.split_focus {
             SplitFocus::Panel(i) => self.split_panels.get_mut(i),
@@ -2896,50 +2889,6 @@ mod tests {
             panel_state: ChannelPanelState::new(),
         });
         assert!(app.is_split());
-    }
-
-    #[test]
-    fn focused_panel_returns_first_panel() {
-        let mut app = make_app();
-        app.split_panels.push(SplitPanel {
-            target: SplitTarget::Channel,
-            node_buffer: String::new(),
-            node_msg_pending: false,
-            panel_state: ChannelPanelState::new(),
-        });
-        app.split_focus = SplitFocus::Panel(0);
-
-        let panel = app.focused_panel();
-        assert!(panel.is_some());
-        assert_eq!(panel.unwrap().target, SplitTarget::Channel);
-    }
-
-    #[test]
-    fn focused_panel_returns_none_when_dm_focus() {
-        let mut app = make_app();
-        app.split_panels.push(SplitPanel {
-            target: SplitTarget::Channel,
-            node_buffer: String::new(),
-            node_msg_pending: false,
-            panel_state: ChannelPanelState::new(),
-        });
-        app.split_focus = SplitFocus::Dm;
-
-        assert!(app.focused_panel().is_none());
-    }
-
-    #[test]
-    fn focused_panel_returns_none_when_index_out_of_bounds() {
-        let mut app = make_app();
-        app.split_panels.push(SplitPanel {
-            target: SplitTarget::Channel,
-            node_buffer: String::new(),
-            node_msg_pending: false,
-            panel_state: ChannelPanelState::new(),
-        });
-        app.split_focus = SplitFocus::Panel(5);
-
-        assert!(app.focused_panel().is_none());
     }
 
     #[test]
