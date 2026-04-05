@@ -228,6 +228,13 @@ impl WindowLayout {
         }
     }
 
+    /// 清除所有 panel，重置 focus 到 Primary
+    pub fn clear_panels(&mut self) {
+        self.panels.clear();
+        self.panel_x_boundaries.clear();
+        self.focus = WindowFocus::Primary;
+    }
+
     /// panel 数量
     pub fn panel_count(&self) -> usize {
         self.panels.len()
@@ -917,6 +924,32 @@ mod tests {
 
         layout.remove_panel(0);
         assert_eq!(layout.panel_x_boundaries.len(), layout.panel_count());
+    }
+
+    // ========== 20b. clear_panels ==========
+
+    #[test]
+    fn clear_panels_removes_all_and_resets_focus() {
+        let primary = Window::new(BufferId::Channel { channel_id: "ch1".into() }, 0);
+        let mut layout = WindowLayout::new(primary);
+        layout.add_panel(Window::new(BufferId::NodeLog { node_id: "n1".into() }, 0));
+        layout.add_panel(Window::new(BufferId::NodeLog { node_id: "n2".into() }, 0));
+        layout.cycle_focus_forward(); // Panel(0)
+        assert_eq!(layout.focus, WindowFocus::Panel(0));
+
+        layout.clear_panels();
+        assert_eq!(layout.panel_count(), 0);
+        assert!(layout.panel_x_boundaries.is_empty());
+        assert_eq!(layout.focus, WindowFocus::Primary);
+    }
+
+    #[test]
+    fn clear_panels_on_empty_is_noop() {
+        let primary = Window::new(BufferId::Channel { channel_id: "ch1".into() }, 0);
+        let mut layout = WindowLayout::new(primary);
+        layout.clear_panels();
+        assert_eq!(layout.panel_count(), 0);
+        assert_eq!(layout.focus, WindowFocus::Primary);
     }
 
     // ========== 21. 越界 remove 边界 ==========

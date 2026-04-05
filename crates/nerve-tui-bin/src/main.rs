@@ -36,6 +36,7 @@ fn restore_terminal() {
 }
 
 use nerve_tui::app::App;
+use nerve_tui::event_source::CrosstermEventSource;
 use nerve_tui_core::NerveClient;
 
 #[derive(Parser)]
@@ -152,8 +153,9 @@ async fn main() -> Result<()> {
         let mut terminal = Terminal::new(backend)?;
 
         let mut app = App::new_with_project(client, event_rx, project);
+        let mut event_source = CrosstermEventSource::new();
         app.init().await?;
-        app.run(&mut terminal).await
+        app.run(&mut terminal, &mut event_source).await
     }
     .await;
 

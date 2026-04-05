@@ -1,7 +1,8 @@
 use anyhow::Result;
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
-use futures_util::StreamExt;
-use nerve_tui_core::NerveClient;
+
+use nerve_tui_core::Transport;
+use crate::buffer::{BufferId, BufferContent, BufferPool, WindowLayout, Window, WindowFocus};
 use nerve_tui_protocol::*;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Span;
@@ -41,30 +42,17 @@ fn mentions_name(content: &str, name: &str) -> bool {
     false
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum SplitFocus {
-    Dm,
-    Panel(usize),
+/// Per-panel rendering metadata (parallel to layout.panels).
+#[derive(Debug, Clone)]
+struct PanelMeta {
+    /// Scroll/viewport state for rendering
+    state: ChannelPanelState,
+    /// Display label (node_name for Node panels, empty for Channel panels)
+    label: String,
 }
 
-#[derive(Debug, Clone, PartialEq)]
-enum SplitTarget {
-    Channel,
-    Node { node_id: String, node_name: String },
-}
-
-/// A single split panel with its own target, buffer, and scroll state.
-#[derive(Debug, Clone, PartialEq)]
-struct SplitPanel {
-    target: SplitTarget,
-    node_buffer: String,
-    /// Whether an AI message is currently streaming (between first chunk and message_end).
-    node_msg_pending: bool,
-    panel_state: ChannelPanelState,
-}
-
-pub struct App {
-    pub client: NerveClient,
+pub struct App<T: Transport> {
+    pub client: T,
     event_rx: mpsc::UnboundedReceiver<NerveEvent>,
 
     // UI components — direct view fields (replaces MessagesView proxy)
@@ -94,24 +82,23 @@ pub struct App {
     /// Cached archived channels from last /restore call
     archived_channels: Vec<Value>,
 
-    // Split view
-    split_panels: Vec<SplitPanel>,
-    split_focus: SplitFocus,
-    /// Cached x-coordinates of panel left boundaries (for mouse hit-testing in split view).
-    panel_x_boundaries: Vec<u16>,
+    // Split view — BufferPool + WindowLayout (replaces old split_panels/split_focus)
+    buffer_pool: BufferPool,
+    layout: WindowLayout,
+    panel_meta: Vec<PanelMeta>,
     /// Dirty flag — skip redraw if nothing changed since last frame.
     needs_redraw: bool,
     /// When true, clear terminal buffer before next draw (forces full repaint).
     force_clear: bool,
 }
 
-impl App {
-    pub fn new(client: NerveClient, event_rx: mpsc::UnboundedReceiver<NerveEvent>) -> Self {
+impl<T: Transport> App<T> {
+    pub fn new(client: T, event_rx: mpsc::UnboundedReceiver<NerveEvent>) -> Self {
         Self::new_with_project(client, event_rx, None)
     }
 
     pub fn new_with_project(
-        client: NerveClient,
+        client: T,
         event_rx: mpsc::UnboundedReceiver<NerveEvent>,
         project_path: Option<String>,
     ) -> Self {
@@ -144,9 +131,9 @@ impl App {
             error_tx,
             error_rx,
             archived_channels: Vec::new(),
-            split_panels: Vec::new(),
-            split_focus: SplitFocus::Dm,
-            panel_x_boundaries: Vec::new(),
+            buffer_pool: BufferPool::new(),
+            layout: WindowLayout::new(Window::new(BufferId::Channel { channel_id: String::new() }, 0)),
+            panel_meta: Vec::new(),
             needs_redraw: true,
             force_clear: false,
         }
@@ -182,38 +169,65 @@ impl App {
     }
 
     fn is_split(&self) -> bool {
-        !self.split_panels.is_empty()
+        self.layout.panel_count() > 0
     }
 
-    fn split_panel_count(&self) -> usize {
-        self.split_panels.len()
+
+    /// Add a split panel (Window + PanelMeta kept in sync).
+    fn add_panel(&mut self, buffer_id: BufferId, label: String) {
+        self.buffer_pool.get_or_create(buffer_id.clone());
+        let window = Window::new(buffer_id, 0);
+        self.layout.add_panel(window);
+        let mut meta = PanelMeta { state: ChannelPanelState::new(), label };
+        meta.state.snap_to_bottom();
+        self.panel_meta.push(meta);
     }
 
-    fn focused_panel(&self) -> Option<&SplitPanel> {
-        match self.split_focus {
-            SplitFocus::Panel(i) => self.split_panels.get(i),
-            _ => None,
+    /// Remove a specific panel by index, keeping layout + meta in sync.
+    fn remove_panel(&mut self, index: usize) {
+        if index < self.layout.panel_count() {
+            self.layout.remove_panel(index);
+            self.panel_meta.remove(index);
         }
     }
 
-    fn focused_panel_mut(&mut self) -> Option<&mut SplitPanel> {
-        match self.split_focus {
-            SplitFocus::Panel(i) => self.split_panels.get_mut(i),
-            _ => None,
-        }
+    /// Remove all panels, reset focus to Primary.
+    fn clear_panels(&mut self) {
+        self.layout.clear_panels();
+        self.panel_meta.clear();
     }
 
-    /// Clamp split_focus to a valid index after panels are removed.
-    fn clamp_split_focus(&mut self) {
-        if let SplitFocus::Panel(i) = self.split_focus {
-            if i >= self.split_panels.len() {
-                self.split_focus = if self.split_panels.is_empty() {
-                    SplitFocus::Dm
-                } else {
-                    SplitFocus::Panel(self.split_panels.len() - 1)
-                };
+    /// Unsubscribe from all NodeLog/Dm panels, then clear.
+    async fn unsubscribe_and_clear_panels(&mut self) {
+        for panel in &self.layout.panels {
+            match &panel.buffer_id {
+                BufferId::NodeLog { ref node_id } | BufferId::Dm { ref node_id } => {
+                    let _ = self.client.node_unsubscribe(node_id).await;
+                }
+                _ => {}
             }
         }
+        self.clear_panels();
+    }
+
+    /// Get the focused panel's PanelMeta (for scroll operations).
+    fn focused_panel_meta_mut(&mut self) -> Option<&mut PanelMeta> {
+        match self.layout.focus {
+            WindowFocus::Panel(i) => self.panel_meta.get_mut(i),
+            _ => None,
+        }
+    }
+
+    /// Get node_buffer text for a panel (read from buffer_pool).
+    fn panel_node_buffer(&self, index: usize) -> &str {
+        if let Some(panel) = self.layout.panels.get(index) {
+            if let Some(entry) = self.buffer_pool.get(&panel.buffer_id) {
+                if let BufferContent::NodeLog { ref text, .. } = entry.content {
+                    return text.as_str();
+                }
+            }
+        }
+        ""
     }
 
     fn dm_node_id(&self) -> Option<&str> {
@@ -227,6 +241,15 @@ impl App {
         match &self.view_mode {
             ViewMode::Dm { node_name, .. } => Some(node_name.as_str()),
             _ => None,
+        }
+    }
+
+    /// Returns &DmView if the given node_id matches the current DM target.
+    fn dm_view_for_node(&self, node_id: &str) -> Option<&DmView> {
+        if self.dm_node_id() == Some(node_id) {
+            Some(&self.dm_view)
+        } else {
+            None
         }
     }
 
@@ -299,8 +322,8 @@ impl App {
     pub async fn run(
         &mut self,
         terminal: &mut ratatui::Terminal<impl ratatui::backend::Backend>,
+        event_source: &mut impl crate::event_source::EventSource,
     ) -> Result<()> {
-        let mut event_stream = crossterm::event::EventStream::new();
         let mut redraw_interval = tokio::time::interval(tokio::time::Duration::from_millis(33));
 
         loop {
@@ -320,17 +343,22 @@ impl App {
 
             // Wait for at least one event
             tokio::select! {
-                Some(Ok(evt)) = event_stream.next() => {
-                    match evt {
-                        Event::Key(key) => {
-                            debug!("key event: code={:?} modifiers={:?}", key.code, key.modifiers);
-                            self.handle_key(key).await;
+                result = event_source.next_event() => {
+                    match result? {
+                        Some(evt) => {
+                            match evt {
+                                Event::Key(key) => {
+                                    debug!("key event: code={:?} modifiers={:?}", key.code, key.modifiers);
+                                    self.handle_key(key).await;
+                                }
+                                Event::Mouse(mouse) => self.handle_mouse(mouse),
+                                Event::Paste(text) => self.handle_paste(&text).await,
+                                _ => {}
+                            }
+                            self.needs_redraw = true;
                         }
-                        Event::Mouse(mouse) => self.handle_mouse(mouse),
-                        Event::Paste(text) => self.handle_paste(&text).await,
-                        _ => {}
+                        None => break, // event source exhausted
                     }
-                    self.needs_redraw = true;
                 }
                 Some(event) = self.event_rx.recv() => {
                     self.handle_nerve_event(event).await;
@@ -359,7 +387,7 @@ impl App {
         self.dm_view.tick_blink();
 
         let area = frame.area();
-        let panel_count = if self.is_dm_mode() { self.split_panels.len() } else { 0 };
+        let panel_count = if self.is_dm_mode() { self.layout.panel_count() } else { 0 };
         let input_inner_w = AppLayout::input_inner_width(area, self.sidebar_visible, panel_count);
         let input_lines = self.input.visual_line_count(input_inner_w) + 2;
         let layout = AppLayout::build(area, input_lines, self.sidebar_visible, panel_count);
@@ -385,14 +413,33 @@ impl App {
             self.channel_view.render(layout.messages, frame.buffer_mut());
         }
 
-        // Right panels (split view): channel or node output
-        self.panel_x_boundaries.clear();
+        // Pre-build DM panel lines (&self phase, before mutable render)
+        let dm_panel_lines: Vec<Option<Vec<ratatui::text::Line<'static>>>> = self.layout.panels.iter().enumerate().map(|(i, panel)| {
+            match &panel.buffer_id {
+                BufferId::Dm { ref node_id } => {
+                    let width = layout.panels.get(i).map(|a| a.width.saturating_sub(2)).unwrap_or(80);
+                    if let Some(dm) = self.dm_view_for_node(node_id) {
+                        Some(dm.build_text(width))
+                    } else {
+                        // DM target mismatch
+                        Some(vec![ratatui::text::Line::from(Span::styled(
+                            "已切换到其他对话",
+                            Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+                        ))])
+                    }
+                }
+                _ => None,
+            }
+        }).collect();
+
+        // Right panels (split view): channel, node output, or DM
+        self.layout.panel_x_boundaries.clear();
         for (i, panel_area) in layout.panels.iter().enumerate() {
-            self.panel_x_boundaries.push(panel_area.x);
-            if let Some(panel) = self.split_panels.get_mut(i) {
-                let focused = self.split_focus == SplitFocus::Panel(i);
-                match &panel.target {
-                    SplitTarget::Channel => {
+            self.layout.panel_x_boundaries.push(panel_area.x);
+            if i < self.layout.panels.len() {
+                let focused = self.layout.focus == WindowFocus::Panel(i);
+                match &self.layout.panels[i].buffer_id {
+                    BufferId::Channel { .. } => {
                         let channel_name = self
                             .channels
                             .iter()
@@ -401,23 +448,36 @@ impl App {
                             .unwrap_or("channel");
                         self.channel_view.render_panel(
                             channel_name,
-                            &mut panel.panel_state,
+                            &mut self.panel_meta[i].state,
                             focused,
                             *panel_area,
                             frame.buffer_mut(),
                         );
                     }
-                    SplitTarget::Node { node_name, .. } => {
-                        let title = format!("@{}", node_name);
-                        let buf = &panel.node_buffer;
+                    BufferId::NodeLog { .. } => {
+                        let title = format!("@{}", self.panel_meta[i].label);
+                        let buf = self.panel_node_buffer(i).to_string();
                         channel_view::render_text_panel(
                             &title,
-                            buf,
-                            &mut panel.panel_state,
+                            &buf,
+                            &mut self.panel_meta[i].state,
                             focused,
                             *panel_area,
                             frame.buffer_mut(),
                         );
+                    }
+                    BufferId::Dm { .. } => {
+                        let title = format!("@{}", self.panel_meta[i].label);
+                        if let Some(Some(lines)) = dm_panel_lines.get(i) {
+                            channel_view::render_dm_panel(
+                                &title,
+                                lines.clone(),
+                                &mut self.panel_meta[i].state,
+                                focused,
+                                *panel_area,
+                                frame.buffer_mut(),
+                            );
+                        }
                     }
                 }
             }
@@ -498,20 +558,12 @@ impl App {
             KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 if self.is_dm_mode() {
                     let has_target = self.active_channel.is_some()
-                        || self.split_panels.iter().any(|p| matches!(p.target, SplitTarget::Node { .. }));
+                        || self.layout.panels.iter().any(|p| matches!(p.buffer_id, BufferId::NodeLog { .. } | BufferId::Dm { .. }));
                     if has_target {
                         if self.is_split() {
-                            self.split_panels.clear();
-                            self.split_focus = SplitFocus::Dm;
+                            self.unsubscribe_and_clear_panels().await;
                         } else {
-                            self.split_panels.push(SplitPanel {
-                                target: SplitTarget::Channel,
-                                node_buffer: String::new(),
-                                node_msg_pending: false,
-                                panel_state: ChannelPanelState::new(),
-                            });
-                            self.split_focus = SplitFocus::Dm;
-                            self.split_panels[0].panel_state.snap_to_bottom();
+                            self.add_panel(BufferId::Channel { channel_id: String::new() }, String::new());
                         }
                     } else {
                         self.push_system_to_active("需要先加入频道才能分屏");
@@ -520,16 +572,7 @@ impl App {
             }
             KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 if self.is_split() && self.is_dm_mode() {
-                    self.split_focus = match self.split_focus {
-                        SplitFocus::Dm => SplitFocus::Panel(0),
-                        SplitFocus::Panel(i) => {
-                            if i + 1 < self.split_panel_count() {
-                                SplitFocus::Panel(i + 1)
-                            } else {
-                                SplitFocus::Dm
-                            }
-                        }
-                    };
+                    self.layout.cycle_focus_forward();
                 } else {
                     self.input.delete_word();
                 }
@@ -541,8 +584,8 @@ impl App {
                     // Moved cursor up within input
                 } else if !self.input.is_multiline() && self.input.history_up() {
                     // Browsing history in single-line mode
-                } else if let Some(panel) = self.focused_panel_mut() {
-                    panel.panel_state.scroll_up(1);
+                } else if let Some(panel) = self.focused_panel_meta_mut() {
+                    panel.state.scroll_up(1);
                 } else {
                     self.scroll_active_up(1);
                 }
@@ -552,8 +595,8 @@ impl App {
                     // Moved cursor down within input
                 } else if !self.input.is_multiline() && self.input.history_down() {
                     // Browsing history in single-line mode
-                } else if let Some(panel) = self.focused_panel_mut() {
-                    panel.panel_state.scroll_down(1);
+                } else if let Some(panel) = self.focused_panel_meta_mut() {
+                    panel.state.scroll_down(1);
                 } else {
                     self.scroll_active_down(1);
                 }
@@ -561,29 +604,29 @@ impl App {
 
             // Scroll messages (dispatched to focused panel in split mode)
             KeyCode::PageUp => {
-                if let Some(panel) = self.focused_panel_mut() {
-                    panel.panel_state.page_up();
+                if let Some(panel) = self.focused_panel_meta_mut() {
+                    panel.state.page_up();
                 } else {
                     self.page_active_up();
                 }
             }
             KeyCode::PageDown => {
-                if let Some(panel) = self.focused_panel_mut() {
-                    panel.panel_state.page_down();
+                if let Some(panel) = self.focused_panel_meta_mut() {
+                    panel.state.page_down();
                 } else {
                     self.page_active_down();
                 }
             }
             KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                if let Some(panel) = self.focused_panel_mut() {
-                    panel.panel_state.scroll_down(1);
+                if let Some(panel) = self.focused_panel_meta_mut() {
+                    panel.state.scroll_down(1);
                 } else {
                     self.scroll_active_down(1);
                 }
             }
             KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                if let Some(panel) = self.focused_panel_mut() {
-                    panel.panel_state.scroll_down(10);
+                if let Some(panel) = self.focused_panel_meta_mut() {
+                    panel.state.scroll_down(10);
                 } else {
                     self.scroll_active_down(10);
                 }
@@ -670,8 +713,8 @@ impl App {
             KeyCode::Esc => {
                 if self.input.is_popup_visible() {
                     self.input.dismiss_popup();
-                } else if self.is_split() && matches!(self.split_focus, SplitFocus::Panel(_)) {
-                    self.split_focus = SplitFocus::Dm;
+                } else if self.is_split() && matches!(self.layout.focus, WindowFocus::Panel(_)) {
+                    self.layout.focus = WindowFocus::Primary;
                 } else if self.is_dm_mode() {
                     if self.dm_view.is_responding {
                         self.cancel_active_dm().await;
@@ -712,14 +755,14 @@ impl App {
         match mouse.kind {
             MouseEventKind::ScrollUp => {
                 if let Some(idx) = self.mouse_panel_index(mouse.column) {
-                    self.split_panels[idx].panel_state.scroll_up(3);
+                    self.panel_meta[idx].state.scroll_up(3);
                 } else {
                     self.scroll_active_up(3);
                 }
             }
             MouseEventKind::ScrollDown => {
                 if let Some(idx) = self.mouse_panel_index(mouse.column) {
-                    self.split_panels[idx].panel_state.scroll_down(3);
+                    self.panel_meta[idx].state.scroll_down(3);
                 } else {
                     self.scroll_active_down(3);
                 }
@@ -730,12 +773,12 @@ impl App {
 
     /// Find which split panel the mouse column falls in (if any).
     fn mouse_panel_index(&self, column: u16) -> Option<usize> {
-        if self.panel_x_boundaries.is_empty() {
+        if self.layout.panel_x_boundaries.is_empty() {
             return None;
         }
         // Find the rightmost boundary that the column is >= to
         let mut result = None;
-        for (i, &bx) in self.panel_x_boundaries.iter().enumerate() {
+        for (i, &bx) in self.layout.panel_x_boundaries.iter().enumerate() {
             if column >= bx {
                 result = Some(i);
             }
@@ -875,11 +918,9 @@ impl App {
             // Send in background — response comes via node.update or node.log
             let node_id = node_id.clone();
             let content = text.to_string();
-            let client_ws_tx = self.client.ws_tx_clone();
-            let pending = self.client.pending_clone();
+            let client = self.client.clone();
             let error_tx = self.error_tx.clone();
             tokio::spawn(async move {
-                let client = NerveClient::from_parts(client_ws_tx, pending);
                 let result = if is_program {
                     client.node_message(&node_id, &content).await
                 } else {
@@ -981,11 +1022,12 @@ impl App {
         self.dm_view = DmView::new(&node_name);
         self.view_mode = ViewMode::Dm { node_id, node_name: node_name.clone() };
 
-        // Initialize usage display from agent snapshot
+        // Initialize usage and model display from agent snapshot
         if let Some(agent) = self.agents.iter().find(|a| a.name == node_name) {
             if let Some((used, size, cost)) = agent.usage {
                 self.dm_view.update_usage(used, size, cost);
             }
+            self.dm_view.update_model(agent.model.clone());
         }
 
         self.sync_navigation_selection();
@@ -998,17 +1040,11 @@ impl App {
                 warn!("unsubscribe failed: {}", e);
             }
             // Clean up split node subscriptions
-            for panel in &self.split_panels {
-                if let SplitTarget::Node { ref node_id, .. } = panel.target {
-                    let _ = self.client.node_unsubscribe(node_id).await;
-                }
-            }
-            self.split_panels.clear();
+            self.unsubscribe_and_clear_panels().await;
             self.dm_view.clear();
             self.view_mode = ViewMode::Channel {
                 channel_id: self.active_channel.clone().unwrap_or_default(),
             };
-            self.split_focus = SplitFocus::Dm;
             self.sync_navigation_selection();
         }
     }
@@ -1026,7 +1062,7 @@ impl App {
         }
 
         self.flush_streaming_as_dm(&node_id, &node_name);
-        self.dm_view.is_responding = false;
+        self.dm_view.set_responding(false);
         self.push_contextual_system(&format!("已中断 {}", node_name));
     }
 
@@ -1097,7 +1133,7 @@ impl App {
                     match self.client.session_clear(&node_name).await {
                         Ok(_) => {
                             self.dm_view.clear();
-                            self.dm_view.is_responding = false;
+                            self.dm_view.set_responding(false);
                             self.push_contextual_system(&format!(
                                 "/clear — {} session 已清除",
                                 node_name
@@ -1419,24 +1455,19 @@ impl App {
 
                 if arg == "close" && arg2 == "all" {
                     // /split close all — remove all panels
-                    for panel in &self.split_panels {
-                        if let SplitTarget::Node { ref node_id, .. } = panel.target {
-                            let _ = self.client.node_unsubscribe(node_id).await;
-                        }
-                    }
-                    self.split_panels.clear();
-                    self.split_focus = SplitFocus::Dm;
+                    self.unsubscribe_and_clear_panels().await;
                 } else if arg == "close" {
                     // /split close — remove focused panel
-                    if let SplitFocus::Panel(i) = self.split_focus {
-                        if i < self.split_panels.len() {
-                            let panel = &self.split_panels[i];
-                            if let SplitTarget::Node { ref node_id, .. } = panel.target {
-                                let id = node_id.clone();
-                                let _ = self.client.node_unsubscribe(&id).await;
+                    if let WindowFocus::Panel(i) = self.layout.focus {
+                        if i < self.layout.panel_count() {
+                            match &self.layout.panels[i].buffer_id {
+                                BufferId::NodeLog { ref node_id } | BufferId::Dm { ref node_id } => {
+                                    let id = node_id.clone();
+                                    let _ = self.client.node_unsubscribe(&id).await;
+                                }
+                                _ => {}
                             }
-                            self.split_panels.remove(i);
-                            self.clamp_split_focus();
+                            self.remove_panel(i);
                         }
                     } else {
                         self.push_contextual_system("焦点不在面板上，用 Ctrl+W 切换焦点");
@@ -1446,12 +1477,10 @@ impl App {
                     let agent_name = &arg[1..];
 
                     // Dedup: if agent already has a panel, just focus it
-                    if let Some(idx) = self.split_panels.iter().position(|p| {
-                        matches!(&p.target, SplitTarget::Node { node_name, .. } if node_name == agent_name)
-                    }) {
-                        self.split_focus = SplitFocus::Panel(idx);
+                    if let Some(idx) = self.panel_meta.iter().position(|m| m.label == agent_name) {
+                        self.layout.focus = WindowFocus::Panel(idx);
                         self.push_contextual_system(&format!("已聚焦 @{}", agent_name));
-                    } else if self.split_panels.len() >= 4 {
+                    } else if self.layout.panel_count() >= 4 {
                         self.push_contextual_system("面板已满（最多 4 个）");
                     } else if let Some(agent) = self.agents.iter().find(|a| a.name == agent_name) {
                         let node_id = agent.node_id.clone();
@@ -1460,15 +1489,8 @@ impl App {
                         if let Err(e) = self.client.node_subscribe(&node_id).await {
                             self.push_contextual_system(&format!("subscribe 失败: {}", e));
                         } else {
-                            let mut new_panel = SplitPanel {
-                                target: SplitTarget::Node { node_id, node_name: node_name.clone() },
-                                node_buffer: String::new(),
-                                node_msg_pending: false,
-                                panel_state: ChannelPanelState::new(),
-                            };
-                            new_panel.panel_state.snap_to_bottom();
-                            self.split_panels.push(new_panel);
-                            self.split_focus = SplitFocus::Dm;
+                            self.add_panel(BufferId::Dm { node_id }, node_name.clone());
+                            self.layout.focus = WindowFocus::Primary;
                             self.push_contextual_system(&format!("分屏查看 @{}", node_name));
                         }
                     } else {
@@ -1477,42 +1499,20 @@ impl App {
                 } else if arg.starts_with('#') {
                     // /split #channel — add a channel panel
                     let _channel_name = &arg[1..];
-                    if self.split_panels.len() >= 4 {
+                    if self.layout.panel_count() >= 4 {
                         self.push_contextual_system("面板已满（最多 4 个）");
                     } else {
-                        let mut new_panel = SplitPanel {
-                            target: SplitTarget::Channel,
-                            node_buffer: String::new(),
-                            node_msg_pending: false,
-                            panel_state: ChannelPanelState::new(),
-                        };
-                        new_panel.panel_state.snap_to_bottom();
-                        self.split_panels.push(new_panel);
-                        self.split_focus = SplitFocus::Dm;
+                        self.add_panel(BufferId::Channel { channel_id: String::new() }, String::new());
                     }
                 } else if self.is_dm_mode() {
                     if self.is_split() && arg.is_empty() {
                         // Toggle off — unsubscribe from split nodes
-                        for panel in &self.split_panels {
-                            if let SplitTarget::Node { ref node_id, .. } = panel.target {
-                                let _ = self.client.node_unsubscribe(node_id).await;
-                            }
-                        }
-                        self.split_panels.clear();
-                        self.split_focus = SplitFocus::Dm;
+                        self.unsubscribe_and_clear_panels().await;
                     } else if self.active_channel.is_some() {
-                        if self.split_panels.len() >= 4 {
+                        if self.layout.panel_count() >= 4 {
                             self.push_contextual_system("面板已满（最多 4 个）");
                         } else {
-                            let mut new_panel = SplitPanel {
-                                target: SplitTarget::Channel,
-                                node_buffer: String::new(),
-                                node_msg_pending: false,
-                                panel_state: ChannelPanelState::new(),
-                            };
-                            new_panel.panel_state.snap_to_bottom();
-                            self.split_panels.push(new_panel);
-                            self.split_focus = SplitFocus::Dm;
+                            self.add_panel(BufferId::Channel { channel_id: String::new() }, String::new());
                         }
                     } else {
                         self.push_contextual_system("需要先加入频道才能分屏");
@@ -1612,8 +1612,8 @@ impl App {
                 // Only show messages that @mention me or that I sent.
                 // Token-level match: @name must be preceded by whitespace and followed
                 // by whitespace, punctuation, or EOF (mirrors server router.ts:parseMentions).
-                let dominated = message.from == self.client.node_name
-                    || mentions_name(&message.content, &self.client.node_name);
+                let dominated = message.from == self.client.node_name()
+                    || mentions_name(&message.content, self.client.node_name());
                 if dominated {
                     let is_active = self.active_channel.as_deref() == Some(&channel_id);
                     if is_active {
@@ -1690,7 +1690,7 @@ impl App {
                 if status == "idle" {
                     self.flush_streaming_as_dm(&node_id, &name);
                 } else if self.dm_node_id() == Some(node_id.as_str()) && status == "busy" {
-                    self.dm_view.is_responding = true;
+                    self.dm_view.set_responding(true);
                 }
             }
 
@@ -1738,12 +1738,6 @@ impl App {
                 ..
             } => {
                 info!("NodeRegistered: name={}", name);
-                // Show in both channel and DM views
-                self.channel_view
-                    .push_system(&format!("{} 已注册", name));
-                if self.is_dm_mode() {
-                    self.dm_view.push_system(&format!("{} 已注册", name));
-                }
                 self.refresh_agents().await;
                 info!(
                     "NodeRegistered: after refresh, agents count={}, names=[{}]",
@@ -1766,16 +1760,19 @@ impl App {
                     self.channel_view
                         .push_system(&format!("{} 已停止", name));
                 }
-                // Clean up split panels targeting the stopped node
-                let had_panel = self.split_panels.iter().any(|p| {
-                    matches!(&p.target, SplitTarget::Node { node_id: sid, .. } if sid == &node_id)
-                });
-                if had_panel {
+                // Clean up split panels targeting the stopped node (both NodeLog and Dm)
+                let target_node_log = BufferId::NodeLog { node_id: node_id.clone() };
+                let target_dm = BufferId::Dm { node_id: node_id.clone() };
+                if self.layout.has_panel_for_buffer(&target_node_log) || self.layout.has_panel_for_buffer(&target_dm) {
                     let _ = self.client.node_unsubscribe(&node_id).await;
-                    self.split_panels.retain(|p| {
-                        !matches!(&p.target, SplitTarget::Node { node_id: sid, .. } if sid == &node_id)
-                    });
-                    self.clamp_split_focus();
+                    // Remove matching panels in reverse order to keep indices valid
+                    let mut i = self.layout.panels.len();
+                    while i > 0 {
+                        i -= 1;
+                        if self.layout.panels[i].buffer_id == target_node_log || self.layout.panels[i].buffer_id == target_dm {
+                            self.remove_panel(i);
+                        }
+                    }
                 }
                 // Remove from agents list immediately
                 self.agents.retain(|a| a.node_id != node_id);
@@ -1815,8 +1812,7 @@ impl App {
         }
         self.dm_view.flushed_agents.insert(name.to_string());
         if self.dm_node_id() == Some(node_id) {
-            self.dm_view.is_responding = false;
-            self.dm_view.summary_mode = true;
+            self.dm_view.set_responding(false);
         }
     }
 
@@ -1824,36 +1820,53 @@ impl App {
         let in_dm = self.dm_node_id() == Some(node_id);
 
         // Route updates to split node buffers for all panels targeting this node
-        for panel in &mut self.split_panels {
-            let matches = matches!(&panel.target, SplitTarget::Node { node_id: sid, .. } if sid == node_id);
-            if matches {
-                if let Some(update) = detail.get("update") {
-                    let kind = update.get("sessionUpdate").and_then(|v| v.as_str());
-                    if kind == Some("agent_message_chunk") {
-                        if let Some(text) = update.get("content").and_then(|c| c.get("text")).and_then(|v| v.as_str()) {
-                            // Prepend role+timestamp header on first chunk of a new message
-                            if !panel.node_msg_pending {
-                                panel.node_msg_pending = true;
+        let target_bid = BufferId::NodeLog { node_id: node_id.to_string() };
+        if self.layout.has_panel_for_buffer(&target_bid) {
+            if let Some(update) = detail.get("update") {
+                let kind = update.get("sessionUpdate").and_then(|v| v.as_str());
+                if kind == Some("agent_message_chunk") {
+                    if let Some(text) = update.get("content").and_then(|c| c.get("text")).and_then(|v| v.as_str()) {
+                        let entry = self.buffer_pool.get_or_create(target_bid.clone());
+                        if let BufferContent::NodeLog { text: ref mut buf, ref mut pending } = entry.content {
+                            if !*pending {
+                                *pending = true;
                                 let ts = chrono::Local::now().format("%H:%M:%S");
-                                panel.node_buffer.push_str(&format!("assistant  {}\n", ts));
+                                buf.push_str(&format!("assistant  {}\n", ts));
                             }
-                            panel.node_buffer.push_str(text);
+                            buf.push_str(text);
                         }
-                    } else if kind == Some("agent_message_end") || kind == Some("stop_reason") {
-                        panel.node_msg_pending = false;
-                        panel.node_buffer.push('\n');
-                    } else if kind == Some("node_log") {
-                        if let Some(entries) = update.get("entries").and_then(|v| v.as_array()) {
-                            for entry in entries {
-                                let level = entry.get("level").and_then(|v| v.as_str()).unwrap_or("info");
-                                let message = entry.get("message").and_then(|v| v.as_str()).unwrap_or("");
-                                let ts_str = entry.get("ts").and_then(|v| v.as_str()).unwrap_or("");
+                        entry.bump_version();
+                    }
+                } else if kind == Some("agent_message_end") || kind == Some("stop_reason") {
+                    let entry = self.buffer_pool.get_or_create(target_bid.clone());
+                    if let BufferContent::NodeLog { ref mut text, ref mut pending } = entry.content {
+                        *pending = false;
+                        text.push('\n');
+                    }
+                    entry.bump_version();
+                } else if kind == Some("node_log") {
+                    if let Some(entries) = update.get("entries").and_then(|v| v.as_array()) {
+                        let buf_entry = self.buffer_pool.get_or_create(target_bid.clone());
+                        if let BufferContent::NodeLog { ref mut text, .. } = buf_entry.content {
+                            for log_entry in entries {
+                                let level = log_entry.get("level").and_then(|v| v.as_str()).unwrap_or("info");
+                                let message = log_entry.get("message").and_then(|v| v.as_str()).unwrap_or("");
+                                let ts_str = log_entry.get("ts").and_then(|v| v.as_str()).unwrap_or("");
                                 let time_display = ts_str.get(11..19).unwrap_or("??:??:??");
-                                panel.node_buffer.push_str(&format!("[{}] [{}] {}\n", time_display, level.to_uppercase(), message));
+                                text.push_str(&format!("[{}] [{}] {}\n", time_display, level.to_uppercase(), message));
                             }
                         }
+                        buf_entry.bump_version();
                     }
                 }
+            }
+        }
+
+        // Bump version for Dm panels so split panel scroll tracks new data
+        let target_dm_bid = BufferId::Dm { node_id: node_id.to_string() };
+        if self.layout.has_panel_for_buffer(&target_dm_bid) {
+            if let Some(entry) = self.buffer_pool.get_mut(&target_dm_bid) {
+                entry.bump_version();
             }
         }
 
@@ -1968,7 +1981,7 @@ impl App {
                         self.dm_view.dm_history.push(dm_msg);
                     }
                     if self.dm_node_id() == Some(node_id) {
-                        self.dm_view.is_responding = false;
+                        self.dm_view.set_responding(false);
                     }
                 }
                 Some("agent_thought_chunk") => {
@@ -2144,6 +2157,7 @@ impl App {
                         status: n.status,
                         activity: n.activity,
                         adapter: n.adapter,
+                        model: n.model,
                         node_id: n.id,
                         transport: n.transport,
                         capabilities: n.capabilities,
@@ -2199,15 +2213,36 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ratatui::layout::Rect;
-    use std::collections::HashMap;
-    use std::sync::Arc;
-    use tokio::sync::Mutex;
+use ratatui::layout::Rect;
+    use std::sync::{Arc, Mutex as StdMutex};
 
-    fn make_app() -> App {
-        let (ws_tx, _ws_rx) = mpsc::unbounded_channel::<String>();
-        let pending = Arc::new(Mutex::new(HashMap::new()));
-        let client = NerveClient::from_parts(ws_tx, pending);
+    #[derive(Clone)]
+    struct MockTransport {
+        name: String,
+        response: Arc<StdMutex<Value>>,
+    }
+
+    impl MockTransport {
+        fn new(name: &str) -> Self {
+            Self {
+                name: name.to_string(),
+                response: Arc::new(StdMutex::new(Value::Null)),
+            }
+        }
+    }
+
+    impl Transport for MockTransport {
+        async fn request(&self, _method: &str, _params: Value) -> anyhow::Result<Value> {
+            Ok(self.response.lock().unwrap().clone())
+        }
+
+        fn node_name(&self) -> &str {
+            &self.name
+        }
+    }
+
+    fn make_app() -> App<MockTransport> {
+        let client = MockTransport::new("test-user");
         let (_event_tx, event_rx) = mpsc::unbounded_channel();
         App::new(client, event_rx)
     }
@@ -2215,20 +2250,18 @@ mod tests {
     #[test]
     fn project_name_uses_last_path_segment() {
         assert_eq!(
-            App::project_name_from_path("/tmp/demo-project"),
+            App::<MockTransport>::project_name_from_path("/tmp/demo-project"),
             Some("demo-project".to_string())
         );
         assert_eq!(
-            App::project_name_from_path("/tmp/demo-project/"),
+            App::<MockTransport>::project_name_from_path("/tmp/demo-project/"),
             Some("demo-project".to_string())
         );
     }
 
     #[test]
     fn new_with_project_sets_project_context() {
-        let (ws_tx, _ws_rx) = mpsc::unbounded_channel::<String>();
-        let pending = Arc::new(Mutex::new(HashMap::new()));
-        let client = NerveClient::from_parts(ws_tx, pending);
+        let client = MockTransport::new("test-user");
         let (_event_tx, event_rx) = mpsc::unbounded_channel();
         let app = App::new_with_project(client, event_rx, Some("/tmp/demo-project".into()));
 
@@ -2332,6 +2365,7 @@ mod tests {
             status: "idle".into(),
             activity: None,
             adapter: Some("claude".into()),
+            model: None,
             node_id: "n1".into(),
             transport: "stdio".into(),
             capabilities: vec![],
@@ -2365,6 +2399,7 @@ mod tests {
                 status: "idle".into(),
                 activity: None,
                 adapter: Some("claude".into()),
+                model: None,
                 node_id: "n1".into(),
                 transport: "stdio".into(),
                 capabilities: vec![],
@@ -2378,6 +2413,7 @@ mod tests {
                 status: "busy".into(),
                 activity: None,
                 adapter: Some("codex".into()),
+                model: None,
                 node_id: "n2".into(),
                 transport: "stdio".into(),
                 capabilities: vec![],
@@ -2462,9 +2498,7 @@ mod tests {
 
     #[test]
     fn cwd_filter_respects_global_mode() {
-        let (ws_tx, _ws_rx) = mpsc::unbounded_channel::<String>();
-        let pending = Arc::new(Mutex::new(HashMap::new()));
-        let client = NerveClient::from_parts(ws_tx, pending);
+        let client = MockTransport::new("test-user");
         let (_event_tx, event_rx) = mpsc::unbounded_channel();
         let mut app = App::new_with_project(client, event_rx, Some("/tmp/project".into()));
 
@@ -2886,7 +2920,7 @@ mod tests {
         assert_eq!(extracted, "nerve_post");
     }
 
-    // --- Split Step 1: SplitPanel data structure migration tests ---
+    // --- Split: BufferPool + WindowLayout migration tests ---
 
     #[test]
     fn is_split_false_when_no_panels() {
@@ -2897,210 +2931,118 @@ mod tests {
     #[test]
     fn is_split_true_when_panels_exist() {
         let mut app = make_app();
-        app.split_panels.push(SplitPanel {
-            target: SplitTarget::Channel,
-            node_buffer: String::new(),
-            node_msg_pending: false,
-            panel_state: ChannelPanelState::new(),
-        });
+        app.add_panel(BufferId::Channel { channel_id: String::new() }, String::new());
         assert!(app.is_split());
     }
 
     #[test]
-    fn focused_panel_returns_first_panel() {
+    fn focused_panel_meta_returns_some_when_focused() {
         let mut app = make_app();
-        app.split_panels.push(SplitPanel {
-            target: SplitTarget::Channel,
-            node_buffer: String::new(),
-            node_msg_pending: false,
-            panel_state: ChannelPanelState::new(),
-        });
-        app.split_focus = SplitFocus::Panel(0);
+        app.add_panel(BufferId::Channel { channel_id: String::new() }, String::new());
+        app.layout.focus = WindowFocus::Panel(0);
 
-        let panel = app.focused_panel();
-        assert!(panel.is_some());
-        assert_eq!(panel.unwrap().target, SplitTarget::Channel);
+        let meta = app.focused_panel_meta_mut();
+        assert!(meta.is_some());
     }
 
     #[test]
-    fn focused_panel_returns_none_when_dm_focus() {
+    fn focused_panel_meta_returns_none_when_primary() {
         let mut app = make_app();
-        app.split_panels.push(SplitPanel {
-            target: SplitTarget::Channel,
-            node_buffer: String::new(),
-            node_msg_pending: false,
-            panel_state: ChannelPanelState::new(),
-        });
-        app.split_focus = SplitFocus::Dm;
+        app.add_panel(BufferId::Channel { channel_id: String::new() }, String::new());
+        app.layout.focus = WindowFocus::Primary;
 
-        assert!(app.focused_panel().is_none());
+        assert!(app.focused_panel_meta_mut().is_none());
     }
 
     #[test]
-    fn focused_panel_returns_none_when_index_out_of_bounds() {
+    fn focused_panel_meta_returns_none_when_oob() {
         let mut app = make_app();
-        app.split_panels.push(SplitPanel {
-            target: SplitTarget::Channel,
-            node_buffer: String::new(),
-            node_msg_pending: false,
-            panel_state: ChannelPanelState::new(),
-        });
-        app.split_focus = SplitFocus::Panel(5);
+        app.add_panel(BufferId::Channel { channel_id: String::new() }, String::new());
+        app.layout.focus = WindowFocus::Panel(5);
 
-        assert!(app.focused_panel().is_none());
+        assert!(app.focused_panel_meta_mut().is_none());
     }
 
     #[test]
-    fn focused_panel_mut_can_modify_panel() {
+    fn panel_holds_channel_buffer_id() {
         let mut app = make_app();
-        app.split_panels.push(SplitPanel {
-            target: SplitTarget::Channel,
-            node_buffer: String::new(),
-            node_msg_pending: false,
-            panel_state: ChannelPanelState::new(),
-        });
-        app.split_focus = SplitFocus::Panel(0);
-
-        app.focused_panel_mut().unwrap().node_buffer.push_str("hello");
-        assert_eq!(app.split_panels[0].node_buffer, "hello");
+        app.add_panel(BufferId::Channel { channel_id: String::new() }, String::new());
+        assert!(matches!(app.layout.panels[0].buffer_id, BufferId::Channel { .. }));
     }
 
     #[test]
-    fn split_focus_panel_replaces_old_channel_variant() {
-        // Panel(0) should be the equivalent of the old SplitFocus::Channel
-        let focus = SplitFocus::Panel(0);
-        assert_ne!(focus, SplitFocus::Dm);
-        assert_eq!(focus, SplitFocus::Panel(0));
-    }
-
-    #[test]
-    fn split_panel_holds_channel_target() {
-        let panel = SplitPanel {
-            target: SplitTarget::Channel,
-            node_buffer: String::new(),
-            node_msg_pending: false,
-            panel_state: ChannelPanelState::new(),
-        };
-        assert_eq!(panel.target, SplitTarget::Channel);
-        assert!(panel.node_buffer.is_empty());
-    }
-
-    #[test]
-    fn split_panel_holds_node_target() {
-        let panel = SplitPanel {
-            target: SplitTarget::Node {
-                node_id: "n1".into(),
-                node_name: "alice".into(),
-            },
-            node_buffer: String::new(),
-            node_msg_pending: false,
-            panel_state: ChannelPanelState::new(),
-        };
-        assert!(matches!(panel.target, SplitTarget::Node { .. }));
-        if let SplitTarget::Node { node_id, node_name } = &panel.target {
-            assert_eq!(node_id, "n1");
-            assert_eq!(node_name, "alice");
-        }
-    }
-
-    #[test]
-    fn split_panel_has_independent_panel_state() {
+    fn panel_holds_node_log_buffer_id() {
         let mut app = make_app();
-        app.split_panels.push(SplitPanel {
-            target: SplitTarget::Channel,
-            node_buffer: String::new(),
-            node_msg_pending: false,
-            panel_state: ChannelPanelState::new(),
-        });
-        app.split_panels.push(SplitPanel {
-            target: SplitTarget::Node {
-                node_id: "n1".into(),
-                node_name: "alice".into(),
-            },
-            node_buffer: String::new(),
-            node_msg_pending: false,
-            panel_state: ChannelPanelState::new(),
-        });
+        app.add_panel(BufferId::NodeLog { node_id: "n1".into() }, "alice".into());
+        assert!(matches!(app.layout.panels[0].buffer_id, BufferId::NodeLog { .. }));
+        assert_eq!(app.panel_meta[0].label, "alice");
+    }
+
+    #[test]
+    fn panels_have_independent_state() {
+        let mut app = make_app();
+        app.add_panel(BufferId::Channel { channel_id: String::new() }, String::new());
+        app.add_panel(BufferId::NodeLog { node_id: "n1".into() }, "alice".into());
 
         // Mutate panel 0's state
-        app.split_panels[0].panel_state.auto_scroll = false;
-        app.split_panels[0].panel_state.scroll_offset = 42;
+        app.panel_meta[0].state.auto_scroll = false;
+        app.panel_meta[0].state.scroll_offset = 42;
 
         // Panel 1 should be unaffected
-        assert!(app.split_panels[1].panel_state.auto_scroll);
-        assert_eq!(app.split_panels[1].panel_state.scroll_offset, u16::MAX);
+        assert!(app.panel_meta[1].state.auto_scroll);
+        assert_eq!(app.panel_meta[1].state.scroll_offset, u16::MAX);
     }
 
-    // --- Split Step 3: render multi-panel logic tests ---
-
-    fn make_split_panel(target: SplitTarget) -> SplitPanel {
-        SplitPanel {
-            target,
-            node_buffer: String::new(),
-            node_msg_pending: false,
-            panel_state: ChannelPanelState::new(),
-        }
-    }
+    // --- Render multi-panel logic tests ---
 
     #[test]
     fn panel_x_boundaries_populated_from_layout() {
         let mut app = make_app();
-        // Simulate 2 panels
-        app.split_panels.push(make_split_panel(SplitTarget::Channel));
-        app.split_panels.push(make_split_panel(SplitTarget::Node {
-            node_id: "n1".into(),
-            node_name: "alice".into(),
-        }));
+        app.add_panel(BufferId::Channel { channel_id: String::new() }, String::new());
+        app.add_panel(BufferId::NodeLog { node_id: "n1".into() }, "alice".into());
 
-        // Build layout with 2 panels
         let area = Rect::new(0, 0, 120, 30);
-        let layout = AppLayout::build(area, 3, true, 2);
+        let app_layout = AppLayout::build(area, 3, true, 2);
 
-        // Simulate what render() does: populate panel_x_boundaries
-        app.panel_x_boundaries.clear();
-        for panel_area in &layout.panels {
-            app.panel_x_boundaries.push(panel_area.x);
+        app.layout.panel_x_boundaries.clear();
+        for panel_area in &app_layout.panels {
+            app.layout.panel_x_boundaries.push(panel_area.x);
         }
 
-        assert_eq!(app.panel_x_boundaries.len(), 2);
-        // Boundaries should be increasing (left to right)
-        assert!(app.panel_x_boundaries[0] < app.panel_x_boundaries[1]);
+        assert_eq!(app.layout.panel_x_boundaries.len(), 2);
+        assert!(app.layout.panel_x_boundaries[0] < app.layout.panel_x_boundaries[1]);
     }
 
     #[test]
     fn panel_x_boundaries_matches_layout_panels_count() {
         let mut app = make_app();
         for _ in 0..3 {
-            app.split_panels.push(make_split_panel(SplitTarget::Channel));
+            app.add_panel(BufferId::Channel { channel_id: String::new() }, String::new());
         }
 
         let area = Rect::new(0, 0, 120, 30);
-        let layout = AppLayout::build(area, 3, true, 3);
+        let app_layout = AppLayout::build(area, 3, true, 3);
 
-        app.panel_x_boundaries.clear();
-        for panel_area in &layout.panels {
-            app.panel_x_boundaries.push(panel_area.x);
+        app.layout.panel_x_boundaries.clear();
+        for panel_area in &app_layout.panels {
+            app.layout.panel_x_boundaries.push(panel_area.x);
         }
 
-        assert_eq!(app.panel_x_boundaries.len(), layout.panels.len());
-        assert_eq!(app.panel_x_boundaries.len(), app.split_panels.len());
+        assert_eq!(app.layout.panel_x_boundaries.len(), app_layout.panels.len());
+        assert_eq!(app.layout.panel_x_boundaries.len(), app.layout.panel_count());
     }
 
     #[test]
     fn focus_highlights_only_target_panel() {
         let mut app = make_app();
-        app.split_panels.push(make_split_panel(SplitTarget::Channel));
-        app.split_panels.push(make_split_panel(SplitTarget::Node {
-            node_id: "n1".into(),
-            node_name: "alice".into(),
-        }));
-        app.split_panels.push(make_split_panel(SplitTarget::Channel));
+        app.add_panel(BufferId::Channel { channel_id: String::new() }, String::new());
+        app.add_panel(BufferId::NodeLog { node_id: "n1".into() }, "alice".into());
+        app.add_panel(BufferId::Channel { channel_id: String::new() }, String::new());
 
-        // Focus on panel 1
-        app.split_focus = SplitFocus::Panel(1);
+        app.layout.focus = WindowFocus::Panel(1);
 
         for i in 0..3 {
-            let focused = app.split_focus == SplitFocus::Panel(i);
+            let focused = app.layout.focus == WindowFocus::Panel(i);
             if i == 1 {
                 assert!(focused, "panel 1 should be focused");
             } else {
@@ -3110,16 +3052,16 @@ mod tests {
     }
 
     #[test]
-    fn focus_dm_highlights_no_panel() {
+    fn focus_primary_highlights_no_panel() {
         let mut app = make_app();
-        app.split_panels.push(make_split_panel(SplitTarget::Channel));
-        app.split_panels.push(make_split_panel(SplitTarget::Channel));
-        app.split_focus = SplitFocus::Dm;
+        app.add_panel(BufferId::Channel { channel_id: String::new() }, String::new());
+        app.add_panel(BufferId::Channel { channel_id: String::new() }, String::new());
+        app.layout.focus = WindowFocus::Primary;
 
         for i in 0..2 {
             assert!(
-                app.split_focus != SplitFocus::Panel(i),
-                "panel {} should NOT be focused when Dm",
+                app.layout.focus != WindowFocus::Panel(i),
+                "panel {} should NOT be focused when Primary",
                 i
             );
         }
@@ -3128,7 +3070,6 @@ mod tests {
     #[test]
     fn mouse_panel_index_empty_boundaries() {
         let app = make_app();
-        // No panels → always None
         assert!(app.mouse_panel_index(50).is_none());
         assert!(app.mouse_panel_index(0).is_none());
     }
@@ -3136,8 +3077,8 @@ mod tests {
     #[test]
     fn mouse_panel_index_single_panel() {
         let mut app = make_app();
-        app.split_panels.push(make_split_panel(SplitTarget::Channel));
-        app.panel_x_boundaries = vec![60]; // panel starts at x=60
+        app.add_panel(BufferId::Channel { channel_id: String::new() }, String::new());
+        app.layout.panel_x_boundaries = vec![60];
 
         assert!(app.mouse_panel_index(59).is_none(), "before panel boundary");
         assert_eq!(app.mouse_panel_index(60), Some(0), "at panel boundary");
@@ -3147,12 +3088,9 @@ mod tests {
     #[test]
     fn mouse_panel_index_multi_panel() {
         let mut app = make_app();
-        app.split_panels.push(make_split_panel(SplitTarget::Channel));
-        app.split_panels.push(make_split_panel(SplitTarget::Node {
-            node_id: "n1".into(),
-            node_name: "alice".into(),
-        }));
-        app.panel_x_boundaries = vec![40, 70]; // panel 0 at x=40, panel 1 at x=70
+        app.add_panel(BufferId::Channel { channel_id: String::new() }, String::new());
+        app.add_panel(BufferId::NodeLog { node_id: "n1".into() }, "alice".into());
+        app.layout.panel_x_boundaries = vec![40, 70];
 
         assert!(app.mouse_panel_index(39).is_none(), "before any panel");
         assert_eq!(app.mouse_panel_index(40), Some(0), "at panel 0 boundary");
@@ -3162,196 +3100,152 @@ mod tests {
     }
 
     #[test]
-    fn node_panel_uses_own_buffer() {
+    fn node_panel_uses_buffer_pool() {
         let mut app = make_app();
-        app.split_panels.push(make_split_panel(SplitTarget::Node {
-            node_id: "n1".into(),
-            node_name: "alice".into(),
-        }));
-        app.split_panels.push(make_split_panel(SplitTarget::Node {
-            node_id: "n2".into(),
-            node_name: "bob".into(),
-        }));
+        app.add_panel(BufferId::NodeLog { node_id: "n1".into() }, "alice".into());
+        app.add_panel(BufferId::NodeLog { node_id: "n2".into() }, "bob".into());
 
-        // Write to each panel's buffer independently
-        app.split_panels[0].node_buffer.push_str("alice output");
-        app.split_panels[1].node_buffer.push_str("bob output");
-
-        assert_eq!(app.split_panels[0].node_buffer, "alice output");
-        assert_eq!(app.split_panels[1].node_buffer, "bob output");
-        // Verify target identity
-        assert!(matches!(
-            &app.split_panels[0].target,
-            SplitTarget::Node { node_name, .. } if node_name == "alice"
-        ));
-        assert!(matches!(
-            &app.split_panels[1].target,
-            SplitTarget::Node { node_name, .. } if node_name == "bob"
-        ));
-    }
-
-    #[test]
-    fn channel_panel_target_distinct_from_node() {
-        let mut app = make_app();
-        app.split_panels.push(make_split_panel(SplitTarget::Channel));
-        app.split_panels.push(make_split_panel(SplitTarget::Node {
-            node_id: "n1".into(),
-            node_name: "alice".into(),
-        }));
-
-        assert!(matches!(app.split_panels[0].target, SplitTarget::Channel));
-        assert!(matches!(app.split_panels[1].target, SplitTarget::Node { .. }));
-    }
-
-    // --- Split Step 4: keyboard interaction tests ---
-
-    /// Helper: simulate the Ctrl+W focus cycling logic (extracted from handle_key).
-    fn cycle_split_focus(app: &mut App) {
-        if app.is_split() {
-            app.split_focus = match app.split_focus {
-                SplitFocus::Dm => SplitFocus::Panel(0),
-                SplitFocus::Panel(i) => {
-                    if i + 1 < app.split_panel_count() {
-                        SplitFocus::Panel(i + 1)
-                    } else {
-                        SplitFocus::Dm
-                    }
-                }
-            };
+        // Write to each buffer independently via buffer_pool
+        let bid1 = BufferId::NodeLog { node_id: "n1".into() };
+        let entry1 = app.buffer_pool.get_or_create(bid1);
+        if let BufferContent::NodeLog { ref mut text, .. } = entry1.content {
+            text.push_str("alice output");
         }
+
+        let bid2 = BufferId::NodeLog { node_id: "n2".into() };
+        let entry2 = app.buffer_pool.get_or_create(bid2);
+        if let BufferContent::NodeLog { ref mut text, .. } = entry2.content {
+            text.push_str("bob output");
+        }
+
+        assert!(app.panel_node_buffer(0).contains("alice output"));
+        assert!(app.panel_node_buffer(1).contains("bob output"));
+        assert_eq!(app.panel_meta[0].label, "alice");
+        assert_eq!(app.panel_meta[1].label, "bob");
     }
 
     #[test]
-    fn ctrl_w_single_panel_toggles_dm_and_panel0() {
+    fn channel_panel_distinct_from_node() {
         let mut app = make_app();
-        app.split_panels.push(make_split_panel(SplitTarget::Channel));
-        app.split_focus = SplitFocus::Dm;
+        app.add_panel(BufferId::Channel { channel_id: String::new() }, String::new());
+        app.add_panel(BufferId::NodeLog { node_id: "n1".into() }, "alice".into());
 
-        cycle_split_focus(&mut app);
-        assert_eq!(app.split_focus, SplitFocus::Panel(0));
+        assert!(matches!(app.layout.panels[0].buffer_id, BufferId::Channel { .. }));
+        assert!(matches!(app.layout.panels[1].buffer_id, BufferId::NodeLog { .. }));
+    }
 
-        cycle_split_focus(&mut app);
-        assert_eq!(app.split_focus, SplitFocus::Dm);
+    // --- Keyboard interaction tests ---
 
-        // One more round to confirm stable cycle
-        cycle_split_focus(&mut app);
-        assert_eq!(app.split_focus, SplitFocus::Panel(0));
+    #[test]
+    fn ctrl_w_single_panel_cycles() {
+        let mut app = make_app();
+        app.add_panel(BufferId::Channel { channel_id: String::new() }, String::new());
+        app.layout.focus = WindowFocus::Primary;
+
+        app.layout.cycle_focus_forward();
+        assert_eq!(app.layout.focus, WindowFocus::Panel(0));
+
+        app.layout.cycle_focus_forward();
+        assert_eq!(app.layout.focus, WindowFocus::Primary);
+
+        app.layout.cycle_focus_forward();
+        assert_eq!(app.layout.focus, WindowFocus::Panel(0));
     }
 
     #[test]
-    fn ctrl_w_two_panels_cycles_dm_p0_p1_dm() {
+    fn ctrl_w_two_panels_cycles() {
         let mut app = make_app();
-        app.split_panels.push(make_split_panel(SplitTarget::Channel));
-        app.split_panels.push(make_split_panel(SplitTarget::Node {
-            node_id: "n1".into(),
-            node_name: "alice".into(),
-        }));
-        app.split_focus = SplitFocus::Dm;
+        app.add_panel(BufferId::Channel { channel_id: String::new() }, String::new());
+        app.add_panel(BufferId::NodeLog { node_id: "n1".into() }, "alice".into());
+        app.layout.focus = WindowFocus::Primary;
 
-        cycle_split_focus(&mut app);
-        assert_eq!(app.split_focus, SplitFocus::Panel(0));
+        app.layout.cycle_focus_forward();
+        assert_eq!(app.layout.focus, WindowFocus::Panel(0));
 
-        cycle_split_focus(&mut app);
-        assert_eq!(app.split_focus, SplitFocus::Panel(1));
+        app.layout.cycle_focus_forward();
+        assert_eq!(app.layout.focus, WindowFocus::Panel(1));
 
-        cycle_split_focus(&mut app);
-        assert_eq!(app.split_focus, SplitFocus::Dm);
+        app.layout.cycle_focus_forward();
+        assert_eq!(app.layout.focus, WindowFocus::Primary);
     }
 
     #[test]
     fn ctrl_w_three_panels_cycles_all() {
         let mut app = make_app();
         for _ in 0..3 {
-            app.split_panels.push(make_split_panel(SplitTarget::Channel));
+            app.add_panel(BufferId::Channel { channel_id: String::new() }, String::new());
         }
-        app.split_focus = SplitFocus::Dm;
+        app.layout.focus = WindowFocus::Primary;
 
         let expected = [
-            SplitFocus::Panel(0),
-            SplitFocus::Panel(1),
-            SplitFocus::Panel(2),
-            SplitFocus::Dm,
+            WindowFocus::Panel(0),
+            WindowFocus::Panel(1),
+            WindowFocus::Panel(2),
+            WindowFocus::Primary,
         ];
         for exp in &expected {
-            cycle_split_focus(&mut app);
-            assert_eq!(app.split_focus, *exp);
+            app.layout.cycle_focus_forward();
+            assert_eq!(app.layout.focus, *exp);
         }
     }
 
     #[test]
     fn scroll_routes_to_focused_panel() {
         let mut app = make_app();
-        app.split_panels.push(make_split_panel(SplitTarget::Channel));
-        app.split_panels.push(make_split_panel(SplitTarget::Node {
-            node_id: "n1".into(),
-            node_name: "alice".into(),
-        }));
-        app.split_focus = SplitFocus::Panel(1);
+        app.add_panel(BufferId::Channel { channel_id: String::new() }, String::new());
+        app.add_panel(BufferId::NodeLog { node_id: "n1".into() }, "alice".into());
+        app.layout.focus = WindowFocus::Panel(1);
 
-        // Simulate scroll on focused panel
-        if let Some(panel) = app.focused_panel_mut() {
-            panel.panel_state.scroll_up(5);
+        if let Some(meta) = app.focused_panel_meta_mut() {
+            meta.state.scroll_up(5);
         }
 
         // Panel 1 should be scrolled
-        assert_ne!(app.split_panels[1].panel_state.scroll_offset, u16::MAX);
+        assert_ne!(app.panel_meta[1].state.scroll_offset, u16::MAX);
         // Panel 0 should be untouched
-        assert_eq!(app.split_panels[0].panel_state.scroll_offset, u16::MAX);
+        assert_eq!(app.panel_meta[0].state.scroll_offset, u16::MAX);
     }
 
     #[test]
     fn focus_fallback_after_panel_removal() {
         let mut app = make_app();
-        app.split_panels.push(make_split_panel(SplitTarget::Channel));
-        app.split_panels.push(make_split_panel(SplitTarget::Node {
-            node_id: "n1".into(),
-            node_name: "alice".into(),
-        }));
-        app.split_panels.push(make_split_panel(SplitTarget::Node {
-            node_id: "n2".into(),
-            node_name: "bob".into(),
-        }));
-        app.split_focus = SplitFocus::Panel(2);
+        app.add_panel(BufferId::Channel { channel_id: String::new() }, String::new());
+        app.add_panel(BufferId::NodeLog { node_id: "n1".into() }, "alice".into());
+        app.add_panel(BufferId::NodeLog { node_id: "n2".into() }, "bob".into());
+        app.layout.focus = WindowFocus::Panel(2);
 
-        // Remove last panel (simulating node stop)
-        app.split_panels.remove(2);
+        app.remove_panel(2);
 
-        // Focus should clamp: Panel(2) out of bounds → Panel(1) (last valid index)
-        app.clamp_split_focus();
-        assert_eq!(app.split_focus, SplitFocus::Panel(1));
+        assert_eq!(app.layout.focus, WindowFocus::Panel(1));
     }
 
     #[test]
     fn focus_fallback_all_panels_removed() {
         let mut app = make_app();
-        app.split_panels.push(make_split_panel(SplitTarget::Channel));
-        app.split_focus = SplitFocus::Panel(0);
+        app.add_panel(BufferId::Channel { channel_id: String::new() }, String::new());
+        app.layout.focus = WindowFocus::Panel(0);
 
-        app.split_panels.clear();
-        app.clamp_split_focus();
+        app.clear_panels();
 
-        assert_eq!(app.split_focus, SplitFocus::Dm);
+        assert_eq!(app.layout.focus, WindowFocus::Primary);
     }
 
     #[tokio::test]
     async fn ctrl_w_no_panels_acts_as_delete_word() {
         let mut app = make_app();
-        // Enter DM mode so Ctrl+W path is exercised
         app.dm_view = DmView::new("alice");
         app.view_mode = ViewMode::Dm { node_id: "n1".into(), node_name: "alice".into() };
-        // No split panels — Ctrl+W should delete word, not cycle focus
         app.input.insert_str("hello world");
 
         app.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL)).await;
 
-        // "world" should be deleted
         assert!(!app.input.text.contains("world"), "Ctrl+W without panels should delete word, got: {}", app.input.text);
     }
 
-    // --- Split Step 5: /split command extension tests ---
+    // --- /split command tests ---
 
     /// Helper: set up app in DM mode with an active channel.
-    fn make_dm_app() -> App {
+    fn make_dm_app() -> App<MockTransport> {
         let mut app = make_app();
         app.dm_view = DmView::new("alice");
         app.view_mode = ViewMode::Dm { node_id: "n1".into(), node_name: "alice".into() };
@@ -3361,6 +3255,7 @@ mod tests {
             status: "idle".into(),
             activity: None,
             adapter: Some("claude".into()),
+            model: None,
             node_id: "n1".into(),
             transport: "stdio".into(),
             capabilities: vec![],
@@ -3375,114 +3270,92 @@ mod tests {
     #[tokio::test]
     async fn split_no_arg_no_panels_adds_channel_panel() {
         let mut app = make_dm_app();
-        assert!(app.split_panels.is_empty());
+        assert!(!app.is_split());
 
         app.handle_command("/split").await;
 
-        assert_eq!(app.split_panels.len(), 1);
-        assert_eq!(app.split_panels[0].target, SplitTarget::Channel);
+        assert_eq!(app.layout.panel_count(), 1);
+        assert!(matches!(app.layout.panels[0].buffer_id, BufferId::Channel { .. }));
     }
 
     #[tokio::test]
     async fn split_no_arg_with_panels_clears_all() {
         let mut app = make_dm_app();
-        app.split_panels.push(make_split_panel(SplitTarget::Channel));
-        app.split_panels.push(make_split_panel(SplitTarget::Channel));
-        assert_eq!(app.split_panels.len(), 2);
+        app.add_panel(BufferId::Channel { channel_id: String::new() }, String::new());
+        app.add_panel(BufferId::Channel { channel_id: String::new() }, String::new());
+        assert_eq!(app.layout.panel_count(), 2);
 
         app.handle_command("/split").await;
 
-        assert!(app.split_panels.is_empty());
-        assert_eq!(app.split_focus, SplitFocus::Dm);
+        assert!(!app.is_split());
+        assert_eq!(app.layout.focus, WindowFocus::Primary);
     }
 
     #[test]
     fn split_at_agent_adds_node_panel() {
-        // Test state change directly (mock client can't subscribe over WS)
         let mut app = make_dm_app();
 
         // Simulate what /split @alice does on successful subscribe:
-        let new_panel = SplitPanel {
-            target: SplitTarget::Node { node_id: "n1".into(), node_name: "alice".into() },
-            node_buffer: String::new(),
-            node_msg_pending: false,
-            panel_state: ChannelPanelState::new(),
-        };
-        app.split_panels.push(new_panel);
-        app.split_focus = SplitFocus::Dm;
+        app.add_panel(BufferId::NodeLog { node_id: "n1".into() }, "alice".into());
+        app.layout.focus = WindowFocus::Primary;
 
-        assert_eq!(app.split_panels.len(), 1);
-        assert!(matches!(
-            &app.split_panels[0].target,
-            SplitTarget::Node { node_name, .. } if node_name == "alice"
-        ));
-        assert_eq!(app.split_focus, SplitFocus::Dm);
+        assert_eq!(app.layout.panel_count(), 1);
+        assert!(matches!(app.layout.panels[0].buffer_id, BufferId::NodeLog { .. }));
+        assert_eq!(app.panel_meta[0].label, "alice");
+        assert_eq!(app.layout.focus, WindowFocus::Primary);
     }
 
     #[tokio::test]
     async fn split_at_agent_dedup_focuses_existing() {
         let mut app = make_dm_app();
-        // Pre-populate with alice panel
-        app.split_panels.push(SplitPanel {
-            target: SplitTarget::Node { node_id: "n1".into(), node_name: "alice".into() },
-            node_buffer: String::new(),
-            node_msg_pending: false,
-            panel_state: ChannelPanelState::new(),
-        });
-        app.split_panels.push(make_split_panel(SplitTarget::Channel));
-        app.split_focus = SplitFocus::Dm;
+        app.add_panel(BufferId::NodeLog { node_id: "n1".into() }, "alice".into());
+        app.add_panel(BufferId::Channel { channel_id: String::new() }, String::new());
+        app.layout.focus = WindowFocus::Primary;
 
         app.handle_command("/split @alice").await;
 
-        // Should NOT add a new panel — still 2
-        assert_eq!(app.split_panels.len(), 2, "duplicate @alice should not add panel");
-        // Focus should move to existing alice panel (index 0)
-        assert_eq!(app.split_focus, SplitFocus::Panel(0));
+        assert_eq!(app.layout.panel_count(), 2, "duplicate @alice should not add panel");
+        assert_eq!(app.layout.focus, WindowFocus::Panel(0));
     }
 
     #[tokio::test]
     async fn split_close_removes_focused_panel() {
         let mut app = make_dm_app();
-        app.split_panels.push(make_split_panel(SplitTarget::Channel));
-        app.split_panels.push(make_split_panel(SplitTarget::Node {
-            node_id: "n1".into(),
-            node_name: "alice".into(),
-        }));
-        app.split_focus = SplitFocus::Panel(1);
+        app.add_panel(BufferId::Channel { channel_id: String::new() }, String::new());
+        app.add_panel(BufferId::NodeLog { node_id: "n1".into() }, "alice".into());
+        app.layout.focus = WindowFocus::Panel(1);
 
         app.handle_command("/split close").await;
 
-        assert_eq!(app.split_panels.len(), 1, "focused panel should be removed");
-        // Focus should clamp: Panel(1) removed, fall to Panel(0)
-        assert_eq!(app.split_focus, SplitFocus::Panel(0));
+        assert_eq!(app.layout.panel_count(), 1, "focused panel should be removed");
+        assert_eq!(app.layout.focus, WindowFocus::Panel(0));
     }
 
     #[tokio::test]
     async fn split_close_all_clears_everything() {
         let mut app = make_dm_app();
-        app.split_panels.push(make_split_panel(SplitTarget::Channel));
-        app.split_panels.push(make_split_panel(SplitTarget::Channel));
-        app.split_panels.push(make_split_panel(SplitTarget::Channel));
-        app.split_focus = SplitFocus::Panel(2);
+        app.add_panel(BufferId::Channel { channel_id: String::new() }, String::new());
+        app.add_panel(BufferId::Channel { channel_id: String::new() }, String::new());
+        app.add_panel(BufferId::Channel { channel_id: String::new() }, String::new());
+        app.layout.focus = WindowFocus::Panel(2);
 
         app.handle_command("/split close all").await;
 
-        assert!(app.split_panels.is_empty());
-        assert_eq!(app.split_focus, SplitFocus::Dm);
+        assert!(!app.is_split());
+        assert_eq!(app.layout.focus, WindowFocus::Primary);
     }
 
     #[tokio::test]
     async fn split_panel_limit_rejects_fifth() {
         let mut app = make_dm_app();
         for _ in 0..4 {
-            app.split_panels.push(make_split_panel(SplitTarget::Channel));
+            app.add_panel(BufferId::Channel { channel_id: String::new() }, String::new());
         }
-        assert_eq!(app.split_panels.len(), 4);
+        assert_eq!(app.layout.panel_count(), 4);
 
-        // Try adding a 5th panel — should be rejected
         app.handle_command("/split #extra").await;
 
-        assert_eq!(app.split_panels.len(), 4, "should not exceed 4 panels");
+        assert_eq!(app.layout.panel_count(), 4, "should not exceed 4 panels");
     }
 
     #[tokio::test]
@@ -3498,13 +3371,11 @@ mod tests {
 
         app.handle_command("/split #ops").await;
 
-        // Should add a channel panel (may need new SplitTarget variant or field)
-        assert_eq!(app.split_panels.len(), 1, "/split #ops should add a panel");
+        assert_eq!(app.layout.panel_count(), 1, "/split #ops should add a panel");
     }
 
-    // --- Split Step 6: node_log event routing tests ---
+    // --- node_log event routing tests ---
 
-    /// Build a node update detail JSON for agent_message_chunk.
     fn node_update_chunk(text: &str) -> serde_json::Value {
         serde_json::json!({
             "update": {
@@ -3514,72 +3385,39 @@ mod tests {
         })
     }
 
-    /// Build a node update detail JSON for agent_message_end.
-    fn node_update_end() -> serde_json::Value {
-        serde_json::json!({
-            "update": {
-                "sessionUpdate": "agent_message_end"
-            }
-        })
-    }
-
     #[test]
-    fn node_log_routes_to_single_matching_panel() {
+    fn node_log_routes_to_matching_panel() {
         let mut app = make_app();
-        app.split_panels.push(SplitPanel {
-            target: SplitTarget::Node { node_id: "n1".into(), node_name: "alice".into() },
-            node_buffer: String::new(),
-            node_msg_pending: false,
-            panel_state: ChannelPanelState::new(),
-        });
+        app.add_panel(BufferId::NodeLog { node_id: "n1".into() }, "alice".into());
 
         let detail = node_update_chunk("hello from alice");
         app.handle_node_update("n1", "alice", &detail);
 
-        // node_buffer now has a role+timestamp header before content
-        assert!(app.split_panels[0].node_buffer.contains("hello from alice"));
-        assert!(app.split_panels[0].node_buffer.starts_with("assistant"));
+        let buf = app.panel_node_buffer(0);
+        assert!(buf.contains("hello from alice"));
+        assert!(buf.starts_with("assistant"));
     }
 
     #[test]
-    fn node_log_routes_to_both_panels_subscribing_same_node() {
+    fn node_log_shared_buffer_for_same_node() {
         let mut app = make_app();
-        // Two panels both subscribe to node A
-        app.split_panels.push(SplitPanel {
-            target: SplitTarget::Node { node_id: "n1".into(), node_name: "alice".into() },
-            node_buffer: String::new(),
-            node_msg_pending: false,
-            panel_state: ChannelPanelState::new(),
-        });
-        app.split_panels.push(SplitPanel {
-            target: SplitTarget::Node { node_id: "n1".into(), node_name: "alice".into() },
-            node_buffer: String::new(),
-            node_msg_pending: false,
-            panel_state: ChannelPanelState::new(),
-        });
+        // Two panels both subscribe to same node — they share the buffer_pool entry
+        app.add_panel(BufferId::NodeLog { node_id: "n1".into() }, "alice".into());
+        app.add_panel(BufferId::NodeLog { node_id: "n1".into() }, "alice".into());
 
         let detail = node_update_chunk("broadcast");
         app.handle_node_update("n1", "alice", &detail);
 
-        assert!(app.split_panels[0].node_buffer.contains("broadcast"));
-        assert!(app.split_panels[1].node_buffer.contains("broadcast"));
+        // Both panels read from same buffer
+        assert!(app.panel_node_buffer(0).contains("broadcast"));
+        assert!(app.panel_node_buffer(1).contains("broadcast"));
     }
 
     #[test]
     fn node_log_isolates_different_nodes() {
         let mut app = make_app();
-        app.split_panels.push(SplitPanel {
-            target: SplitTarget::Node { node_id: "n1".into(), node_name: "alice".into() },
-            node_buffer: String::new(),
-            node_msg_pending: false,
-            panel_state: ChannelPanelState::new(),
-        });
-        app.split_panels.push(SplitPanel {
-            target: SplitTarget::Node { node_id: "n2".into(), node_name: "bob".into() },
-            node_buffer: String::new(),
-            node_msg_pending: false,
-            panel_state: ChannelPanelState::new(),
-        });
+        app.add_panel(BufferId::NodeLog { node_id: "n1".into() }, "alice".into());
+        app.add_panel(BufferId::NodeLog { node_id: "n2".into() }, "bob".into());
 
         let detail_a = node_update_chunk("alice output");
         app.handle_node_update("n1", "alice", &detail_a);
@@ -3587,44 +3425,31 @@ mod tests {
         let detail_b = node_update_chunk("bob output");
         app.handle_node_update("n2", "bob", &detail_b);
 
-        assert!(app.split_panels[0].node_buffer.contains("alice output"));
-        assert!(app.split_panels[1].node_buffer.contains("bob output"));
+        assert!(app.panel_node_buffer(0).contains("alice output"));
+        assert!(app.panel_node_buffer(1).contains("bob output"));
     }
 
     #[test]
     fn node_log_no_matching_panel_no_panic() {
         let mut app = make_app();
-        app.split_panels.push(SplitPanel {
-            target: SplitTarget::Node { node_id: "n1".into(), node_name: "alice".into() },
-            node_buffer: String::new(),
-            node_msg_pending: false,
-            panel_state: ChannelPanelState::new(),
-        });
+        app.add_panel(BufferId::NodeLog { node_id: "n1".into() }, "alice".into());
 
-        // Event for node n2 — no panel subscribes
         let detail = node_update_chunk("orphan log");
         app.handle_node_update("n2", "bob", &detail);
 
-        // Panel 0 should be untouched
-        assert!(app.split_panels[0].node_buffer.is_empty());
+        assert!(app.panel_node_buffer(0).is_empty());
     }
 
     #[test]
     fn node_log_preserves_auto_scroll() {
         let mut app = make_app();
-        app.split_panels.push(SplitPanel {
-            target: SplitTarget::Node { node_id: "n1".into(), node_name: "alice".into() },
-            node_buffer: String::new(),
-            node_msg_pending: false,
-            panel_state: ChannelPanelState::new(),
-        });
-        assert!(app.split_panels[0].panel_state.auto_scroll);
+        app.add_panel(BufferId::NodeLog { node_id: "n1".into() }, "alice".into());
+        assert!(app.panel_meta[0].state.auto_scroll);
 
         let detail = node_update_chunk("some log");
         app.handle_node_update("n1", "alice", &detail);
 
-        // auto_scroll should still be true (not manually scrolled)
-        assert!(app.split_panels[0].panel_state.auto_scroll);
+        assert!(app.panel_meta[0].state.auto_scroll);
     }
 
     // --- Task 4c: /ch channel name completion in app ---
@@ -3760,25 +3585,11 @@ mod tests {
 
     #[test]
     fn split_node_panel_render_includes_role_and_timestamp() {
-        // Bug 5b: /split @node right panel only shows raw text,
-        // missing role labels (user/assistant) and timestamps that DM view has.
-        //
-        // The split panel uses render_text_panel() which treats node_buffer as plain
-        // text. It should render structured messages with role headers like DM view.
         use ratatui::buffer::Buffer;
 
         let mut app = make_app();
-        app.split_panels.push(SplitPanel {
-            target: SplitTarget::Node {
-                node_id: "n1".into(),
-                node_name: "alice".into(),
-            },
-            node_buffer: String::new(),
-            node_msg_pending: false,
-            panel_state: ChannelPanelState::new(),
-        });
+        app.add_panel(BufferId::NodeLog { node_id: "n1".into() }, "alice".into());
 
-        // Simulate AI node producing a message via agent_message_chunk + agent_message_end
         let chunk = node_update_chunk("Hello from assistant");
         app.handle_node_update("n1", "alice", &chunk);
         let end_detail = serde_json::json!({
@@ -3786,20 +3597,18 @@ mod tests {
         });
         app.handle_node_update("n1", "alice", &end_detail);
 
-        // Now render the split panel into a test buffer
         let area = Rect::new(0, 0, 60, 20);
         let mut buf = Buffer::empty(area);
-        let panel = &mut app.split_panels[0];
+        let node_buf = app.panel_node_buffer(0).to_string();
         channel_view::render_text_panel(
-            &format!("@{}", "alice"),
-            &panel.node_buffer,
-            &mut panel.panel_state,
+            "@alice",
+            &node_buf,
+            &mut app.panel_meta[0].state,
             true,
             area,
             &mut buf,
         );
 
-        // Extract all text from the rendered buffer
         let rendered: String = (0..area.height)
             .map(|y| {
                 (0..area.width)
@@ -3809,15 +3618,9 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
 
-        // The rendered content (excluding the border title) should contain a role label
-        // AND a timestamp, like DM view does. Currently render_text_panel just dumps raw
-        // text, so this WILL FAIL (red).
-        //
-        // We check the inner content lines (skip first/last border rows) for role+timestamp.
         let inner_lines: Vec<&str> = rendered.lines().skip(1).collect();
         let inner_text = inner_lines.join("\n");
 
-        // Must contain a timestamp pattern (HH:MM:SS) in the content area
         let has_timestamp = regex::Regex::new(r"\d{2}:\d{2}:\d{2}")
             .unwrap()
             .is_match(&inner_text);
@@ -3828,27 +3631,14 @@ mod tests {
         );
     }
 
-    /// Bug 5a: node_log events should route to split panel's node_buffer,
-    /// not just the DM view. Currently, node_log is only handled inside
-    /// the `if in_dm` gate and never reaches split panels.
     #[test]
-    fn node_log_routes_to_split_panel_node_buffer() {
+    fn node_log_routes_to_split_panel_buffer_pool() {
         let mut app = make_app();
 
-        // We are in channel view (NOT DM mode) with a split panel targeting node "n1"
         app.active_channel = Some("ch1".into());
         app.view_mode = ViewMode::Channel { channel_id: "ch1".into() };
-        app.split_panels.push(SplitPanel {
-            target: SplitTarget::Node {
-                node_id: "n1".into(),
-                node_name: "context-guardian".into(),
-            },
-            node_buffer: String::new(),
-            node_msg_pending: false,
-            panel_state: ChannelPanelState::new(),
-        });
+        app.add_panel(BufferId::NodeLog { node_id: "n1".into() }, "context-guardian".into());
 
-        // Simulate a node_log event arriving for node "n1"
         let detail = serde_json::json!({
             "update": {
                 "sessionUpdate": "node_log",
@@ -3864,15 +3654,13 @@ mod tests {
 
         app.handle_node_update("n1", "context-guardian", &detail);
 
-        // The split panel's node_buffer should contain the log entry
         assert!(
-            !app.split_panels[0].node_buffer.is_empty(),
-            "Bug 5a: node_log event should populate split panel node_buffer, \
-             but it was empty. node_log is only routed to DM view, not split panels."
+            !app.panel_node_buffer(0).is_empty(),
+            "node_log event should populate buffer_pool node_buffer"
         );
         assert!(
-            app.split_panels[0].node_buffer.contains("context window compacted"),
-            "Split panel node_buffer should contain the log message"
+            app.panel_node_buffer(0).contains("context window compacted"),
+            "buffer_pool should contain the log message"
         );
     }
 
@@ -3889,13 +3677,13 @@ mod tests {
         app.agents = vec![
             AgentDisplay {
                 name: "ai-1".into(), status: "idle".into(), activity: None,
-                adapter: Some("claude".into()), node_id: "n1".into(),
+                adapter: Some("claude".into()), model: None, node_id: "n1".into(),
                 transport: "stdio".into(), capabilities: vec![],
                 usage: None, tool_call_name: None, tool_call_started: None, waiting_for: None,
             },
             AgentDisplay {
                 name: "ai-2".into(), status: "idle".into(), activity: None,
-                adapter: Some("claude".into()), node_id: "n2".into(),
+                adapter: Some("claude".into()), model: None, node_id: "n2".into(),
                 transport: "stdio".into(), capabilities: vec![],
                 usage: None, tool_call_name: None, tool_call_started: None, waiting_for: None,
             },
@@ -3921,5 +3709,259 @@ mod tests {
         assert!(!app.status_bar.collapsed_sections.contains("AI Agents"),
                 "Enter again should expand the section");
         assert_eq!(app.status_bar.nav_count(&app.channels, &app.agents), 4);
+    }
+
+    // ========== Buffer/Window integration tests (Part 2) ==========
+
+    mod buffer_window {
+        use crate::buffer::*;
+
+        #[test]
+        fn buffer_pool_and_layout_coexist() {
+            let pool = BufferPool::new();
+            let primary_id = BufferId::Channel { channel_id: "ch1".into() };
+            let primary = Window::new(primary_id.clone(), 0);
+            let layout = WindowLayout::new(primary);
+
+            // App 构造后应有 buffer_pool（空）和 layout（1 primary, 0 panels）
+            assert!(pool.get(&primary_id).is_none());
+            assert_eq!(layout.panel_count(), 0);
+            assert_eq!(layout.focus, WindowFocus::Primary);
+        }
+
+        #[test]
+        fn add_panel_increments_panel_count() {
+            let primary = Window::new(BufferId::Channel { channel_id: "ch1".into() }, 0);
+            let mut layout = WindowLayout::new(primary);
+
+            let p1 = Window::new(BufferId::NodeLog { node_id: "n1".into() }, 0);
+            layout.add_panel(p1);
+            assert_eq!(layout.panel_count(), 1);
+
+            let p2 = Window::new(BufferId::NodeLog { node_id: "n2".into() }, 0);
+            layout.add_panel(p2);
+            assert_eq!(layout.panel_count(), 2);
+        }
+
+        #[test]
+        fn cycle_focus_forward_wraps_around() {
+            let primary = Window::new(BufferId::Channel { channel_id: "ch1".into() }, 0);
+            let mut layout = WindowLayout::new(primary);
+            layout.add_panel(Window::new(BufferId::NodeLog { node_id: "n1".into() }, 0));
+            layout.add_panel(Window::new(BufferId::NodeLog { node_id: "n2".into() }, 0));
+
+            assert_eq!(layout.focus, WindowFocus::Primary);
+            layout.cycle_focus_forward();
+            assert_eq!(layout.focus, WindowFocus::Panel(0));
+            layout.cycle_focus_forward();
+            assert_eq!(layout.focus, WindowFocus::Panel(1));
+            layout.cycle_focus_forward();
+            assert_eq!(layout.focus, WindowFocus::Primary); // wraps
+        }
+
+        #[test]
+        fn remove_panel_clamps_focus() {
+            let primary = Window::new(BufferId::Channel { channel_id: "ch1".into() }, 0);
+            let mut layout = WindowLayout::new(primary);
+            layout.add_panel(Window::new(BufferId::NodeLog { node_id: "n1".into() }, 0));
+            layout.add_panel(Window::new(BufferId::NodeLog { node_id: "n2".into() }, 0));
+
+            // Focus on last panel
+            layout.focus = WindowFocus::Panel(1);
+            // Remove it
+            layout.remove_panel(1);
+            assert_eq!(layout.panel_count(), 1);
+            // Focus should clamp to Panel(0)
+            assert_eq!(layout.focus, WindowFocus::Panel(0));
+
+            // Remove last remaining panel → focus back to Primary
+            layout.remove_panel(0);
+            assert_eq!(layout.panel_count(), 0);
+            assert_eq!(layout.focus, WindowFocus::Primary);
+        }
+
+        #[test]
+        fn panel_x_boundaries_matches_panel_count() {
+            let primary = Window::new(BufferId::Channel { channel_id: "ch1".into() }, 0);
+            let mut layout = WindowLayout::new(primary);
+
+            layout.add_panel(Window::new(BufferId::NodeLog { node_id: "n1".into() }, 0));
+            layout.add_panel(Window::new(BufferId::NodeLog { node_id: "n2".into() }, 0));
+            assert_eq!(layout.panel_x_boundaries.len(), layout.panel_count());
+
+            layout.remove_panel(0);
+            assert_eq!(layout.panel_x_boundaries.len(), layout.panel_count());
+        }
+
+        #[test]
+        fn mouse_hit_test_via_panel_x_boundaries() {
+            let primary = Window::new(BufferId::Channel { channel_id: "ch1".into() }, 0);
+            let mut layout = WindowLayout::new(primary);
+
+            layout.add_panel(Window::new(BufferId::NodeLog { node_id: "n1".into() }, 0));
+            layout.add_panel(Window::new(BufferId::NodeLog { node_id: "n2".into() }, 0));
+
+            // Simulate render setting boundaries: panel 0 at x=40, panel 1 at x=80
+            layout.panel_x_boundaries[0] = 40;
+            layout.panel_x_boundaries[1] = 80;
+
+            // Hit test: find which panel a mouse click at x falls into
+            let hit = |x: u16| -> Option<usize> {
+                layout.panel_x_boundaries.iter().rposition(|&bx| x >= bx)
+            };
+
+            assert_eq!(hit(39), None);     // before first panel → primary area
+            assert_eq!(hit(40), Some(0));  // at panel 0 boundary
+            assert_eq!(hit(60), Some(0));  // inside panel 0
+            assert_eq!(hit(80), Some(1));  // at panel 1 boundary
+            assert_eq!(hit(100), Some(1)); // inside panel 1
+        }
+
+        #[test]
+        fn node_output_writes_to_buffer_pool_node_log() {
+            let mut pool = BufferPool::new();
+            let buf_id = BufferId::NodeLog { node_id: "n1".into() };
+
+            // Simulate node output arriving
+            let entry = pool.get_or_create(buf_id.clone());
+            match &mut entry.content {
+                BufferContent::NodeLog { text, pending } => {
+                    text.push_str("line 1\n");
+                    *pending = true;
+                    entry.bump_version();
+                }
+                _ => panic!("expected NodeLog"),
+            }
+
+            // Verify buffer has the content
+            let entry = pool.get(&buf_id).unwrap();
+            assert_eq!(entry.content_version, 1);
+            match &entry.content {
+                BufferContent::NodeLog { text, pending } => {
+                    assert_eq!(text, "line 1\n");
+                    assert!(*pending);
+                }
+                _ => panic!("expected NodeLog"),
+            }
+
+            // Window detects version change
+            let mut win = Window::new(buf_id.clone(), 0);
+            assert!(win.check_content_version(entry.content_version));
+            // Second check with same version → no change
+            assert!(!win.check_content_version(entry.content_version));
+        }
+    }
+
+    // ==========================================================
+    // Buffer Unify: split Dm panel tests
+    // Design: /split @agent creates BufferId::Dm, not NodeLog
+    // See: notes/tasks/tui-split/buffer-unify-design.md
+    // ==========================================================
+
+    // RED (assertion failure): current code creates NodeLog, should create Dm
+    #[tokio::test]
+    async fn split_at_agent_creates_dm_panel() {
+        let mut app = make_dm_app();
+        app.handle_command("/split @alice").await;
+
+        assert_eq!(app.layout.panel_count(), 1);
+        assert!(
+            matches!(app.layout.panels[0].buffer_id, BufferId::Dm { .. }),
+            "/split @agent should create Dm panel, got: {:?}",
+            app.layout.panels[0].buffer_id
+        );
+    }
+
+    // RED: /split close should match BufferId::Dm for unsubscribe.
+    // Current code only matches NodeLog. Panel is still removed (remove_panel
+    // is type-agnostic), but unsubscribe is skipped for Dm panels.
+    #[tokio::test]
+    async fn split_close_handles_dm_panel() {
+        let mut app = make_dm_app();
+        app.add_panel(BufferId::Dm { node_id: "n1".into() }, "alice".into());
+        app.layout.focus = WindowFocus::Panel(0);
+
+        app.handle_command("/split close").await;
+
+        assert_eq!(app.layout.panel_count(), 0);
+        assert!(!app.layout.has_panel_for_buffer(&BufferId::Dm { node_id: "n1".into() }));
+    }
+
+    // RED: unsubscribe_and_clear_panels should handle both Dm and NodeLog panels.
+    // Current code only matches NodeLog for unsubscribe.
+    #[tokio::test]
+    async fn unsubscribe_clear_handles_dm_panels() {
+        let mut app = make_dm_app();
+        app.add_panel(BufferId::Dm { node_id: "n1".into() }, "alice".into());
+        app.add_panel(BufferId::NodeLog { node_id: "n2".into() }, "bob".into());
+        assert_eq!(app.layout.panel_count(), 2);
+
+        app.unsubscribe_and_clear_panels().await;
+
+        assert_eq!(app.layout.panel_count(), 0);
+        assert_eq!(app.layout.focus, WindowFocus::Primary);
+    }
+
+    // RED (compile error): dm_view_for_node() doesn't exist yet.
+    // Tests that DM target mismatch is detected (user switched DM target,
+    // residual split panel should show hint, not blank).
+    #[test]
+    fn dm_target_mismatch_returns_none() {
+        let app = make_dm_app(); // DM with n1/alice
+        // n1 matches current DM target → Some
+        assert!(app.dm_view_for_node("n1").is_some());
+        // n2 does not match → None (panel should show "已切换到其他对话")
+        assert!(app.dm_view_for_node("n2").is_none());
+    }
+
+    // RED (assertion failure): handle_node_update only checks BufferId::NodeLog,
+    // should also bump version for BufferId::Dm panels.
+    #[test]
+    fn node_update_bumps_dm_buffer_version() {
+        let mut app = make_dm_app();
+        app.add_panel(BufferId::Dm { node_id: "n1".into() }, "alice".into());
+
+        let dm_bid = BufferId::Dm { node_id: "n1".into() };
+        let version_before = app.buffer_pool.get(&dm_bid).unwrap().content_version;
+
+        let detail = node_update_chunk("hello");
+        app.handle_node_update("n1", "alice", &detail);
+
+        let version_after = app.buffer_pool.get(&dm_bid).unwrap().content_version;
+        assert!(
+            version_after > version_before,
+            "node_update should bump Dm buffer version for panel scroll tracking, was {} now {}",
+            version_before, version_after
+        );
+    }
+
+    #[tokio::test]
+    async fn node_registered_should_not_show_in_channel_view() {
+        let mut app = make_app();
+        app.active_channel = Some("ch1".into());
+
+        let initial_count = app.channel_view.line_count();
+
+        app.handle_nerve_event(NerveEvent::NodeRegistered {
+            node_id: "xxx".into(),
+            name: "mc".into(),
+            adapter: None,
+            transport: Some("websocket".into()),
+        })
+        .await;
+
+        // NodeRegistered is a global event — it should NOT push system messages into channel_view
+        let has_registered_msg = app.channel_view.messages.iter().any(|m| {
+            m.from == "系统" && m.content.contains("mc") && m.content.contains("已注册")
+        });
+        assert!(
+            !has_registered_msg,
+            "NodeRegistered should not appear in channel_view, but found '已注册' message"
+        );
+        assert_eq!(
+            app.channel_view.line_count(),
+            initial_count,
+            "channel_view message count should not increase on NodeRegistered"
+        );
     }
 }

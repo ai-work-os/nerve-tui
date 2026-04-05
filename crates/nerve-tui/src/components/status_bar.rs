@@ -16,6 +16,7 @@ pub struct AgentDisplay {
     pub status: String,
     pub activity: Option<String>,
     pub adapter: Option<String>,
+    pub model: Option<String>,
     pub node_id: String,
     pub transport: String,
     pub capabilities: Vec<String>,
@@ -567,6 +568,7 @@ mod tests {
                 status: "idle".to_string(),
                 activity: None,
                 adapter: Some("claude".to_string()),
+                model: None,
                 node_id: format!("n{}", i),
                 transport: "stdio".to_string(),
                 capabilities: vec![],
@@ -769,9 +771,9 @@ mod tests {
             unread: 0,
         };
         let agents = vec![
-            AgentDisplay { name: "a".into(), status: "idle".into(), activity: None, adapter: None, node_id: "n1".into(), transport: "stdio".into(), capabilities: vec![], usage: None, tool_call_name: None, tool_call_started: None, waiting_for: None },
-            AgentDisplay { name: "b".into(), status: "busy".into(), activity: None, adapter: None, node_id: "n2".into(), transport: "stdio".into(), capabilities: vec![], usage: None, tool_call_name: None, tool_call_started: None, waiting_for: None },
-            AgentDisplay { name: "c".into(), status: "busy".into(), activity: None, adapter: None, node_id: "n3".into(), transport: "stdio".into(), capabilities: vec![], usage: None, tool_call_name: None, tool_call_started: None, waiting_for: None },
+            AgentDisplay { name: "a".into(), status: "idle".into(), activity: None, adapter: None, model: None, node_id: "n1".into(), transport: "stdio".into(), capabilities: vec![], usage: None, tool_call_name: None, tool_call_started: None, waiting_for: None },
+            AgentDisplay { name: "b".into(), status: "busy".into(), activity: None, adapter: None, model: None, node_id: "n2".into(), transport: "stdio".into(), capabilities: vec![], usage: None, tool_call_name: None, tool_call_started: None, waiting_for: None },
+            AgentDisplay { name: "c".into(), status: "busy".into(), activity: None, adapter: None, model: None, node_id: "n3".into(), transport: "stdio".into(), capabilities: vec![], usage: None, tool_call_name: None, tool_call_started: None, waiting_for: None },
         ];
         let busy = ch.members.iter().filter(|m| {
             agents.iter().any(|a| a.node_id == m.node_id && a.status == "busy")
@@ -822,6 +824,7 @@ mod tests {
             status: "idle".into(),
             activity: None,
             adapter: Some("claude/opus".into()),
+            model: None,
             node_id: "n1".into(),
             transport: "stdio".into(),
             capabilities: vec![],
@@ -841,6 +844,7 @@ mod tests {
             status: "busy".into(),
             activity: None,
             adapter: Some("claude/opus".into()),
+            model: None,
             node_id: "n1".into(),
             transport: "stdio".into(),
             capabilities: vec![],
@@ -861,6 +865,7 @@ mod tests {
             status: "busy".into(),
             activity: Some("thinking".into()),
             adapter: Some("claude/opus".into()),
+            model: None,
             node_id: "n1".into(),
             transport: "stdio".into(),
             capabilities: vec![],
@@ -880,6 +885,7 @@ mod tests {
             status: "busy".into(),
             activity: Some("typing".into()),
             adapter: Some("claude/opus".into()),
+            model: None,
             node_id: "n1".into(),
             transport: "stdio".into(),
             capabilities: vec![],
@@ -900,6 +906,7 @@ mod tests {
             status: "busy".into(),
             activity: None,
             adapter: Some("claude/opus".into()),
+            model: None,
             node_id: "n1".into(),
             transport: "stdio".into(),
             capabilities: vec![],
@@ -920,6 +927,7 @@ mod tests {
             status: "busy".into(),
             activity: Some("recording".into()),
             adapter: None,
+            model: None,
             node_id: "n1".into(),
             transport: "ws".into(),
             capabilities: vec![],
@@ -939,6 +947,7 @@ mod tests {
             status: "busy".into(),
             activity: None,
             adapter: Some("very-long-adapter/very-long-model".into()),
+            model: None,
             node_id: "n1".into(),
             transport: "stdio".into(),
             capabilities: vec![],
@@ -958,6 +967,7 @@ mod tests {
             status: "busy".into(),
             activity: None,
             adapter: Some("模型".into()),  // 4 display cols
+            model: None,
             node_id: "n1".into(),
             transport: "stdio".into(),
             capabilities: vec![],
@@ -978,33 +988,33 @@ mod tests {
             // AI Agents (transport = "stdio")
             AgentDisplay {
                 name: "ai-1".into(), status: "idle".into(), activity: None,
-                adapter: Some("claude".into()), node_id: "n1".into(),
+                adapter: Some("claude".into()), model: None, node_id: "n1".into(),
                 transport: "stdio".into(), capabilities: vec![],
                 usage: None, tool_call_name: None, tool_call_started: None, waiting_for: None,
             },
             AgentDisplay {
                 name: "ai-2".into(), status: "busy".into(), activity: None,
-                adapter: Some("claude".into()), node_id: "n2".into(),
+                adapter: Some("claude".into()), model: None, node_id: "n2".into(),
                 transport: "stdio".into(), capabilities: vec![],
                 usage: None, tool_call_name: None, tool_call_started: None, waiting_for: None,
             },
             // Programs (transport != "stdio", has "monitor" capability)
             AgentDisplay {
                 name: "prog-1".into(), status: "idle".into(), activity: None,
-                adapter: None, node_id: "n3".into(),
+                adapter: None, model: None, node_id: "n3".into(),
                 transport: "ws".into(), capabilities: vec!["monitor".into()],
                 usage: None, tool_call_name: None, tool_call_started: None, waiting_for: None,
             },
             // Clients (transport != "stdio", no "monitor" capability)
             AgentDisplay {
                 name: "client-1".into(), status: "idle".into(), activity: None,
-                adapter: None, node_id: "n4".into(),
+                adapter: None, model: None, node_id: "n4".into(),
                 transport: "ws".into(), capabilities: vec![],
                 usage: None, tool_call_name: None, tool_call_started: None, waiting_for: None,
             },
             AgentDisplay {
                 name: "client-2".into(), status: "idle".into(), activity: None,
-                adapter: None, node_id: "n5".into(),
+                adapter: None, model: None, node_id: "n5".into(),
                 transport: "ws".into(), capabilities: vec![],
                 usage: None, tool_call_name: None, tool_call_started: None, waiting_for: None,
             },
@@ -1150,7 +1160,7 @@ mod tests {
         let agents = vec![
             AgentDisplay {
                 name: "ai-only".into(), status: "idle".into(), activity: None,
-                adapter: Some("claude".into()), node_id: "n1".into(),
+                adapter: Some("claude".into()), model: None, node_id: "n1".into(),
                 transport: "stdio".into(), capabilities: vec![],
                 usage: None, tool_call_name: None, tool_call_started: None, waiting_for: None,
             },
@@ -1213,6 +1223,7 @@ mod tests {
             status: "busy".into(),
             activity: None,
             adapter: None,
+            model: None,
             node_id: "n1".into(),
             transport: "stdio".into(),
             capabilities: vec![],
@@ -1234,6 +1245,7 @@ mod tests {
             status: "busy".into(),
             activity: None,
             adapter: None,
+            model: None,
             node_id: "n1".into(),
             transport: "stdio".into(),
             capabilities: vec![],
