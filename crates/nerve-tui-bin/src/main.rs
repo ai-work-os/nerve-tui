@@ -36,7 +36,6 @@ fn restore_terminal() {
 }
 
 use nerve_tui::app::App;
-use nerve_tui::event_source::CrosstermEventSource;
 use nerve_tui_core::NerveClient;
 
 #[derive(Parser)]

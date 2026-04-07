@@ -34,6 +34,7 @@ pub struct DmView {
     pub streaming_messages: HashMap<String, Message>,
     next_msg_id: u64,
     // UI
+    pub(crate) model_label: Option<String>,
     usage_label: Option<String>,
     usage_ratio: f64,
     blink_tick: u16,
@@ -58,6 +59,7 @@ impl DmView {
             has_new_messages: false,
             streaming_messages: HashMap::new(),
             next_msg_id: 0,
+            model_label: None,
             usage_label: None,
             usage_ratio: 0.0,
             blink_tick: 0,
@@ -149,6 +151,19 @@ impl DmView {
         );
         self.usage_label = Some(label);
         self.usage_ratio = ratio;
+    }
+
+    pub fn set_model_label(&mut self, model: Option<&str>, token_size: Option<f64>) {
+        self.model_label = match model {
+            Some(m) => {
+                if let Some(size) = token_size {
+                    Some(format!("{} / {}", m, format_tokens(size)))
+                } else {
+                    Some(m.to_string())
+                }
+            }
+            None => None,
+        };
     }
 
     // --- Node log entries (program node observability) ---
@@ -255,16 +270,6 @@ impl DmView {
 
     pub fn render(&mut self, area: Rect, buf: &mut Buffer) {
         let title = format!(" 与 {} 的对话 ", self.agent_name);
-        let usage_span = self.usage_label.as_ref().map(|label| {
-            let color = if self.usage_ratio >= 0.9 {
-                Color::Red
-            } else if self.usage_ratio >= 0.8 {
-                Color::Yellow
-            } else {
-                theme::BORDER
-            };
-            Span::styled(format!(" {} ", label), Style::default().fg(color))
-        });
 
         let mut block = Block::default()
             .borders(Borders::LEFT)
@@ -273,8 +278,29 @@ impl DmView {
             .title(title)
             .title_style(Style::default().fg(theme::BORDER));
 
-        if let Some(usage) = usage_span {
-            block = block.title_top(Line::from(usage).alignment(ratatui::layout::Alignment::Right));
+        // Right-aligned top: model label + usage (e.g. "opus[1m] / 200k  50K/100K 50% $1.23")
+        let mut right_spans: Vec<Span> = Vec::new();
+        if let Some(ref model) = self.model_label {
+            right_spans.push(Span::styled(
+                format!(" {} ", model),
+                Style::default().fg(theme::BORDER),
+            ));
+        }
+        if let Some(ref label) = self.usage_label {
+            let color = if self.usage_ratio >= 0.9 {
+                Color::Red
+            } else if self.usage_ratio >= 0.8 {
+                Color::Yellow
+            } else {
+                theme::BORDER
+            };
+            right_spans.push(Span::styled(
+                format!(" {} ", label),
+                Style::default().fg(color),
+            ));
+        }
+        if !right_spans.is_empty() {
+            block = block.title_top(Line::from(right_spans).alignment(ratatui::layout::Alignment::Right));
         }
 
         let inner = block.inner(area);
@@ -766,6 +792,32 @@ mod tests {
         dm.set_responding(true);
         assert!(dm.is_responding);
         assert!(!dm.summary_mode);
+    }
+
+    // --- Model label ---
+
+    #[test]
+    fn set_model_label_stores_value() {
+        let mut dm = DmView::new("alice");
+        assert!(dm.model_label.is_none());
+        dm.set_model_label(Some("opus[1m]"), Some(200_000.0));
+        assert_eq!(dm.model_label.as_deref(), Some("opus[1m] / 200.0k"));
+    }
+
+    #[test]
+    fn set_model_label_without_context_window() {
+        let mut dm = DmView::new("alice");
+        dm.set_model_label(Some("sonnet"), None);
+        assert_eq!(dm.model_label.as_deref(), Some("sonnet"));
+    }
+
+    #[test]
+    fn set_model_label_none_clears() {
+        let mut dm = DmView::new("alice");
+        dm.set_model_label(Some("opus"), None);
+        assert!(dm.model_label.is_some());
+        dm.set_model_label(None, None);
+        assert!(dm.model_label.is_none());
     }
 
     // --- Usage ---

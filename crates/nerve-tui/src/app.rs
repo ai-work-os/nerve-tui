@@ -189,13 +189,6 @@ impl<T: Transport> App<T> {
         self.split_panels.len()
     }
 
-    fn focused_panel(&self) -> Option<&SplitPanel> {
-        match self.split_focus {
-            SplitFocus::Panel(i) => self.split_panels.get(i),
-            _ => None,
-        }
-    }
-
     fn focused_panel_mut(&mut self) -> Option<&mut SplitPanel> {
         match self.split_focus {
             SplitFocus::Panel(i) => self.split_panels.get_mut(i),
@@ -213,6 +206,29 @@ impl<T: Transport> App<T> {
                     SplitFocus::Panel(self.split_panels.len() - 1)
                 };
             }
+        }
+    }
+
+    /// Close all split panels, unsubscribing from any node targets.
+    async fn close_all_split_panels(&mut self) {
+        for panel in &self.split_panels {
+            if let SplitTarget::Node { ref node_id, .. } = panel.target {
+                let _ = self.client.node_unsubscribe(node_id).await;
+            }
+        }
+        self.split_panels.clear();
+        self.split_focus = SplitFocus::Dm;
+    }
+
+    /// Close a single split panel by index, unsubscribing if it targets a node.
+    async fn close_split_panel(&mut self, index: usize) {
+        if index < self.split_panels.len() {
+            if let SplitTarget::Node { ref node_id, .. } = self.split_panels[index].target {
+                let id = node_id.clone();
+                let _ = self.client.node_unsubscribe(&id).await;
+            }
+            self.split_panels.remove(index);
+            self.clamp_split_focus();
         }
     }
 
@@ -359,7 +375,7 @@ impl<T: Transport> App<T> {
         self.dm_view.tick_blink();
 
         let area = frame.area();
-        let panel_count = if self.is_dm_mode() { self.split_panels.len() } else { 0 };
+        let panel_count = self.split_panels.len();
         let input_inner_w = AppLayout::input_inner_width(area, self.sidebar_visible, panel_count);
         let input_lines = self.input.visual_line_count(input_inner_w) + 2;
         let layout = AppLayout::build(area, input_lines, self.sidebar_visible, panel_count);
@@ -501,13 +517,7 @@ impl<T: Transport> App<T> {
                         || self.split_panels.iter().any(|p| matches!(p.target, SplitTarget::Node { .. }));
                     if has_target {
                         if self.is_split() {
-                            for panel in &self.split_panels {
-                                if let SplitTarget::Node { ref node_id, .. } = panel.target {
-                                    let _ = self.client.node_unsubscribe(node_id).await;
-                                }
-                            }
-                            self.split_panels.clear();
-                            self.split_focus = SplitFocus::Dm;
+                            self.close_all_split_panels().await;
                         } else {
                             self.split_panels.push(SplitPanel {
                                 target: SplitTarget::Channel,
@@ -984,8 +994,10 @@ impl<T: Transport> App<T> {
         self.dm_view = DmView::new(&node_name);
         self.view_mode = ViewMode::Dm { node_id, node_name: node_name.clone() };
 
-        // Initialize usage display from agent snapshot
+        // Initialize model + usage display from agent snapshot
         if let Some(agent) = self.agents.iter().find(|a| a.name == node_name) {
+            let token_size = agent.usage.map(|(_, size, _)| size);
+            self.dm_view.set_model_label(agent.model.as_deref(), token_size);
             if let Some((used, size, cost)) = agent.usage {
                 self.dm_view.update_usage(used, size, cost);
             }
@@ -997,16 +1009,16 @@ impl<T: Transport> App<T> {
     async fn exit_dm(&mut self) {
         if let ViewMode::Dm { ref node_id, ref node_name } = self.view_mode.clone() {
             debug!("exiting DM with {}", node_name);
-            if let Err(e) = self.client.node_unsubscribe(node_id).await {
-                warn!("unsubscribe failed: {}", e);
-            }
-            // Clean up split node subscriptions
-            for panel in &self.split_panels {
-                if let SplitTarget::Node { ref node_id, .. } = panel.target {
-                    let _ = self.client.node_unsubscribe(node_id).await;
+            // Only unsubscribe the DM node if no split panel is also watching it
+            let split_has_node = self.split_panels.iter().any(|p| {
+                matches!(&p.target, SplitTarget::Node { node_id: sid, .. } if sid == node_id)
+            });
+            if !split_has_node {
+                if let Err(e) = self.client.node_unsubscribe(node_id).await {
+                    warn!("unsubscribe failed: {}", e);
                 }
             }
-            self.split_panels.clear();
+            // Preserve split panels — they are independent of the DM session
             self.dm_view.clear();
             self.view_mode = ViewMode::Channel {
                 channel_id: self.active_channel.clone().unwrap_or_default(),
@@ -1421,26 +1433,11 @@ impl<T: Transport> App<T> {
                 let arg2 = parts.get(2).copied().unwrap_or("");
 
                 if arg == "close" && arg2 == "all" {
-                    // /split close all — remove all panels
-                    for panel in &self.split_panels {
-                        if let SplitTarget::Node { ref node_id, .. } = panel.target {
-                            let _ = self.client.node_unsubscribe(node_id).await;
-                        }
-                    }
-                    self.split_panels.clear();
-                    self.split_focus = SplitFocus::Dm;
+                    self.close_all_split_panels().await;
                 } else if arg == "close" {
                     // /split close — remove focused panel
                     if let SplitFocus::Panel(i) = self.split_focus {
-                        if i < self.split_panels.len() {
-                            let panel = &self.split_panels[i];
-                            if let SplitTarget::Node { ref node_id, .. } = panel.target {
-                                let id = node_id.clone();
-                                let _ = self.client.node_unsubscribe(&id).await;
-                            }
-                            self.split_panels.remove(i);
-                            self.clamp_split_focus();
-                        }
+                        self.close_split_panel(i).await;
                     } else {
                         self.push_contextual_system("焦点不在面板上，用 Ctrl+W 切换焦点");
                     }
@@ -1495,14 +1492,7 @@ impl<T: Transport> App<T> {
                     }
                 } else if self.is_dm_mode() {
                     if self.is_split() && arg.is_empty() {
-                        // Toggle off — unsubscribe from split nodes
-                        for panel in &self.split_panels {
-                            if let SplitTarget::Node { ref node_id, .. } = panel.target {
-                                let _ = self.client.node_unsubscribe(node_id).await;
-                            }
-                        }
-                        self.split_panels.clear();
-                        self.split_focus = SplitFocus::Dm;
+                        self.close_all_split_panels().await;
                     } else if self.active_channel.is_some() {
                         if self.split_panels.len() >= 4 {
                             self.push_contextual_system("面板已满（最多 4 个）");
@@ -2899,50 +2889,6 @@ mod tests {
     }
 
     #[test]
-    fn focused_panel_returns_first_panel() {
-        let mut app = make_app();
-        app.split_panels.push(SplitPanel {
-            target: SplitTarget::Channel,
-            node_buffer: String::new(),
-            node_msg_pending: false,
-            panel_state: ChannelPanelState::new(),
-        });
-        app.split_focus = SplitFocus::Panel(0);
-
-        let panel = app.focused_panel();
-        assert!(panel.is_some());
-        assert_eq!(panel.unwrap().target, SplitTarget::Channel);
-    }
-
-    #[test]
-    fn focused_panel_returns_none_when_dm_focus() {
-        let mut app = make_app();
-        app.split_panels.push(SplitPanel {
-            target: SplitTarget::Channel,
-            node_buffer: String::new(),
-            node_msg_pending: false,
-            panel_state: ChannelPanelState::new(),
-        });
-        app.split_focus = SplitFocus::Dm;
-
-        assert!(app.focused_panel().is_none());
-    }
-
-    #[test]
-    fn focused_panel_returns_none_when_index_out_of_bounds() {
-        let mut app = make_app();
-        app.split_panels.push(SplitPanel {
-            target: SplitTarget::Channel,
-            node_buffer: String::new(),
-            node_msg_pending: false,
-            panel_state: ChannelPanelState::new(),
-        });
-        app.split_focus = SplitFocus::Panel(5);
-
-        assert!(app.focused_panel().is_none());
-    }
-
-    #[test]
     fn focused_panel_mut_can_modify_panel() {
         let mut app = make_app();
         app.split_panels.push(SplitPanel {
@@ -3366,6 +3312,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn enter_dm_sets_model_label() {
+        let mut app = make_app();
+        app.agents = vec![AgentDisplay {
+            name: "alice".into(),
+            status: "idle".into(),
+            activity: None,
+            adapter: Some("claude".into()),
+            model: Some("opus[1m]".into()),
+            node_id: "n1".into(),
+            transport: "stdio".into(),
+            capabilities: vec![],
+            usage: Some((50_000.0, 200_000.0, 1.5)),
+            tool_call_name: None,
+            tool_call_started: None,
+            waiting_for: None,
+        }];
+        app.enter_dm("alice").await;
+        assert_eq!(app.dm_view.model_label.as_deref(), Some("opus[1m] / 200.0k"));
+    }
+
+    #[tokio::test]
+    async fn enter_dm_no_model_sets_none() {
+        let mut app = make_app();
+        app.agents = vec![AgentDisplay {
+            name: "bob".into(),
+            status: "idle".into(),
+            activity: None,
+            adapter: None,
+            model: None,
+            node_id: "n2".into(),
+            transport: "stdio".into(),
+            capabilities: vec![],
+            usage: None,
+            tool_call_name: None,
+            tool_call_started: None,
+            waiting_for: None,
+        }];
+        app.enter_dm("bob").await;
+        assert!(app.dm_view.model_label.is_none());
+    }
+
+    #[tokio::test]
     async fn split_no_arg_no_panels_adds_channel_panel() {
         let mut app = make_dm_app();
         assert!(app.split_panels.is_empty());
@@ -3451,6 +3439,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn close_all_split_panels_unsubscribes_and_clears() {
+        let mut app = make_dm_app();
+        app.split_panels.push(make_split_panel(SplitTarget::Channel));
+        app.split_panels.push(make_split_panel(SplitTarget::Node {
+            node_id: "n2".into(),
+            node_name: "bob".into(),
+        }));
+        app.split_focus = SplitFocus::Panel(1);
+
+        app.close_all_split_panels().await;
+
+        assert!(app.split_panels.is_empty());
+        assert_eq!(app.split_focus, SplitFocus::Dm);
+    }
+
+    #[tokio::test]
+    async fn close_split_panel_removes_single() {
+        let mut app = make_dm_app();
+        app.split_panels.push(make_split_panel(SplitTarget::Channel));
+        app.split_panels.push(make_split_panel(SplitTarget::Node {
+            node_id: "n2".into(),
+            node_name: "bob".into(),
+        }));
+        app.split_focus = SplitFocus::Panel(1);
+
+        app.close_split_panel(1).await;
+
+        assert_eq!(app.split_panels.len(), 1);
+        assert_eq!(app.split_panels[0].target, SplitTarget::Channel);
+    }
+
+    #[tokio::test]
     async fn split_close_all_clears_everything() {
         let mut app = make_dm_app();
         app.split_panels.push(make_split_panel(SplitTarget::Channel));
@@ -3462,6 +3482,62 @@ mod tests {
 
         assert!(app.split_panels.is_empty());
         assert_eq!(app.split_focus, SplitFocus::Dm);
+    }
+
+    #[tokio::test]
+    async fn exit_dm_preserves_split_panels() {
+        let mut app = make_dm_app();
+        app.split_panels.push(make_split_panel(SplitTarget::Channel));
+        app.split_panels.push(make_split_panel(SplitTarget::Node {
+            node_id: "n2".into(),
+            node_name: "bob".into(),
+        }));
+        assert_eq!(app.split_panels.len(), 2);
+
+        app.exit_dm().await;
+
+        // Split panels should survive DM exit
+        assert_eq!(app.split_panels.len(), 2, "split panels should persist after exit_dm");
+    }
+
+    #[tokio::test]
+    async fn split_renders_in_channel_mode() {
+        let mut app = make_app();
+        app.view_mode = ViewMode::Channel { channel_id: "ch1".into() };
+        app.split_panels.push(make_split_panel(SplitTarget::Node {
+            node_id: "n1".into(),
+            node_name: "alice".into(),
+        }));
+
+        // panel_count should include split panels even in channel mode
+        assert!(!app.is_dm_mode());
+        assert_eq!(app.split_panel_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn switch_dm_preserves_split_panels() {
+        let mut app = make_dm_app();
+        app.split_panels.push(make_split_panel(SplitTarget::Channel));
+        app.agents.push(AgentDisplay {
+            name: "bob".into(),
+            status: "idle".into(),
+            activity: None,
+            adapter: None,
+            model: None,
+            node_id: "n2".into(),
+            transport: "stdio".into(),
+            capabilities: vec![],
+            usage: None,
+            tool_call_name: None,
+            tool_call_started: None,
+            waiting_for: None,
+        });
+        assert_eq!(app.split_panels.len(), 1);
+
+        app.enter_dm("bob").await;
+
+        // Split panels should survive DM-to-DM switch
+        assert_eq!(app.split_panels.len(), 1, "split panels should persist after DM switch");
     }
 
     #[tokio::test]
