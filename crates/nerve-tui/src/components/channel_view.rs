@@ -28,6 +28,14 @@ pub(crate) struct MessageLine {
     pub blocks: Vec<ContentBlock>,
 }
 
+/// Cached result of build_text for channel messages.
+struct TextCacheEntry {
+    lines: Vec<Line<'static>>,
+    width: u16,
+    msg_count: usize,
+    filter: Option<String>,
+}
+
 /// Channel messages view — handles channel.message events, caching, filtering, scrolling.
 pub struct ChannelView {
     pub(crate) messages: Vec<MessageLine>,
@@ -39,6 +47,10 @@ pub struct ChannelView {
     /// channel_id → (messages, scroll snapshot)
     channel_cache: HashMap<String, (Vec<MessageLine>, ViewSnapshot)>,
     channel_unread: HashMap<String, usize>,
+    /// Cached rendered lines for build_text.
+    text_cache: Option<TextCacheEntry>,
+    /// Number of cache hits (for diagnostics/testing).
+    pub cache_hit_count: u64,
 }
 
 impl ChannelView {
@@ -52,6 +64,8 @@ impl ChannelView {
             filter: None,
             channel_cache: HashMap::new(),
             channel_unread: HashMap::new(),
+            text_cache: None,
+            cache_hit_count: 0,
         }
     }
 
@@ -73,6 +87,7 @@ impl ChannelView {
             timestamp: msg.timestamp,
             blocks,
         });
+        self.text_cache = None;
         if self.auto_scroll {
             self.snap_to_bottom();
         } else {
@@ -87,6 +102,7 @@ impl ChannelView {
             timestamp: Local::now().timestamp() as f64,
             blocks: vec![ContentBlock::Text { text: content.to_string() }],
         });
+        self.text_cache = None;
         if self.auto_scroll {
             self.snap_to_bottom();
         } else {
@@ -119,6 +135,7 @@ impl ChannelView {
             self.auto_scroll = snapshot.auto_scroll;
             self.has_new_messages = snapshot.has_new_messages;
             self.channel_unread.remove(channel_id);
+            self.text_cache = None;
             true
         } else {
             false
@@ -187,6 +204,7 @@ impl ChannelView {
         self.messages.clear();
         self.scroll_offset = 0;
         self.has_new_messages = false;
+        self.text_cache = None;
     }
 
     // --- Rendering ---
@@ -247,7 +265,7 @@ impl ChannelView {
 
     /// Render channel messages in the split-view right panel.
     pub fn render_panel(
-        &self,
+        &mut self,
         channel_name: &str,
         state: &mut ChannelPanelState,
         focused: bool,
@@ -289,11 +307,34 @@ impl ChannelView {
 
     /// Public accessor for build_text (used by tests).
     #[allow(dead_code)]
-    pub(crate) fn build_text_pub(&self, width: u16) -> Vec<Line<'static>> {
+    pub(crate) fn build_text_pub(&mut self, width: u16) -> Vec<Line<'static>> {
         self.build_text(width)
     }
 
-    fn build_text(&self, width: u16) -> Vec<Line<'static>> {
+    fn build_text(&mut self, width: u16) -> Vec<Line<'static>> {
+        // Check cache validity
+        let cache_valid = self.text_cache.as_ref().map_or(false, |c| {
+            c.width == width
+                && c.msg_count == self.messages.len()
+                && c.filter == self.filter
+        });
+
+        if cache_valid {
+            self.cache_hit_count += 1;
+            return self.text_cache.as_ref().unwrap().lines.clone();
+        }
+
+        let lines = self.build_text_inner(width);
+        self.text_cache = Some(TextCacheEntry {
+            lines: lines.clone(),
+            width,
+            msg_count: self.messages.len(),
+            filter: self.filter.clone(),
+        });
+        lines
+    }
+
+    fn build_text_inner(&self, width: u16) -> Vec<Line<'static>> {
         let mut out: Vec<Line<'static>> = Vec::new();
         let mut prev_timestamp: Option<f64> = None;
 
@@ -725,6 +766,47 @@ mod tests {
         assert_eq!(v.unread_count("ch-d"), 1);
         v.load_channel("ch-d");
         assert_eq!(v.unread_count("ch-d"), 0);
+    }
+
+    // --- Filter ---
+
+    // --- build_text cache ---
+
+    #[test]
+    fn build_text_idempotent() {
+        let mut v = ChannelView::new();
+        v.push(&make_msg("alice", "hello"), false);
+        v.push(&make_msg("bob", "world"), false);
+        let lines1 = v.build_text_pub(80);
+        let lines2 = v.build_text_pub(80);
+        assert_eq!(lines1.len(), lines2.len());
+        for (a, b) in lines1.iter().zip(lines2.iter()) {
+            assert_eq!(format!("{:?}", a), format!("{:?}", b));
+        }
+    }
+
+    #[test]
+    fn build_text_cache_invalidated_on_push() {
+        let mut v = ChannelView::new();
+        v.push(&make_msg("alice", "hello"), false);
+        let lines_before = v.build_text_pub(80);
+        v.push(&make_msg("bob", "world"), false);
+        let lines_after = v.build_text_pub(80);
+        assert!(lines_after.len() > lines_before.len());
+    }
+
+    #[test]
+    fn build_text_cache_reports_hits() {
+        let mut v = ChannelView::new();
+        v.push(&make_msg("alice", "hello"), false);
+        assert_eq!(v.cache_hit_count, 0);
+        v.build_text_pub(80); // miss
+        assert_eq!(v.cache_hit_count, 0);
+        v.build_text_pub(80); // hit
+        assert_eq!(v.cache_hit_count, 1);
+        v.push(&make_msg("bob", "world"), false);
+        v.build_text_pub(80); // miss
+        assert_eq!(v.cache_hit_count, 1);
     }
 
     // --- Filter ---

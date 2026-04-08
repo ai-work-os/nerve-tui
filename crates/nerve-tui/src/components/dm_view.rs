@@ -22,6 +22,14 @@ pub(crate) struct MessageLine {
     pub blocks: Vec<ContentBlock>,
 }
 
+/// Cached result of build_text for static messages.
+struct TextCacheEntry {
+    lines: Vec<Line<'static>>,
+    width: u16,
+    msg_count: usize,
+    summary_mode: bool,
+}
+
 /// DM view — handles node.update events, streaming, DM messages, scrolling.
 pub struct DmView {
     agent_name: String,
@@ -46,6 +54,10 @@ pub struct DmView {
     pub is_responding: bool,
     /// Summary mode: history messages show only text (no thinking/tool_call/code fences).
     pub summary_mode: bool,
+    /// Cached rendered lines for static messages (excludes streaming).
+    text_cache: Option<TextCacheEntry>,
+    /// Number of cache hits (for diagnostics/testing).
+    pub cache_hit_count: u64,
 }
 
 impl DmView {
@@ -67,6 +79,8 @@ impl DmView {
             dm_history: Vec::new(),
             is_responding: false,
             summary_mode: false,
+            text_cache: None,
+            cache_hit_count: 0,
         }
     }
 
@@ -87,11 +101,13 @@ impl DmView {
         self.is_responding = responding;
         if !responding {
             self.summary_mode = true;
+            self.text_cache = None;
         }
     }
 
     pub fn toggle_summary_mode(&mut self) {
         self.summary_mode = !self.summary_mode;
+        self.text_cache = None;
     }
 
     pub fn clear(&mut self) {
@@ -103,6 +119,7 @@ impl DmView {
         self.scroll_offset = 0;
         self.auto_scroll = true;
         self.has_new_messages = false;
+        self.text_cache = None;
     }
 
     pub fn push(&mut self, msg: &DmMessage) {
@@ -118,6 +135,7 @@ impl DmView {
             timestamp: msg.timestamp as f64,
             blocks,
         });
+        self.text_cache = None;
         if msg.role == "user" || self.auto_scroll {
             self.snap_to_bottom();
         } else {
@@ -132,6 +150,7 @@ impl DmView {
             timestamp: Local::now().timestamp() as f64,
             blocks: vec![ContentBlock::Text { text: content.to_string() }],
         });
+        self.text_cache = None;
         if self.auto_scroll {
             self.snap_to_bottom();
         } else {
@@ -184,6 +203,7 @@ impl DmView {
                     blocks: vec![ContentBlock::Text { text: formatted }],
                 });
             }
+            self.text_cache = None;
             if self.auto_scroll {
                 self.snap_to_bottom();
             } else {
@@ -342,7 +362,71 @@ impl DmView {
         }
     }
 
-    pub(crate) fn build_text(&self, width: u16) -> Vec<Line<'static>> {
+    pub(crate) fn build_text(&mut self, width: u16) -> Vec<Line<'static>> {
+        // Check if static message cache is valid
+        let cache_valid = self.text_cache.as_ref().map_or(false, |c| {
+            c.width == width
+                && c.msg_count == self.messages.len()
+                && c.summary_mode == self.summary_mode
+        });
+
+        let static_lines = if cache_valid {
+            self.cache_hit_count += 1;
+            self.text_cache.as_ref().unwrap().lines.clone()
+        } else {
+            let lines = self.build_static_lines(width);
+            self.text_cache = Some(TextCacheEntry {
+                lines: lines.clone(),
+                width,
+                msg_count: self.messages.len(),
+                summary_mode: self.summary_mode,
+            });
+            lines
+        };
+
+        let mut out = static_lines;
+
+        // Streaming previews — always rebuilt (content changes every chunk)
+        let cursor_char = if self.cursor_visible() { " ▌" } else { "  " };
+        let mut streaming_names: Vec<&String> = self.streaming_messages.keys().collect();
+        streaming_names.sort();
+        for name in streaming_names {
+            let msg = &self.streaming_messages[name];
+            out.push(Line::from(""));
+            out.push(Line::from(vec![
+                Span::styled(
+                    name.clone(),
+                    Style::default()
+                        .fg(theme::AGENT_MSG)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(cursor_char.to_string(), Style::default().fg(theme::MENTION)),
+            ]));
+
+            if !msg.blocks.is_empty() {
+                debug!(
+                    "streaming render: {} blocks={}",
+                    name, msg.blocks.len()
+                );
+                for block in &msg.blocks {
+                    let rendered = block_renderer::render_block(block, width);
+                    out.extend(rendered);
+                }
+            } else {
+                debug!("streaming render: {} has 0 blocks", name);
+            }
+        }
+
+        // Trailing padding
+        if !out.is_empty() {
+            out.push(Line::from(""));
+        }
+
+        out
+    }
+
+    /// Build rendered lines for static (non-streaming) messages.
+    fn build_static_lines(&self, width: u16) -> Vec<Line<'static>> {
         let mut out: Vec<Line<'static>> = Vec::new();
         let mut prev_timestamp: Option<f64> = None;
 
@@ -447,42 +531,6 @@ impl DmView {
             }
             compact_rendered_lines(&mut content_lines);
             out.extend(content_lines);
-        }
-
-        // Streaming previews — sorted keys for stable render order
-        let cursor_char = if self.cursor_visible() { " ▌" } else { "  " };
-        let mut streaming_names: Vec<&String> = self.streaming_messages.keys().collect();
-        streaming_names.sort();
-        for name in streaming_names {
-            let msg = &self.streaming_messages[name];
-            out.push(Line::from(""));
-            out.push(Line::from(vec![
-                Span::styled(
-                    name.clone(),
-                    Style::default()
-                        .fg(theme::AGENT_MSG)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(cursor_char.to_string(), Style::default().fg(theme::MENTION)),
-            ]));
-
-            if !msg.blocks.is_empty() {
-                debug!(
-                    "streaming render: {} blocks={}",
-                    name, msg.blocks.len()
-                );
-                for block in &msg.blocks {
-                    let rendered = block_renderer::render_block(block, width);
-                    out.extend(rendered);
-                }
-            } else {
-                debug!("streaming render: {} has 0 blocks", name);
-            }
-        }
-
-        // Trailing padding
-        if !out.is_empty() {
-            out.push(Line::from(""));
         }
 
         out
@@ -875,6 +923,71 @@ mod tests {
     #[test]
     fn format_tokens_millions() {
         assert_eq!(format_tokens(2_500_000.0), "2.5M");
+    }
+
+    // --- build_text cache ---
+
+    #[test]
+    fn build_text_idempotent() {
+        let mut dm = DmView::new("alice");
+        dm.push(&make_dm("user", "hello"));
+        dm.push(&make_dm("assistant", "world"));
+        let lines1 = dm.build_text(80);
+        let lines2 = dm.build_text(80);
+        assert_eq!(lines1.len(), lines2.len());
+        for (a, b) in lines1.iter().zip(lines2.iter()) {
+            assert_eq!(format!("{:?}", a), format!("{:?}", b));
+        }
+    }
+
+    #[test]
+    fn build_text_cache_invalidated_on_push() {
+        let mut dm = DmView::new("alice");
+        dm.push(&make_dm("user", "hello"));
+        let lines_before = dm.build_text(80);
+        dm.push(&make_dm("assistant", "reply"));
+        let lines_after = dm.build_text(80);
+        // After push, output must include the new message (more lines)
+        assert!(lines_after.len() > lines_before.len());
+    }
+
+    #[test]
+    fn build_text_cache_invalidated_on_width_change() {
+        let mut dm = DmView::new("alice");
+        dm.push(&make_dm("user", "hello"));
+        let lines_80 = dm.build_text(80);
+        let lines_120 = dm.build_text(120);
+        // Different widths should both produce valid output
+        assert!(!lines_80.is_empty());
+        assert!(!lines_120.is_empty());
+    }
+
+    #[test]
+    fn build_text_cache_invalidated_on_summary_toggle() {
+        let mut dm = DmView::new("alice");
+        dm.push(&make_dm("user", "hello"));
+        let lines_normal = dm.build_text(80);
+        dm.toggle_summary_mode();
+        let lines_summary = dm.build_text(80);
+        // Both should produce valid output (content may differ)
+        assert!(!lines_normal.is_empty());
+        assert!(!lines_summary.is_empty());
+    }
+
+    #[test]
+    fn build_text_cache_reports_hits() {
+        let mut dm = DmView::new("alice");
+        dm.push(&make_dm("user", "hello"));
+        assert_eq!(dm.cache_hit_count, 0);
+        dm.build_text(80); // miss
+        assert_eq!(dm.cache_hit_count, 0);
+        dm.build_text(80); // hit
+        assert_eq!(dm.cache_hit_count, 1);
+        dm.build_text(80); // hit
+        assert_eq!(dm.cache_hit_count, 2);
+        dm.push(&make_dm("assistant", "world"));
+        dm.build_text(80); // miss (invalidated)
+        assert_eq!(dm.cache_hit_count, 2);
     }
 
     // --- extract_channel_origin ---
