@@ -17,30 +17,6 @@ use crate::components::dm_view::DmView;
 use crate::components::*;
 use crate::layout::AppLayout;
 
-/// Check if `content` contains an @mention of `name` as a whole token.
-/// Mirrors server-side `parseMentions` in router.ts: @name must be preceded by
-/// whitespace (or start of string) and followed by whitespace, punctuation, or EOF.
-fn mentions_name(content: &str, name: &str) -> bool {
-    let padded = format!(" {}", content);
-    let pattern = format!("@{}", name);
-    for (i, _) in padded.match_indices(&pattern) {
-        // Check preceding char is whitespace
-        let before = padded.as_bytes().get(i.wrapping_sub(1)).copied().unwrap_or(b' ');
-        if !before.is_ascii_whitespace() {
-            continue;
-        }
-        // Check following char is whitespace, punctuation, or EOF
-        let after_pos = i + pattern.len();
-        match padded.as_bytes().get(after_pos) {
-            None => return true, // EOF
-            Some(c) if c.is_ascii_whitespace() => return true,
-            Some(c) if b".,;:!?".contains(c) => return true,
-            _ => continue, // e.g. @alice-dev when looking for @alice
-        }
-    }
-    false
-}
-
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum SplitFocus {
     Dm,
@@ -1602,23 +1578,16 @@ impl<T: Transport> App<T> {
                 channel_id,
                 message,
             } => {
-                // Only show messages that @mention me or that I sent.
-                // Token-level match: @name must be preceded by whitespace and followed
-                // by whitespace, punctuation, or EOF (mirrors server router.ts:parseMentions).
-                let dominated = message.from == self.client.node_name()
-                    || mentions_name(&message.content, self.client.node_name());
-                if dominated {
-                    let is_active = self.active_channel.as_deref() == Some(&channel_id);
-                    if is_active {
-                        let is_agent = self.agents.iter().any(|a| a.name == message.from);
-                        self.channel_view.push(&message, is_agent);
-                    } else {
-                        // Cache message for non-active channel + bump unread
-                        self.channel_view.push_to_channel(&channel_id, &message);
-                        // Update sidebar unread badge
-                        if let Some(ch) = self.channels.iter_mut().find(|c| c.id == channel_id) {
-                            ch.unread = self.channel_view.unread_count(&channel_id);
-                        }
+                let is_active = self.active_channel.as_deref() == Some(&channel_id);
+                if is_active {
+                    let is_agent = self.agents.iter().any(|a| a.name == message.from);
+                    self.channel_view.push(&message, is_agent);
+                } else {
+                    // Cache message for non-active channel + bump unread
+                    self.channel_view.push_to_channel(&channel_id, &message);
+                    // Update sidebar unread badge
+                    if let Some(ch) = self.channels.iter_mut().find(|c| c.id == channel_id) {
+                        ch.unread = self.channel_view.unread_count(&channel_id);
                     }
                 }
             }
