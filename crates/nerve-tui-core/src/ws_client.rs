@@ -448,6 +448,23 @@ fn parse_notification(method: &str, params: Value) -> Option<NerveEvent> {
                 detail: params,
             })
         }
+        "message_snapshot" => {
+            let node_id = params.get("nodeId")?.as_str()?.to_string();
+            let name = params.get("name")?.as_str()?.to_string();
+            let messages_val = params.get("messages")?.clone();
+            let messages: Vec<SnapshotMessage> = match serde_json::from_value(messages_val) {
+                Ok(m) => m,
+                Err(e) => {
+                    warn!("failed to parse message_snapshot messages: {}", e);
+                    return None;
+                }
+            };
+            Some(NerveEvent::MessageSnapshot {
+                node_id,
+                name,
+                messages,
+            })
+        }
         "node.statusChanged" => {
             let node_id = params.get("nodeId")?.as_str()?.to_string();
             let name = params.get("name")?.as_str()?.to_string();
@@ -513,6 +530,58 @@ fn parse_notification(method: &str, params: Value) -> Option<NerveEvent> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn parse_message_snapshot_empty() {
+        let params = json!({
+            "nodeId": "n1",
+            "name": "bob",
+            "messages": []
+        });
+        let evt = parse_notification("message_snapshot", params).unwrap();
+        match evt {
+            NerveEvent::MessageSnapshot {
+                node_id,
+                name,
+                messages,
+            } => {
+                assert_eq!(node_id, "n1");
+                assert_eq!(name, "bob");
+                assert_eq!(messages.len(), 0);
+            }
+            _ => panic!("expected MessageSnapshot"),
+        }
+    }
+
+    #[test]
+    fn parse_message_snapshot_with_messages() {
+        let params = json!({
+            "nodeId": "n1",
+            "name": "bob",
+            "messages": [
+                { "id": "m1", "nodeId": "n1", "role": "user",  "sender": "renjinxi", "text": "hi",    "ts": 1710000000000.0 },
+                { "id": "m2", "nodeId": "n1", "role": "agent", "sender": "bob",      "text": "hello", "ts": 1710000001000.0 }
+            ]
+        });
+        let evt = parse_notification("message_snapshot", params).unwrap();
+        match evt {
+            NerveEvent::MessageSnapshot {
+                node_id,
+                name,
+                messages,
+            } => {
+                assert_eq!(node_id, "n1");
+                assert_eq!(name, "bob");
+                assert_eq!(messages.len(), 2);
+                assert_eq!(messages[0].role, "user");
+                assert_eq!(messages[0].text, "hi");
+                assert_eq!(messages[1].role, "agent");
+                assert_eq!(messages[1].text, "hello");
+                assert_eq!(messages[1].sender, "bob");
+            }
+            _ => panic!("expected MessageSnapshot"),
+        }
+    }
 
     #[test]
     fn parse_channel_message() {

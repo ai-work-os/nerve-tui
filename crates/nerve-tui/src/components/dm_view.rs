@@ -1,7 +1,7 @@
 use crate::theme;
 use crate::components::block_renderer;
 use chrono::Local;
-use nerve_tui_protocol::{ContentBlock, DmMessage, Message, Role, ToolStatus};
+use nerve_tui_protocol::{ContentBlock, DmMessage, Message, Role, SnapshotMessage, ToolStatus};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
@@ -141,6 +141,36 @@ impl DmView {
         } else {
             self.has_new_messages = true;
         }
+    }
+
+    /// Replace the entire DM history with an authoritative snapshot from server.
+    /// Called on subscribe (first time or reconnect resubscribe). Clears local
+    /// messages, streaming state, and history, then batch-pushes the snapshot.
+    pub fn replace_history(&mut self, messages: &[SnapshotMessage]) {
+        debug!(count = messages.len(), "replace_history");
+        self.clear();
+        for m in messages {
+            let role_str = match m.role.as_str() {
+                "user" => "user",
+                "agent" => "assistant",
+                _ => "系统",
+            };
+            let dm_msg = DmMessage {
+                role: role_str.to_string(),
+                content: m.text.clone(),
+                timestamp: m.ts as i64,
+            };
+            let blocks = Message::content_to_blocks(&m.text);
+            self.messages.push(MessageLine {
+                from: dm_msg.role.clone(),
+                content: dm_msg.content.clone(),
+                timestamp: dm_msg.timestamp as f64,
+                blocks,
+            });
+            self.dm_history.push(dm_msg);
+        }
+        self.text_cache = None;
+        self.snap_to_bottom();
     }
 
     pub fn push_system(&mut self, content: &str) {
@@ -612,8 +642,19 @@ fn format_tokens(n: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nerve_tui_protocol::{ContentBlock, DmMessage};
+    use nerve_tui_protocol::{ContentBlock, DmMessage, SnapshotMessage};
     use serde_json::json;
+
+    fn snap(id: &str, role: &str, text: &str, ts: f64) -> SnapshotMessage {
+        SnapshotMessage {
+            id: id.to_string(),
+            node_id: "n1".to_string(),
+            role: role.to_string(),
+            sender: "test".to_string(),
+            text: text.to_string(),
+            ts,
+        }
+    }
 
     fn make_dm(role: &str, content: &str) -> DmMessage {
         DmMessage {
@@ -652,6 +693,45 @@ mod tests {
         dm.push(&make_dm("user", "hello"));
         assert_eq!(dm.messages.len(), 1);
         assert_eq!(dm.messages[0].from, "user");
+    }
+
+    #[test]
+    fn replace_history_empty_clears_view() {
+        let mut dm = DmView::new("alice");
+        dm.push(&make_dm("user", "stale"));
+        dm.push(&make_dm("assistant", "stale reply"));
+        assert_eq!(dm.messages.len(), 2);
+        dm.replace_history(&[]);
+        assert_eq!(dm.messages.len(), 0);
+        assert_eq!(dm.dm_history.len(), 0);
+        assert!(dm.streaming_messages.is_empty());
+    }
+
+    #[test]
+    fn replace_history_populates_from_snapshot() {
+        let mut dm = DmView::new("alice");
+        let snapshot = vec![
+            snap("1", "user", "hi", 1000.0),
+            snap("2", "agent", "hello there", 2000.0),
+        ];
+        dm.replace_history(&snapshot);
+        assert_eq!(dm.messages.len(), 2);
+        assert_eq!(dm.messages[0].from, "user");
+        assert_eq!(dm.messages[0].content, "hi");
+        // role "agent" is rendered as "assistant" locally
+        assert_eq!(dm.messages[1].from, "assistant");
+        assert_eq!(dm.messages[1].content, "hello there");
+        assert_eq!(dm.dm_history.len(), 2);
+    }
+
+    #[test]
+    fn replace_history_discards_stale_streaming() {
+        let mut dm = DmView::new("alice");
+        dm.start_streaming_message("alice");
+        assert!(dm.streaming_messages.contains_key("alice"));
+        dm.replace_history(&[snap("1", "agent", "done", 1000.0)]);
+        assert!(dm.streaming_messages.is_empty());
+        assert_eq!(dm.messages.len(), 1);
     }
 
     #[test]
