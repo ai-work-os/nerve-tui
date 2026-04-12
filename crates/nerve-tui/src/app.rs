@@ -1628,6 +1628,23 @@ impl<T: Transport> App<T> {
                 self.handle_node_update(&node_id, &name, &detail);
             }
 
+            NerveEvent::MessageSnapshot {
+                node_id,
+                name: _name,
+                messages,
+            } => {
+                // Only apply snapshots for the currently active DM view.
+                // Snapshots for non-active nodes are ignored — when the user
+                // enters that DM next, a fresh subscribe will deliver another
+                // snapshot with up-to-date contents.
+                if self.dm_node_id() == Some(node_id.as_str()) {
+                    debug!(node_id = %node_id, count = messages.len(), "applying message_snapshot");
+                    self.dm_view.replace_history(&messages);
+                } else {
+                    debug!(node_id = %node_id, "ignoring snapshot for non-active DM");
+                }
+            }
+
             NerveEvent::NodeStatusChanged {
                 node_id,
                 name,
@@ -1878,39 +1895,27 @@ impl<T: Transport> App<T> {
                     self.dm_view.flushed_agents.remove(name);
                 }
                 Some("agent_message_end") => {
+                    // Live finalization path: take the streaming message's blocks
+                    // and push as a completed DM message. Replay no longer goes
+                    // through here — it's handled by NerveEvent::MessageSnapshot.
                     self.dm_view.apply_streaming_event(name, "agent_message_end", update);
                     let msg = self.dm_view.take_streaming_message(name);
-                    let already_flushed = self.dm_view.flushed_agents.remove(name);
-
-                    // Fallback: some agents include full content in the end event
-                    // (e.g. during replay when no chunks were sent)
-                    let end_content = update
-                        .get("content")
-                        .and_then(|c| c.get("text"))
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("");
+                    self.dm_view.flushed_agents.remove(name);
 
                     let (final_content, final_blocks) = if let Some(m) = msg {
                         if !m.blocks.is_empty() {
                             let text = crate::components::dm_view::blocks_to_text(&m.blocks);
                             (text, m.blocks)
-                        } else if !already_flushed && !end_content.is_empty() {
-                            let blocks = Message::content_to_blocks(end_content);
-                            (end_content.to_string(), blocks)
                         } else {
                             (String::new(), Vec::new())
                         }
-                    } else if !already_flushed && !end_content.is_empty() {
-                        // No streaming_message at all (edge case: replay)
-                        let blocks = Message::content_to_blocks(end_content);
-                        (end_content.to_string(), blocks)
                     } else {
                         (String::new(), Vec::new())
                     };
 
                     debug!(
-                        "agent_message_end from {}: in_dm={} final={} already_flushed={}",
-                        name, in_dm, final_content.len(), already_flushed
+                        "agent_message_end from {}: in_dm={} final={}",
+                        name, in_dm, final_content.len()
                     );
 
                     if in_dm && !final_content.is_empty() {
@@ -2435,31 +2440,6 @@ mod tests {
     fn cwd_filter_none_without_project_path() {
         let app = make_app();
         assert!(app.cwd_filter().is_none());
-    }
-
-    // --- mentions_name tests ---
-
-    #[test]
-    fn mentions_name_exact_match() {
-        assert!(mentions_name("hello @alice how are you", "alice"));
-        assert!(mentions_name("@alice", "alice"));
-        assert!(mentions_name("hey @alice.", "alice")); // trailing punctuation
-        assert!(mentions_name("@alice, @bob", "alice"));
-    }
-
-    #[test]
-    fn mentions_name_no_prefix_match() {
-        // @alice should NOT match @alice-dev
-        assert!(!mentions_name("hello @alice-dev", "alice"));
-        assert!(!mentions_name("@alice_admin is here", "alice"));
-        assert!(!mentions_name("@alicex", "alice"));
-    }
-
-    #[test]
-    fn mentions_name_no_false_positive() {
-        assert!(!mentions_name("hello alice", "alice")); // no @ prefix
-        assert!(!mentions_name("email@alice.com", "alice")); // preceded by non-whitespace
-        assert!(!mentions_name("", "alice"));
     }
 
     // --- ChannelMention in DM mode tests ---

@@ -96,6 +96,19 @@ pub struct MessageInfo {
     pub metadata: Option<Value>,
 }
 
+/// Assembled DM message delivered via `message_snapshot` notification.
+/// Mirror of server-side `Message` type in nerve/src/protocol.ts.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct SnapshotMessage {
+    pub id: String,
+    pub node_id: String,
+    pub role: String, // "user" | "agent" | "system"
+    pub sender: String,
+    pub text: String,
+    pub ts: f64,
+}
+
 // --- WS Notifications ---
 
 #[derive(Debug, Clone)]
@@ -127,6 +140,13 @@ pub enum NerveEvent {
         node_id: String,
         name: String,
         detail: Value,
+    },
+    /// Full assembled DM history — sent on subscribe (and resubscribe).
+    /// Replaces the client's local DM view for this node.
+    MessageSnapshot {
+        node_id: String,
+        name: String,
+        messages: Vec<SnapshotMessage>,
     },
     /// Agent status changed
     NodeStatusChanged {
@@ -169,6 +189,7 @@ impl NerveEvent {
             NerveEvent::NodeJoined { .. } => "NodeJoined",
             NerveEvent::NodeLeft { .. } => "NodeLeft",
             NerveEvent::NodeUpdate { .. } => "NodeUpdate",
+            NerveEvent::MessageSnapshot { .. } => "MessageSnapshot",
             NerveEvent::NodeStatusChanged { .. } => "NodeStatusChanged",
             NerveEvent::ChannelCreated { .. } => "ChannelCreated",
             NerveEvent::ChannelClosed { .. } => "ChannelClosed",
