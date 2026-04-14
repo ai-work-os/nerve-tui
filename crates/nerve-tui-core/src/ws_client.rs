@@ -113,7 +113,8 @@ impl NerveClient {
                 json!({
                     "name": name,
                     "capabilities": ["ui"],
-                    "permissions": "operator"
+                    "permissions": "operator",
+                    "platform": "tui"
                 }),
             )
             .await?;
