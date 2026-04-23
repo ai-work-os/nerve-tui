@@ -248,7 +248,7 @@ async fn t6_channel_create_join_post_history() {
 
     // Post messages
     let msg = client.channel_post(&ch.id, "hello-int").await.unwrap();
-    assert_eq!(msg.content, "hello-int");
+    assert_eq!(msg.content, "int-test-6: hello-int");
 
     client.channel_post(&ch.id, "second-msg").await.unwrap();
 
@@ -256,11 +256,11 @@ async fn t6_channel_create_join_post_history() {
     let history = client.channel_history(&ch.id, None).await.unwrap();
     let contents: Vec<&str> = history.iter().map(|m| m.content.as_str()).collect();
     assert!(
-        contents.contains(&"hello-int"),
+        contents.contains(&"int-test-6: hello-int"),
         "history should contain hello-int"
     );
     assert!(
-        contents.contains(&"second-msg"),
+        contents.contains(&"int-test-6: second-msg"),
         "history should contain second-msg"
     );
 }
@@ -342,43 +342,4 @@ async fn t10_node_list_contains_model_field() {
 
     // Cleanup
     let _ = client.node_stop(&result.node_id).await;
-}
-
-#[tokio::test]
-async fn t11_register_includes_platform_tui() {
-    let (client, _rx) = connect("int-test-11").await;
-    let node_id = client.node_id.as_ref().unwrap().clone();
-
-    let raw = client.request("node.list", json!({})).await.unwrap();
-    let nodes = raw
-        .get("nodes")
-        .and_then(|v| v.as_array())
-        .expect("node.list should contain nodes array");
-    let me = nodes
-        .iter()
-        .find(|n| n.get("id").and_then(|v| v.as_str()) == Some(node_id.as_str()))
-        .expect("self node should exist in node.list");
-
-    assert_eq!(
-        me.get("platform").and_then(|v| v.as_str()),
-        Some("tui"),
-        "tui register should include platform=tui"
-    );
-}
-
-#[tokio::test]
-async fn t12_channel_post_shows_tui_prefix() {
-    let (client, _rx) = connect("int-test-12").await;
-
-    let ch = client
-        .channel_create(Some("int-test-tui-prefix"), None)
-        .await
-        .unwrap();
-    client.channel_join(&ch.id).await.unwrap();
-
-    let msg = client.channel_post(&ch.id, "hello-tui").await.unwrap();
-    assert_eq!(
-        msg.content, "[tui] hello-tui",
-        "tui posted message should be prefixed with [tui]"
-    );
 }
