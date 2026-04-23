@@ -113,8 +113,7 @@ impl NerveClient {
                 json!({
                     "name": name,
                     "capabilities": ["ui"],
-                    "permissions": "operator",
-                    "platform": "tui"
+                    "permissions": "operator"
                 }),
             )
             .await?;
@@ -198,10 +197,11 @@ impl NerveClient {
     }
 
     pub async fn channel_post(&self, channel_id: &str, content: &str) -> Result<MessageInfo> {
+        let tagged = format!("{}: {}", self.node_name, content);
         let r = self
             .request(
                 "channel.post",
-                json!({ "channelId": channel_id, "content": content }),
+                json!({ "channelId": channel_id, "content": tagged }),
             )
             .await?;
         let msg: MessageInfo =
@@ -269,6 +269,7 @@ impl NerveClient {
     }
 
     pub async fn node_prompt(&self, node_id: &str, content: &str) -> Result<PromptResult> {
+        let tagged = format!("{}: {}", self.node_name, content);
         debug!(
             node_id,
             content_len = content.len(),
@@ -277,13 +278,14 @@ impl NerveClient {
         let r = self
             .request(
                 "node.prompt",
-                json!({ "nodeId": node_id, "content": content }),
+                json!({ "nodeId": node_id, "content": tagged }),
             )
             .await?;
         Ok(serde_json::from_value(r)?)
     }
 
     pub async fn node_message(&self, node_id: &str, content: &str) -> Result<()> {
+        let tagged = format!("{}: {}", self.node_name, content);
         debug!(
             node_id,
             content_len = content.len(),
@@ -291,7 +293,7 @@ impl NerveClient {
         );
         self.request(
             "node.message",
-            json!({ "nodeId": node_id, "content": content }),
+            json!({ "nodeId": node_id, "content": tagged }),
         )
         .await?;
         Ok(())
