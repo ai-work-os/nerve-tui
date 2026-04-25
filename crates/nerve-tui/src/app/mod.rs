@@ -1793,15 +1793,18 @@ mod tests {
     }
 
     #[test]
-    fn render_empty_channel_shows_messages_border() {
+    fn render_empty_channel_fills_l0_background() {
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).unwrap();
         let mut app = make_app();
 
         terminal.draw(|f| app.render(f)).unwrap();
 
-        let text = buffer_text(terminal.backend().buffer());
-        assert!(text.contains("Messages"), "buffer should contain 'Messages' title");
+        // Channel view area should be filled with BG_L0 (no border, no title)
+        let buf = terminal.backend().buffer();
+        // Pick a cell in the middle of the message area (right of sidebar)
+        let cell = buf.cell((40, 5)).unwrap();
+        assert_eq!(cell.bg, crate::theme::BG_L0, "channel view should fill with BG_L0 background");
     }
 
     #[test]
@@ -1871,34 +1874,34 @@ mod tests {
         let mut terminal_visible = Terminal::new(backend).unwrap();
         let mut app_visible = make_app();
         app_visible.sidebar_visible = true;
+        app_visible.channel_view.push_system("sidebar-test-marker");
         terminal_visible.draw(|f| app_visible.render(f)).unwrap();
 
         let backend2 = TestBackend::new(80, 24);
         let mut terminal_hidden = Terminal::new(backend2).unwrap();
         let mut app_hidden = make_app();
         app_hidden.sidebar_visible = false;
+        app_hidden.channel_view.push_system("sidebar-test-marker");
         terminal_hidden.draw(|f| app_hidden.render(f)).unwrap();
 
         let buf_visible = terminal_visible.backend().buffer();
         let buf_hidden = terminal_hidden.backend().buffer();
 
-        let find_messages_x = |buf: &ratatui::buffer::Buffer| -> Option<u16> {
+        // Find first x position of BG_L0 on a middle row (message area start)
+        let find_l0_start = |buf: &ratatui::buffer::Buffer| -> Option<u16> {
             let area = buf.area;
-            for y in area.y..area.y + area.height {
-                let mut row = String::new();
-                for x in area.x..area.x + area.width {
-                    row.push_str(buf[(x, y)].symbol());
-                }
-                if let Some(pos) = row.find("Messages") {
-                    return Some(pos as u16);
+            let mid_y = area.y + area.height / 2;
+            for x in area.x..area.x + area.width {
+                if buf.cell((x, mid_y)).unwrap().bg == crate::theme::BG_L0 {
+                    return Some(x);
                 }
             }
             None
         };
 
-        let x_visible = find_messages_x(buf_visible).expect("Messages title with sidebar");
-        let x_hidden = find_messages_x(buf_hidden).expect("Messages title without sidebar");
-        assert!(x_hidden < x_visible, "Messages should start further left when sidebar is hidden (hidden={}, visible={})", x_hidden, x_visible);
+        let x_visible = find_l0_start(buf_visible).expect("BG_L0 area with sidebar");
+        let x_hidden = find_l0_start(buf_hidden).expect("BG_L0 area without sidebar");
+        assert!(x_hidden < x_visible, "Message area should start further left when sidebar is hidden (hidden={}, visible={})", x_hidden, x_visible);
     }
 
     #[test]
