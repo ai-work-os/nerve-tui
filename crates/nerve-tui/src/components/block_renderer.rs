@@ -1545,4 +1545,112 @@ mod tests {
         let result = sanitize_content(input);
         assert_eq!(result, "Just normal text with no XML tags");
     }
+
+    // --- extract_tool_summary tests ---
+
+    #[test]
+    fn tool_summary_bash_extracts_command() {
+        let input = r#"{"command": "ls -la /tmp"}"#;
+        let result = extract_tool_summary("Bash", input);
+        assert_eq!(result, "ls -la /tmp");
+    }
+
+    #[test]
+    fn tool_summary_bash_truncates_long_command() {
+        let long_cmd = "a".repeat(100);
+        let input = format!(r#"{{"command": "{}"}}"#, long_cmd);
+        let result = extract_tool_summary("Bash", &input);
+        assert_eq!(result.len(), 63); // 60 chars + "..."
+        assert!(result.ends_with("..."));
+    }
+
+    #[test]
+    fn tool_summary_read_extracts_file_path() {
+        let input = r#"{"file_path": "/src/main.rs"}"#;
+        let result = extract_tool_summary("Read", input);
+        assert_eq!(result, "/src/main.rs");
+    }
+
+    #[test]
+    fn tool_summary_read_with_offset_and_limit() {
+        let input = r#"{"file_path": "/src/main.rs", "offset": 10, "limit": 50}"#;
+        let result = extract_tool_summary("Read", input);
+        assert_eq!(result, "/src/main.rs (10-60)");
+    }
+
+    #[test]
+    fn tool_summary_read_with_offset_only() {
+        let input = r#"{"file_path": "/src/main.rs", "offset": 10}"#;
+        let result = extract_tool_summary("Read", input);
+        assert_eq!(result, "/src/main.rs (10-)");
+    }
+
+    #[test]
+    fn tool_summary_edit_extracts_file_path() {
+        let input = r#"{"file_path": "/src/theme.rs", "old_string": "foo", "new_string": "bar"}"#;
+        let result = extract_tool_summary("Edit", input);
+        assert_eq!(result, "/src/theme.rs");
+    }
+
+    #[test]
+    fn tool_summary_write_extracts_file_path() {
+        let input = r#"{"file_path": "/src/main.rs", "content": "fn main() {}"}"#;
+        let result = extract_tool_summary("Write", input);
+        assert_eq!(result, "/src/main.rs");
+    }
+
+    #[test]
+    fn tool_summary_websearch_extracts_query() {
+        let input = r#"{"query": "ratatui background color"}"#;
+        let result = extract_tool_summary("WebSearch", input);
+        assert_eq!(result, "ratatui background color");
+    }
+
+    #[test]
+    fn tool_summary_webfetch_extracts_url() {
+        let input = r#"{"url": "https://example.com/page"}"#;
+        let result = extract_tool_summary("WebFetch", input);
+        assert_eq!(result, "https://example.com/page");
+    }
+
+    #[test]
+    fn tool_summary_agent_extracts_description() {
+        let input = r#"{"description": "Explore code structure"}"#;
+        let result = extract_tool_summary("Agent", input);
+        assert_eq!(result, "Explore code structure");
+    }
+
+    #[test]
+    fn tool_summary_unknown_tool_truncates_raw() {
+        let input = r#"{"key": "value", "another": "field"}"#;
+        let result = extract_tool_summary("UnknownTool", input);
+        assert!(result.len() <= 43); // 40 + "..."
+    }
+
+    #[test]
+    fn tool_summary_missing_field_fallback() {
+        let input = r#"{"other_field": "value"}"#;
+        let result = extract_tool_summary("Bash", input);
+        // Falls back to truncated raw input
+        assert!(result.len() <= 43);
+    }
+
+    #[test]
+    fn tool_summary_non_json_input() {
+        let input = "just plain text input";
+        let result = extract_tool_summary("Bash", input);
+        assert_eq!(result, "just plain text input");
+    }
+
+    #[test]
+    fn tool_summary_empty_input() {
+        let result = extract_tool_summary("Bash", "");
+        assert_eq!(result, "");
+    }
+
+    #[test]
+    fn tool_summary_empty_json() {
+        let result = extract_tool_summary("Bash", "{}");
+        assert!(result.len() <= 43);
+    }
 }
