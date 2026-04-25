@@ -187,12 +187,6 @@ fn render_text(content: &str, _width: u16) -> Vec<Line<'static>> {
     out
 }
 
-fn render_text_summary(content: &str, _width: u16) -> Vec<Line<'static>> {
-    let mut out = Vec::new();
-    let cleaned = sanitize_content(content);
-    render_markdown(&cleaned, &mut out, true);
-    out
-}
 
 fn render_markdown(content: &str, out: &mut Vec<Line<'static>>, skip_code_blocks: bool) {
     let opts = Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TABLES;
