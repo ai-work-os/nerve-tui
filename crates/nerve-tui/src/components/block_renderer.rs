@@ -36,6 +36,11 @@ static CODE_THEME: LazyLock<Theme> = LazyLock::new(|| {
         .unwrap_or_else(|| ts.themes["base16-ocean.dark"].clone())
 });
 
+/// Maximum lines to show in collapsed tool results.
+const TOOL_RESULT_MAX_LINES: usize = 10;
+/// Maximum lines to show in expanded tool results.
+const TOOL_RESULT_EXPANDED_MAX: usize = 50;
+
 /// Strip known system XML tags and their content from text.
 /// Two passes: first remove paired tags with content, then orphan opening/closing tags.
 fn sanitize_content(text: &str) -> String {
@@ -467,7 +472,7 @@ fn highlight_code(code: &str, lang: &str) -> Vec<Line<'static>> {
     if !lang.is_empty() {
         lines.push(Line::from(Span::styled(
             lang.to_string(),
-            Style::default().fg(theme::TEXT_MUTED),
+            Style::default().fg(theme::TEXT_MUTED).bg(theme::BG_L1),
         )));
     }
 
@@ -488,7 +493,7 @@ fn highlight_code(code: &str, lang: &str) -> Vec<Line<'static>> {
             Err(_) => {
                 lines.push(Line::from(Span::styled(
                     line.to_string(),
-                    Style::default().fg(theme::TEXT_MUTED),
+                    Style::default().fg(theme::TEXT_MUTED).bg(theme::BG_L1),
                 )));
             }
         }
@@ -499,7 +504,7 @@ fn highlight_code(code: &str, lang: &str) -> Vec<Line<'static>> {
 
 fn syntect_style_to_ratatui(syn: SynStyle) -> Style {
     let fg = Color::Rgb(syn.foreground.r, syn.foreground.g, syn.foreground.b);
-    Style::default().fg(fg)
+    Style::default().fg(fg).bg(theme::BG_L1)
 }
 
 // ---------------------------------------------------------------------------
@@ -549,8 +554,81 @@ fn render_tool_call(name: &str, input: &str, status: &ToolStatus, collapsed: boo
 
     debug!(tool_name = name, ?status, collapsed, "rendering tool_call block");
 
-    // Header: icon + tool name
-    lines.push(Line::from(vec![
+    if collapsed {
+        // Compact one-line: icon + name + ": " + summary
+        let summary = extract_tool_summary(name, input);
+        let mut spans = vec![
+            Span::styled(format!("  {} ", icon), Style::default().fg(icon_color)),
+            Span::styled(
+                name.to_string(),
+                Style::default()
+                    .fg(theme::TOOL_NAME)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ];
+        if !summary.is_empty() {
+            spans.push(Span::styled(
+                format!(": {}", summary),
+                Style::default().fg(theme::TOOL_VALUE),
+            ));
+        }
+        lines.push(Line::from(spans));
+    } else {
+        // Header: icon + tool name
+        lines.push(Line::from(vec![
+            Span::styled(format!("  {} ", icon), Style::default().fg(icon_color)),
+            Span::styled(
+                name.to_string(),
+                Style::default()
+                    .fg(theme::TOOL_NAME)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]));
+
+        // Show input args when expanded
+        if !input.is_empty() {
+            if let Ok(val) = serde_json::from_str::<serde_json::Value>(input) {
+                if let Some(obj) = val.as_object() {
+                    for (k, v) in obj {
+                        let v_str = match v {
+                            serde_json::Value::String(s) => s.clone(),
+                            _ => v.to_string(),
+                        };
+                        lines.push(Line::from(vec![
+                            Span::styled(
+                                format!("    {}: ", k),
+                                Style::default().fg(theme::TOOL_KEY),
+                            ),
+                            Span::styled(v_str, Style::default().fg(theme::TOOL_VALUE)),
+                        ]));
+                    }
+                }
+            } else {
+                // Plain string input
+                for line in input.lines() {
+                    lines.push(Line::from(Span::styled(
+                        format!("    {}", line),
+                        Style::default().fg(theme::TOOL_VALUE),
+                    )));
+                }
+            }
+        }
+    }
+
+    lines
+}
+
+/// Render a ToolCall as a single summary line (for summary_mode).
+fn render_tool_call_summary(name: &str, input: &str, status: &ToolStatus) -> Vec<Line<'static>> {
+    let (icon, icon_color) = match status {
+        ToolStatus::Pending => ("⏳", theme::WARNING),
+        ToolStatus::Running => ("⏳", theme::SUCCESS),
+        ToolStatus::Completed => ("✓", theme::SUCCESS),
+        ToolStatus::Failed => ("✗", theme::ERROR),
+    };
+
+    let summary = extract_tool_summary(name, input);
+    let mut spans = vec![
         Span::styled(format!("  {} ", icon), Style::default().fg(icon_color)),
         Span::styled(
             name.to_string(),
@@ -558,38 +636,15 @@ fn render_tool_call(name: &str, input: &str, status: &ToolStatus, collapsed: boo
                 .fg(theme::TOOL_NAME)
                 .add_modifier(Modifier::BOLD),
         ),
-    ]));
-
-    // Show input args only when expanded
-    if !collapsed && !input.is_empty() {
-        if let Ok(val) = serde_json::from_str::<serde_json::Value>(input) {
-            if let Some(obj) = val.as_object() {
-                for (k, v) in obj {
-                    let v_str = match v {
-                        serde_json::Value::String(s) => s.clone(),
-                        _ => v.to_string(),
-                    };
-                    lines.push(Line::from(vec![
-                        Span::styled(
-                            format!("    {}: ", k),
-                            Style::default().fg(theme::TOOL_KEY),
-                        ),
-                        Span::styled(v_str, Style::default().fg(theme::TOOL_VALUE)),
-                    ]));
-                }
-            }
-        } else {
-            // Plain string input
-            for line in input.lines() {
-                lines.push(Line::from(Span::styled(
-                    format!("    {}", line),
-                    Style::default().fg(theme::TOOL_VALUE),
-                )));
-            }
-        }
+    ];
+    if !summary.is_empty() {
+        spans.push(Span::styled(
+            format!(": {}", summary),
+            Style::default().fg(theme::TOOL_VALUE),
+        ));
     }
 
-    lines
+    vec![Line::from(spans)]
 }
 
 // ---------------------------------------------------------------------------
@@ -604,7 +659,7 @@ fn render_tool_result(content: &str, is_error: bool, collapsed: bool) -> Vec<Lin
 
     let (label, label_color) = if is_error {
         ("  ✗ 结果（错误）".to_string(), theme::ERROR)
-    } else if collapsed && line_count > 3 {
+    } else if line_count > TOOL_RESULT_MAX_LINES {
         (format!("  ✓ 结果 ({} 行)", line_count), theme::TEXT_MUTED)
     } else {
         ("  ✓ 结果".to_string(), theme::TEXT_MUTED)
@@ -621,17 +676,47 @@ fn render_tool_result(content: &str, is_error: bool, collapsed: bool) -> Vec<Lin
         theme::TEXT
     };
 
-    if collapsed {
-        // Show first 3 lines when collapsed
-        let show_count = line_count.min(3);
-        for line in &content_lines[..show_count] {
+    // Error content is never truncated
+    if is_error {
+        for line in content.lines() {
+            lines.push(Line::from(Span::styled(
+                format!("    {}", line),
+                Style::default().fg(content_color),
+            )));
+        }
+        return lines;
+    }
+
+    let (max_lines, head_count, tail_count) = if collapsed {
+        (TOOL_RESULT_MAX_LINES, 5usize, 2usize)
+    } else {
+        (TOOL_RESULT_EXPANDED_MAX, 25usize, 5usize)
+    };
+
+    if line_count <= max_lines {
+        // Show all lines
+        for line in &content_lines {
             lines.push(Line::from(Span::styled(
                 format!("    {}", line),
                 Style::default().fg(content_color),
             )));
         }
     } else {
-        for line in content.lines() {
+        // Head
+        for line in &content_lines[..head_count] {
+            lines.push(Line::from(Span::styled(
+                format!("    {}", line),
+                Style::default().fg(content_color),
+            )));
+        }
+        // Ellipsis
+        let hidden = line_count - head_count - tail_count;
+        lines.push(Line::from(Span::styled(
+            format!("    \u{2026} +{} lines", hidden),
+            Style::default().fg(theme::TEXT_MUTED),
+        )));
+        // Tail
+        for line in &content_lines[line_count - tail_count..] {
             lines.push(Line::from(Span::styled(
                 format!("    {}", line),
                 Style::default().fg(content_color),
@@ -1273,13 +1358,13 @@ mod tests {
 
     #[test]
     fn tool_call_collapsed_shows_header_only() {
-        let input = r#"{"path": "/tmp/test.rs", "content": "fn main() {}"}"#;
+        let input = r#"{"file_path": "/tmp/test.rs", "content": "fn main() {}"}"#;
         let lines = render_tool_call("Write", input, &ToolStatus::Completed, true);
-        // Collapsed: only header line (icon + name), no args
+        // Collapsed: one line with summary (file_path)
         assert_eq!(lines.len(), 1);
         let text = lines_to_text(&lines);
         assert!(text.contains("Write"));
-        assert!(!text.contains("path"));
+        assert!(text.contains("/tmp/test.rs"), "collapsed should show file path summary");
     }
 
     #[test]
@@ -1293,16 +1378,80 @@ mod tests {
     }
 
     #[test]
-    fn tool_result_collapsed_shows_first_3_lines() {
+    fn tool_result_collapsed_shows_truncated() {
         let content = (0..10).map(|i| format!("line {}", i)).collect::<Vec<_>>().join("\n");
         let lines = render_tool_result(&content, false, true);
-        // Collapsed: header + 3 content lines = 4
-        assert_eq!(lines.len(), 4);
+        // 10 lines == TOOL_RESULT_MAX_LINES, show all: header + 10 = 11
+        assert_eq!(lines.len(), 11);
         let text = lines_to_text(&lines);
         assert!(text.contains("line 0"));
-        assert!(text.contains("line 2"));
-        assert!(!text.contains("line 3"));
-        assert!(text.contains("10 行")); // line count in header
+        assert!(text.contains("line 9"));
+    }
+
+    // --- ToolResult truncation tests ---
+
+    #[test]
+    fn tool_result_short_content_unchanged_collapsed() {
+        let content = (0..5).map(|i| format!("line {}", i)).collect::<Vec<_>>().join("\n");
+        let lines = render_tool_result(&content, false, true);
+        let text = lines_to_text(&lines);
+        assert!(text.contains("line 0"));
+        assert!(text.contains("line 4"));
+        assert!(!text.contains("\u{2026}"), "short content should not be truncated");
+    }
+
+    #[test]
+    fn tool_result_long_content_truncated_collapsed() {
+        let content = (0..20).map(|i| format!("line {}", i)).collect::<Vec<_>>().join("\n");
+        let lines = render_tool_result(&content, false, true);
+        let text = lines_to_text(&lines);
+        assert!(text.contains("line 0"));
+        assert!(text.contains("line 4"));
+        assert!(!text.contains("line 5\n") && !text.contains("line 5 ") && !text.contains("    line 5"));
+        assert!(text.contains("\u{2026}"));
+        assert!(text.contains("line 18"));
+        assert!(text.contains("line 19"));
+    }
+
+    #[test]
+    fn tool_result_long_content_truncated_expanded() {
+        let content = (0..100).map(|i| format!("line {}", i)).collect::<Vec<_>>().join("\n");
+        let lines = render_tool_result(&content, false, false);
+        let text = lines_to_text(&lines);
+        assert!(text.contains("line 0"));
+        assert!(text.contains("line 24"));
+        assert!(text.contains("\u{2026}"));
+        assert!(text.contains("line 95"));
+        assert!(text.contains("line 99"));
+    }
+
+    #[test]
+    fn tool_result_expanded_short_no_truncation() {
+        let content = (0..30).map(|i| format!("line {}", i)).collect::<Vec<_>>().join("\n");
+        let lines = render_tool_result(&content, false, false);
+        let text = lines_to_text(&lines);
+        assert!(text.contains("line 0"));
+        assert!(text.contains("line 29"));
+        assert!(!text.contains("\u{2026}"), "30 lines should not be truncated in expanded mode");
+    }
+
+    #[test]
+    fn tool_result_error_not_truncated() {
+        let content = (0..100).map(|i| format!("error line {}", i)).collect::<Vec<_>>().join("\n");
+        let lines = render_tool_result(&content, true, false);
+        let text = lines_to_text(&lines);
+        assert!(text.contains("error line 0"));
+        assert!(text.contains("error line 99"));
+        assert!(!text.contains("\u{2026}"), "error content should not be truncated");
+    }
+
+    #[test]
+    fn tool_result_truncation_ellipsis_shows_count() {
+        let content = (0..100).map(|i| format!("line {}", i)).collect::<Vec<_>>().join("\n");
+        let lines = render_tool_result(&content, false, true);
+        let text = lines_to_text(&lines);
+        // Collapsed: 100 lines, show 5 head + 2 tail = 7 shown, 93 hidden
+        assert!(text.contains("+93 lines"), "ellipsis should show hidden line count, got: {}", text);
     }
 
     #[test]
@@ -1653,4 +1802,102 @@ mod tests {
         let result = extract_tool_summary("Bash", "{}");
         assert!(result.len() <= 43);
     }
+
+    // --- Code block background tests ---
+
+    #[test]
+    fn code_block_spans_have_bg_color() {
+        let lines = highlight_code("let x = 1;", "rust");
+        // Skip the language label line (index 0), check code lines
+        for line in &lines[1..] {
+            for span in &line.spans {
+                assert_eq!(
+                    span.style.bg,
+                    Some(theme::BG_L1),
+                    "code span '{}' should have BG_L1 background",
+                    span.content
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn code_block_lang_label_has_bg_color() {
+        let lines = highlight_code("x = 1", "python");
+        // First line is the language label
+        assert!(!lines.is_empty());
+        let label_line = &lines[0];
+        for span in &label_line.spans {
+            assert_eq!(
+                span.style.bg,
+                Some(theme::BG_L1),
+                "language label span should have BG_L1 background"
+            );
+        }
+    }
+
+    #[test]
+    fn code_block_no_lang_has_bg_color() {
+        let lines = highlight_code("plain code", "");
+        // No language label, just code
+        assert!(!lines.is_empty());
+        for line in &lines {
+            for span in &line.spans {
+                assert_eq!(
+                    span.style.bg,
+                    Some(theme::BG_L1),
+                    "code span '{}' should have BG_L1 background even without lang",
+                    span.content
+                );
+            }
+        }
+    }
+    // --- ToolCall compact rendering tests ---
+
+    #[test]
+    fn tool_call_collapsed_shows_summary() {
+        let input = r#"{"command": "ls -la"}"#;
+        let lines = render_tool_call("Bash", input, &ToolStatus::Running, true);
+        assert_eq!(lines.len(), 1);
+        let text = lines_to_text(&lines);
+        assert!(text.contains("Bash"), "should contain tool name");
+        assert!(text.contains("ls -la"), "collapsed should show command summary");
+    }
+
+    #[test]
+    fn tool_call_expanded_still_shows_full_args() {
+        let input = r#"{"command": "ls -la", "description": "list files"}"#;
+        let lines = render_tool_call("Bash", input, &ToolStatus::Completed, false);
+        // Expanded: header + 2 args
+        assert!(lines.len() >= 3);
+        let text = lines_to_text(&lines);
+        assert!(text.contains("command:"));
+        assert!(text.contains("description:"));
+    }
+
+    #[test]
+    fn tool_call_summary_renders_one_line() {
+        let lines = render_tool_call_summary("Edit", r#"{"file_path": "/src/theme.rs"}"#, &ToolStatus::Completed);
+        assert_eq!(lines.len(), 1);
+        let text = lines_to_text(&lines);
+        assert!(text.contains("✓"));
+        assert!(text.contains("Edit"));
+        assert!(text.contains("/src/theme.rs"));
+    }
+
+    #[test]
+    fn tool_call_summary_pending_icon() {
+        let lines = render_tool_call_summary("Bash", r#"{"command": "cargo test"}"#, &ToolStatus::Pending);
+        let text = lines_to_text(&lines);
+        assert!(text.contains("⏳"));
+        assert!(text.contains("cargo test"));
+    }
+
+    #[test]
+    fn tool_call_summary_failed_icon() {
+        let lines = render_tool_call_summary("Bash", r#"{"command": "false"}"#, &ToolStatus::Failed);
+        let text = lines_to_text(&lines);
+        assert!(text.contains("✗"));
+    }
+
 }
