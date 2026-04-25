@@ -6,7 +6,7 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Widget, Wrap};
+use ratatui::widgets::{Paragraph, Widget, Wrap};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use tracing::debug;
@@ -319,46 +319,27 @@ impl DmView {
     // --- Rendering ---
 
     pub fn render(&mut self, area: Rect, buf: &mut Buffer) {
-        let title = format!(" 与 {} 的对话 ", self.agent_name);
-
-        let mut block = Block::default()
-            .borders(Borders::LEFT)
-            .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(theme::BORDER))
-            .title(title)
-            .title_style(Style::default().fg(theme::BORDER));
-
-        // Right-aligned top: model label + usage (e.g. "opus[1m] / 200k  50K/100K 50% $1.23")
-        let mut right_spans: Vec<Span> = Vec::new();
-        if let Some(ref model) = self.model_label {
-            right_spans.push(Span::styled(
-                format!(" {} ", model),
-                Style::default().fg(theme::BORDER),
-            ));
-        }
-        if let Some(ref label) = self.usage_label {
-            let color = if self.usage_ratio >= 0.9 {
-                Color::Red
-            } else if self.usage_ratio >= 0.8 {
-                Color::Yellow
-            } else {
-                theme::BORDER
-            };
-            right_spans.push(Span::styled(
-                format!(" {} ", label),
-                Style::default().fg(color),
-            ));
-        }
-        if !right_spans.is_empty() {
-            block = block.title_top(Line::from(right_spans).alignment(ratatui::layout::Alignment::Right));
+        // Fill with L0 background
+        for y in area.y..area.y + area.height {
+            for x in area.x..area.x + area.width {
+                if let Some(cell) = buf.cell_mut((x, y)) {
+                    cell.set_bg(theme::BG_L0);
+                }
+            }
         }
 
-        let inner = block.inner(area);
+        // Inner area: 2-char left/right padding
+        let inner = Rect {
+            x: area.x + 2,
+            y: area.y,
+            width: area.width.saturating_sub(4),
+            height: area.height,
+        };
         self.visible_height = inner.height;
-        block.render(area, buf);
 
         let text_lines = self.build_text(inner.width);
         let para = Paragraph::new(text_lines)
+            .style(Style::default().bg(theme::BG_L0))
             .wrap(Wrap { trim: false });
         let total_visual = (para.line_count(inner.width) as u32).min(u16::MAX as u32) as u16;
         let max_offset = total_visual.saturating_sub(self.visible_height);
@@ -386,7 +367,7 @@ impl DmView {
                 y,
                 indicator,
                 Style::default()
-                    .fg(theme::MENTION)
+                    .fg(theme::WARNING)
                     .add_modifier(Modifier::BOLD),
             );
         }
@@ -430,7 +411,7 @@ impl DmView {
                         .fg(theme::AGENT_MSG)
                         .add_modifier(Modifier::BOLD),
                 ),
-                Span::styled(cursor_char.to_string(), Style::default().fg(theme::MENTION)),
+                Span::styled(cursor_char.to_string(), Style::default().fg(theme::WARNING)),
             ]));
 
             if !msg.blocks.is_empty() {
@@ -1088,5 +1069,28 @@ mod tests {
         assert_eq!(o.channel, "general");
         assert_eq!(o.from, "bob");
         assert_eq!(text, "actual content");
+    }
+
+    // --- Render: no title bar ---
+
+    #[test]
+    fn render_no_title_bar() {
+        let mut dm = DmView::new("alice");
+        dm.push(&make_dm("user", "hello"));
+        let area = Rect::new(0, 0, 60, 20);
+        let mut buf = Buffer::empty(area);
+        dm.render(area, &mut buf);
+        let row0: String = (0..60).map(|x| buf.cell((x, 0)).unwrap().symbol().to_string()).collect();
+        assert!(!row0.contains("与"), "DM view should not have title bar");
+    }
+
+    #[test]
+    fn render_fills_l0_background() {
+        let mut dm = DmView::new("alice");
+        let area = Rect::new(0, 0, 60, 20);
+        let mut buf = Buffer::empty(area);
+        dm.render(area, &mut buf);
+        let cell = buf.cell((5, 5)).unwrap();
+        assert_eq!(cell.bg, theme::BG_L0);
     }
 }

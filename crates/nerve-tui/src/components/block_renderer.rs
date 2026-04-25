@@ -163,7 +163,7 @@ fn render_markdown(content: &str, out: &mut Vec<Line<'static>>, skip_code_blocks
                 out.push(Line::from(Span::styled(
                     text,
                     Style::default()
-                        .fg(Color::Cyan)
+                        .fg(theme::PRIMARY)
                         .add_modifier(Modifier::BOLD),
                 )));
                 is_heading = false;
@@ -204,7 +204,7 @@ fn render_markdown(content: &str, out: &mut Vec<Line<'static>>, skip_code_blocks
                 } else {
                     current_spans.push(Span::styled(
                         text.to_string(),
-                        Style::default().fg(Color::Yellow),
+                        Style::default().fg(theme::WARNING),
                     ));
                 }
             }
@@ -330,7 +330,7 @@ fn render_table(table_rows: &[(Vec<String>, bool)]) -> Vec<Line<'static>> {
             let pad = target_w.saturating_sub(display_w);
             let padded = format!("{}{}", cell, " ".repeat(pad));
             let style = if *is_header {
-                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+                Style::default().fg(theme::PRIMARY).add_modifier(Modifier::BOLD)
             } else {
                 Style::default()
             };
@@ -357,7 +357,7 @@ fn render_table(table_rows: &[(Vec<String>, bool)]) -> Vec<Line<'static>> {
     out
 }
 
-/// Highlight code using syntect. Falls back to plain DarkGray on unknown language.
+/// Highlight code using syntect. Falls back to plain muted text on unknown language.
 fn highlight_code(code: &str, lang: &str) -> Vec<Line<'static>> {
     let ss = &*SYNTAX_SET;
     let theme = &*CODE_THEME;
@@ -372,16 +372,13 @@ fn highlight_code(code: &str, lang: &str) -> Vec<Line<'static>> {
     let mut h = HighlightLines::new(syntax, theme);
     let mut lines = Vec::new();
 
-    // Opening border
-    let lang_label = if lang.is_empty() {
-        "───".to_string()
-    } else {
-        format!("─── {} ───", lang)
-    };
-    lines.push(Line::from(Span::styled(
-        lang_label,
-        Style::default().fg(Color::DarkGray),
-    )));
+    // Language label (small, muted) — no separator lines
+    if !lang.is_empty() {
+        lines.push(Line::from(Span::styled(
+            lang.to_string(),
+            Style::default().fg(theme::TEXT_MUTED),
+        )));
+    }
 
     for line in code.lines() {
         match h.highlight_line(line, &ss) {
@@ -400,17 +397,11 @@ fn highlight_code(code: &str, lang: &str) -> Vec<Line<'static>> {
             Err(_) => {
                 lines.push(Line::from(Span::styled(
                     line.to_string(),
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(theme::TEXT_MUTED),
                 )));
             }
         }
     }
-
-    // Closing border
-    lines.push(Line::from(Span::styled(
-        "───".to_string(),
-        Style::default().fg(Color::DarkGray),
-    )));
 
     lines
 }
@@ -435,7 +426,7 @@ fn render_thinking(text: &str, elapsed: Option<std::time::Duration>, collapsed: 
     lines.push(Line::from(Span::styled(
         header,
         Style::default()
-            .fg(Color::DarkGray)
+            .fg(theme::BORDER_ACTIVE)
             .add_modifier(Modifier::ITALIC),
     )));
 
@@ -443,7 +434,7 @@ fn render_thinking(text: &str, elapsed: Option<std::time::Duration>, collapsed: 
         for line in text.lines() {
             lines.push(Line::from(Span::styled(
                 format!("  │ {}", line),
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(theme::BORDER_ACTIVE),
             )));
         }
     }
@@ -459,10 +450,10 @@ fn render_tool_call(name: &str, input: &str, status: &ToolStatus, collapsed: boo
     let mut lines = Vec::new();
 
     let (icon, icon_color) = match status {
-        ToolStatus::Pending => ("⏳", Color::Yellow),
-        ToolStatus::Running => ("⏳", Color::Green),
-        ToolStatus::Completed => ("✓", Color::Green),
-        ToolStatus::Failed => ("✗", Color::Red),
+        ToolStatus::Pending => ("⏳", theme::WARNING),
+        ToolStatus::Running => ("⏳", theme::SUCCESS),
+        ToolStatus::Completed => ("✓", theme::SUCCESS),
+        ToolStatus::Failed => ("✗", theme::ERROR),
     };
 
     debug!(tool_name = name, ?status, collapsed, "rendering tool_call block");
@@ -521,11 +512,11 @@ fn render_tool_result(content: &str, is_error: bool, collapsed: bool) -> Vec<Lin
     let line_count = content_lines.len();
 
     let (label, label_color) = if is_error {
-        ("  ✗ 结果（错误）".to_string(), Color::Red)
+        ("  ✗ 结果（错误）".to_string(), theme::ERROR)
     } else if collapsed && line_count > 3 {
-        (format!("  ✓ 结果 ({} 行)", line_count), theme::TOOL_LABEL)
+        (format!("  ✓ 结果 ({} 行)", line_count), theme::TEXT_MUTED)
     } else {
-        ("  ✓ 结果".to_string(), theme::TOOL_LABEL)
+        ("  ✓ 结果".to_string(), theme::TEXT_MUTED)
     };
 
     lines.push(Line::from(Span::styled(
@@ -534,9 +525,9 @@ fn render_tool_result(content: &str, is_error: bool, collapsed: bool) -> Vec<Lin
     )));
 
     let content_color = if is_error {
-        Color::Red
+        theme::ERROR
     } else {
-        theme::TOOL_VALUE
+        theme::TEXT
     };
 
     if collapsed {
@@ -567,7 +558,7 @@ fn render_tool_result(content: &str, is_error: bool, collapsed: bool) -> Vec<Lin
 fn render_error(message: &str) -> Vec<Line<'static>> {
     vec![Line::from(Span::styled(
         format!("  ⚠ {}", message),
-        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        Style::default().fg(theme::ERROR).add_modifier(Modifier::BOLD),
     ))]
 }
 
@@ -690,7 +681,7 @@ mod tests {
             .flat_map(|l| l.spans.iter())
             .find(|s| s.content.as_ref() == "Title");
         assert!(heading_span.is_some());
-        assert_eq!(heading_span.unwrap().style.fg, Some(Color::Cyan));
+        assert_eq!(heading_span.unwrap().style.fg, Some(theme::PRIMARY));
     }
 
     #[test]
@@ -711,7 +702,7 @@ mod tests {
             .flat_map(|l| l.spans.iter())
             .find(|s| s.content.as_ref() == "foo()");
         assert!(code_span.is_some());
-        assert_eq!(code_span.unwrap().style.fg, Some(Color::Yellow));
+        assert_eq!(code_span.unwrap().style.fg, Some(theme::WARNING));
     }
 
     // --- Thinking block tests ---
@@ -833,7 +824,7 @@ mod tests {
         let error_span = lines.iter()
             .flat_map(|l| l.spans.iter())
             .find(|s| s.content.contains("command not found"));
-        assert_eq!(error_span.unwrap().style.fg, Some(Color::Red));
+        assert_eq!(error_span.unwrap().style.fg, Some(theme::ERROR));
     }
 
     #[test]
@@ -878,7 +869,7 @@ mod tests {
         let text: String = lines[0].spans.iter().map(|s| s.content.to_string()).collect();
         assert!(text.contains("⚠"));
         assert!(text.contains("something went wrong"));
-        assert_eq!(lines[0].spans[0].style.fg, Some(Color::Red));
+        assert_eq!(lines[0].spans[0].style.fg, Some(theme::ERROR));
     }
 
     // --- render_block dispatch tests ---
@@ -935,7 +926,7 @@ mod tests {
     #[test]
     fn highlight_code_rust() {
         let lines = highlight_code("fn main() {\n    println!(\"hello\");\n}", "rust");
-        // Should have: lang label + 2 code lines + closing border = 4+
+        // lang label + 3 code lines = 4
         assert!(lines.len() >= 4);
         let text: String = lines.iter()
             .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
@@ -948,7 +939,8 @@ mod tests {
     #[test]
     fn highlight_code_unknown_lang_fallback() {
         let lines = highlight_code("some stuff", "nonexistent_lang");
-        assert!(lines.len() >= 3); // border + 1 line + border
+        // lang label + 1 line = 2
+        assert!(lines.len() >= 2);
     }
 
     // --- Table rendering tests ---
@@ -990,7 +982,7 @@ mod tests {
             .find(|s| s.content.contains("Name"));
         assert!(header_span.is_some(), "should find Name span");
         let span = header_span.unwrap();
-        assert_eq!(span.style.fg, Some(Color::Cyan));
+        assert_eq!(span.style.fg, Some(theme::PRIMARY));
         assert!(span.style.add_modifier.contains(Modifier::BOLD));
     }
 
@@ -1318,5 +1310,32 @@ mod tests {
             .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
             .collect();
         assert!(rendered.contains("simple plain text"));
+    }
+
+    // --- Task 5 & 6: separator removal + warm colors ---
+
+    #[test]
+    fn code_block_no_separator_lines() {
+        let lines = highlight_code("fn main() {}", "rust");
+        let text: String = lines.iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
+            .collect();
+        assert!(!text.contains("───"), "code block should not have separator lines");
+        assert!(text.contains("rust"), "code block should show language name");
+    }
+
+    #[test]
+    fn thinking_uses_warm_color() {
+        let elapsed = Some(Duration::from_secs_f64(1.0));
+        let lines = render_thinking("test", elapsed, true);
+        let span = &lines[0].spans[0];
+        assert_eq!(span.style.fg, Some(theme::BORDER_ACTIVE));
+    }
+
+    #[test]
+    fn tool_call_completed_uses_success_color() {
+        let lines = render_tool_call("Read", "{}", &ToolStatus::Completed, true);
+        let icon_span = &lines[0].spans[0];
+        assert_eq!(icon_span.style.fg, Some(theme::SUCCESS));
     }
 }
