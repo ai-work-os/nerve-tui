@@ -1828,7 +1828,8 @@ mod tests {
         terminal.draw(|f| app.render(f)).unwrap();
 
         let text = buffer_text_compact(terminal.backend().buffer());
-        assert!(text.contains("与alice的对话"), "buffer should contain agent name in DM title");
+        // DM view no longer has a title bar; check that DM status indicator renders
+        assert!(text.contains("就绪"), "buffer should contain DM status indicator in DM mode");
     }
 
     #[test]
@@ -1907,14 +1908,15 @@ mod tests {
 
         let buf = terminal.backend().buffer();
         let area = buf.area;
+        // Input area bottom row should contain the metadata hint (no border)
         let bottom_y = area.y + area.height - 1;
         let mut bottom_row = String::new();
         for x in area.x..area.x + area.width {
             bottom_row.push_str(buf[(x, bottom_y)].symbol());
         }
         assert!(
-            bottom_row.contains('─') || bottom_row.contains('└') || bottom_row.contains('┘'),
-            "bottom row should contain input area border characters, got: {}",
+            bottom_row.contains('发') || bottom_row.contains('送'),
+            "bottom row should contain input metadata hint, got: {}",
             bottom_row
         );
     }

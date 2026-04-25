@@ -1,7 +1,7 @@
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::widgets::{Block, BorderType, Borders, Clear, Widget};
+use ratatui::widgets::{Clear, Widget};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::theme;
@@ -570,21 +570,20 @@ impl InputBox {
         if width <= 2 {
             return 1;
         }
-        let rows = wrap_lines(&self.text, width as usize, 2, 2);
-        rows.len().max(1) as u16
+        let rows = wrap_lines(&self.text, width as usize, 0, 0);
+        (rows.len() as u16 + 1).max(2) // +1 for metadata row, min 2
     }
 
-    fn cursor_visual_position(&self, width: u16) -> (u16, u16) {
+    fn cursor_visual_position_inner(&self, width: u16, first_prompt: usize, cont_prompt: usize) -> (u16, u16) {
         let inner_w = width as usize;
         if inner_w == 0 {
             return (0, 0);
         }
-        let rows = wrap_lines(&self.text, inner_w, 2, 2);
+        let rows = wrap_lines(&self.text, inner_w, first_prompt, cont_prompt);
 
         // Find which row contains the cursor
         for (row_idx, row) in rows.iter().enumerate() {
             if self.cursor_pos >= row.byte_start && self.cursor_pos <= row.byte_end {
-                // Cursor is in this row
                 let text_before_cursor = &self.text[row.byte_start..self.cursor_pos];
                 let col = row.prompt_width + UnicodeWidthStr::width(text_before_cursor);
                 return (col as u16, row_idx as u16);
@@ -599,37 +598,43 @@ impl InputBox {
         (0, 0)
     }
 
+    #[allow(dead_code)] // used in tests
     fn scroll_offset_for_height(&self, width: u16, visible_height: u16) -> u16 {
         if visible_height == 0 {
             return 0;
         }
-        let (_, cursor_row) = self.cursor_visual_position(width);
+        let (_, cursor_row) = self.cursor_visual_position_inner(width, 0, 0);
         cursor_row.saturating_sub(visible_height.saturating_sub(1))
     }
 
     pub fn render(&self, area: Rect, buf: &mut Buffer) {
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(theme::BORDER))
-            .title(" Input ")
-            .title_style(Style::default().fg(theme::BORDER));
-
-        let inner = block.inner(area);
-        block.render(area, buf);
-
-        let rows = wrap_lines(&self.text, inner.width as usize, 2, 2);
-        let scroll_y = self.scroll_offset_for_height(inner.width, inner.height);
-
-        if rows.len() > 3 {
-            tracing::info!(
-                "INPUT_RENDER: rows={} inner_h={} inner_w={} scroll_y={} text_len={}",
-                rows.len(), inner.height, inner.width, scroll_y, self.text.len()
-            );
+        // Fill with L2 background
+        for y in area.y..area.y + area.height {
+            for x in area.x..area.x + area.width {
+                if let Some(cell) = buf.cell_mut((x, y)) {
+                    cell.set_bg(theme::BG_L2);
+                }
+            }
         }
 
-        let prompt_style = Style::default().fg(Color::DarkGray);
-        let text_style = Style::default();
+        // Inner area: 2-char horizontal padding, 1 row top padding
+        let inner = Rect {
+            x: area.x + 2,
+            y: area.y + 1,
+            width: area.width.saturating_sub(4),
+            height: area.height.saturating_sub(1),
+        };
+
+        let rows = wrap_lines(&self.text, inner.width as usize, 0, 0);
+        let visible_height = inner.height.saturating_sub(1); // reserve 1 row for metadata
+        let scroll_y = if visible_height == 0 {
+            0
+        } else {
+            let (_, cursor_row) = self.cursor_visual_position_inner(inner.width, 0, 0);
+            cursor_row.saturating_sub(visible_height.saturating_sub(1))
+        };
+
+        let text_style = Style::default().fg(theme::TEXT).bg(theme::BG_L2);
 
         for (i, row) in rows.iter().enumerate() {
             let visual_y = i as u16;
@@ -637,20 +642,71 @@ impl InputBox {
                 continue;
             }
             let screen_y = inner.y + visual_y - scroll_y;
-            if screen_y >= inner.y + inner.height {
+            if screen_y >= inner.y + visible_height {
                 break;
             }
-
-            // Render prompt
-            if row.prompt_width > 0 {
-                let prompt = if i == 0 { "> " } else { "  " };
-                buf.set_string(inner.x, screen_y, prompt, prompt_style);
-            }
-
-            // Render text
-            let text_x = inner.x + row.prompt_width as u16;
-            buf.set_string(text_x, screen_y, &row.text, text_style);
+            buf.set_string(inner.x, screen_y, &row.text, text_style);
         }
+
+        // Metadata line at bottom
+        let meta_y = area.y + area.height - 1;
+        let meta_style = Style::default().fg(theme::TEXT_MUTED).bg(theme::BG_L2);
+        let right_hint = "↩ 发送 · ⇧↩ 换行";
+        let hint_w = unicode_width::UnicodeWidthStr::width(right_hint) as u16;
+        let hint_x = area.x + area.width.saturating_sub(hint_w + 2);
+        buf.set_string(hint_x, meta_y, right_hint, meta_style);
+    }
+
+    pub fn render_with_meta(&self, area: Rect, buf: &mut Buffer, meta_left: &str) {
+        // Fill with L2 background
+        for y in area.y..area.y + area.height {
+            for x in area.x..area.x + area.width {
+                if let Some(cell) = buf.cell_mut((x, y)) {
+                    cell.set_bg(theme::BG_L2);
+                }
+            }
+        }
+
+        let inner = Rect {
+            x: area.x + 2,
+            y: area.y + 1,
+            width: area.width.saturating_sub(4),
+            height: area.height.saturating_sub(1),
+        };
+
+        let rows = wrap_lines(&self.text, inner.width as usize, 0, 0);
+        let visible_height = inner.height.saturating_sub(1);
+        let scroll_y = if visible_height == 0 {
+            0
+        } else {
+            let (_, cursor_row) = self.cursor_visual_position_inner(inner.width, 0, 0);
+            cursor_row.saturating_sub(visible_height.saturating_sub(1))
+        };
+
+        let text_style = Style::default().fg(theme::TEXT).bg(theme::BG_L2);
+
+        for (i, row) in rows.iter().enumerate() {
+            let visual_y = i as u16;
+            if visual_y < scroll_y {
+                continue;
+            }
+            let screen_y = inner.y + visual_y - scroll_y;
+            if screen_y >= inner.y + visible_height {
+                break;
+            }
+            buf.set_string(inner.x, screen_y, &row.text, text_style);
+        }
+
+        // Metadata line at bottom
+        let meta_y = area.y + area.height - 1;
+        let meta_style = Style::default().fg(theme::TEXT_MUTED).bg(theme::BG_L2);
+        if !meta_left.is_empty() {
+            buf.set_string(area.x + 2, meta_y, meta_left, meta_style);
+        }
+        let right_hint = "↩ 发送 · ⇧↩ 换行";
+        let hint_w = unicode_width::UnicodeWidthStr::width(right_hint) as u16;
+        let hint_x = area.x + area.width.saturating_sub(hint_w + 2);
+        buf.set_string(hint_x, meta_y, right_hint, meta_style);
     }
 
     pub fn render_popup(&self, input_area: Rect, buf: &mut Buffer) {
@@ -690,12 +746,16 @@ impl InputBox {
 
     /// Get cursor screen position.
     pub fn cursor_position(&self, area: Rect) -> (u16, u16) {
-        let inner_x = area.x + 1;
+        let inner_x = area.x + 2;
         let inner_y = area.y + 1;
-        let inner_width = area.width.saturating_sub(2);
-        let visible_height = area.height.saturating_sub(2);
-        let (col, visual_row) = self.cursor_visual_position(inner_width);
-        let scroll_y = self.scroll_offset_for_height(inner_width, visible_height);
+        let inner_width = area.width.saturating_sub(4);
+        let visible_height = area.height.saturating_sub(2); // 1 top pad + 1 metadata
+        let (col, visual_row) = self.cursor_visual_position_inner(inner_width, 0, 0);
+        let scroll_y = if visible_height == 0 {
+            0
+        } else {
+            visual_row.saturating_sub(visible_height.saturating_sub(1))
+        };
         (inner_x + col, inner_y + visual_row.saturating_sub(scroll_y))
     }
 }
@@ -994,8 +1054,8 @@ mod tests {
     #[test]
     fn cursor_visual_position_empty() {
         let input = InputBox::new();
-        let (col, row) = input.cursor_visual_position(80);
-        assert_eq!(col, 2); // prompt width
+        let (col, row) = input.cursor_visual_position_inner(80, 0, 0);
+        assert_eq!(col, 0); // no prompt
         assert_eq!(row, 0);
     }
 
@@ -1003,8 +1063,8 @@ mod tests {
     fn cursor_visual_position_ascii() {
         let mut input = InputBox::new();
         input.insert_str("hello");
-        let (col, row) = input.cursor_visual_position(80);
-        assert_eq!(col, 7); // prompt(2) + "hello"(5)
+        let (col, row) = input.cursor_visual_position_inner(80, 0, 0);
+        assert_eq!(col, 5); // "hello"(5), no prompt
         assert_eq!(row, 0);
     }
 
@@ -1012,51 +1072,50 @@ mod tests {
     fn cursor_visual_position_cjk() {
         let mut input = InputBox::new();
         input.insert_str("你好");
-        let (col, row) = input.cursor_visual_position(80);
-        assert_eq!(col, 6); // prompt(2) + 2 CJK × 2 cols = 6
+        let (col, row) = input.cursor_visual_position_inner(80, 0, 0);
+        assert_eq!(col, 4); // 2 CJK × 2 cols = 4, no prompt
         assert_eq!(row, 0);
     }
 
     #[test]
     fn cursor_visual_position_wrapping() {
         let mut input = InputBox::new();
-        // width=12, prompt=2, avail=10
+        // width=12, prompt=0, avail=12
         input.insert_str("abcdefghijklm");
-        let (col, row) = input.cursor_visual_position(12);
-        // First row: "abcdefghij" (10 chars), second row: "klm" (3 chars, no prompt)
+        let (col, row) = input.cursor_visual_position_inner(12, 0, 0);
+        // First row: "abcdefghijkl" (12 chars), second row: "m" (1 char)
         assert_eq!(row, 1);
-        assert_eq!(col, 3); // no prompt on continuation
+        assert_eq!(col, 1);
     }
 
     #[test]
     fn cursor_visual_position_multiline() {
         let mut input = InputBox::new();
         input.insert_str("abc\ndef");
-        let (col, row) = input.cursor_visual_position(80);
+        let (col, row) = input.cursor_visual_position_inner(80, 0, 0);
         assert_eq!(row, 1);
-        assert_eq!(col, 5); // prompt(2) + "def"(3)
+        assert_eq!(col, 3); // "def"(3), no prompt
     }
 
     #[test]
     fn cursor_visual_position_cjk_wrapping() {
         let mut input = InputBox::new();
-        // width=8, prompt=2, avail=6. Each CJK = 2 cols, so 3 fit per row
-        input.insert_str("你好世界"); // 4 CJK chars
-        let (col, row) = input.cursor_visual_position(8);
-        // Row 0: "你好世" (6 cols), Row 1: "界" (2 cols)
-        assert_eq!(row, 1);
-        assert_eq!(col, 2); // no prompt on continuation
+        // width=8, prompt=0, avail=8. Each CJK = 2 cols, so 4 fit per row
+        input.insert_str("你好世界"); // 4 CJK chars = 8 cols, fits in one row
+        let (col, row) = input.cursor_visual_position_inner(8, 0, 0);
+        assert_eq!(row, 0);
+        assert_eq!(col, 8); // all 4 CJK fit in width 8
     }
 
     // ── cursor_position (with border) tests ──
 
     #[test]
-    fn cursor_position_with_border() {
+    fn cursor_position_layout() {
         let input = InputBox::new();
         let area = Rect::new(0, 0, 80, 5);
         let (cx, cy) = input.cursor_position(area);
-        assert_eq!(cx, 3); // border(1) + prompt(2)
-        assert_eq!(cy, 1); // border(1)
+        assert_eq!(cx, 2); // padding(2)
+        assert_eq!(cy, 1); // top_pad(1)
     }
 
     #[test]
@@ -1065,7 +1124,7 @@ mod tests {
         input.insert_str("hello");
         let area = Rect::new(0, 0, 80, 5);
         let (cx, cy) = input.cursor_position(area);
-        assert_eq!(cx, 8); // border(1) + prompt(2) + "hello"(5)
+        assert_eq!(cx, 7); // padding(2) + "hello"(5)
         assert_eq!(cy, 1);
     }
 
@@ -1075,7 +1134,7 @@ mod tests {
         input.insert_str("你好");
         let area = Rect::new(0, 0, 80, 5);
         let (cx, cy) = input.cursor_position(area);
-        assert_eq!(cx, 7); // border(1) + prompt(2) + 2×2
+        assert_eq!(cx, 6); // padding(2) + 2×2
         assert_eq!(cy, 1);
     }
 
@@ -1085,8 +1144,8 @@ mod tests {
         input.insert_str("line1\nab");
         let area = Rect::new(0, 0, 80, 7);
         let (cx, cy) = input.cursor_position(area);
-        assert_eq!(cx, 5); // border(1) + prompt(2) + "ab"(2)
-        assert_eq!(cy, 2); // border(1) + row 1
+        assert_eq!(cx, 4); // padding(2) + "ab"(2)
+        assert_eq!(cy, 2); // top_pad(1) + row 1
     }
 
     #[test]
@@ -1095,7 +1154,11 @@ mod tests {
         input.insert_str("line1\nline2\nline3\nline4");
         let area = Rect::new(0, 0, 20, 5);
         let (cx, cy) = input.cursor_position(area);
-        assert_eq!(cx, 8); // border(1) + prompt(2) + "line4"(5)
+        // visible_height = 5 - 2 = 3 (1 top pad + 1 metadata)
+        // 4 rows of text, cursor on row 3 (line4)
+        // scroll_y = 3 - (3-1) = 1
+        // screen_y = 1 + 3 - 1 = 3
+        assert_eq!(cx, 7); // padding(2) + "line4"(5)
         assert_eq!(cy, 3);
     }
 
@@ -1166,10 +1229,10 @@ mod tests {
     #[test]
     fn visual_line_count() {
         let mut input = InputBox::new();
-        assert_eq!(input.visual_line_count(80), 1);
+        assert_eq!(input.visual_line_count(80), 2); // 1 text row + 1 metadata, min 2
 
         input.insert_str(&"a".repeat(100));
-        assert!(input.visual_line_count(80) >= 2);
+        assert!(input.visual_line_count(80) >= 3); // 2+ text rows + 1 metadata
 
         assert_eq!(input.visual_line_count(2), 1);
         assert_eq!(input.visual_line_count(1), 1);
@@ -1179,22 +1242,24 @@ mod tests {
     fn visual_line_count_multiline() {
         let mut input = InputBox::new();
         input.insert_str("line1\nline2\nline3");
-        assert!(input.visual_line_count(80) >= 3);
+        assert!(input.visual_line_count(80) >= 4); // 3 text rows + 1 metadata
     }
 
     #[test]
     fn visual_line_count_exact_fit() {
         let mut input = InputBox::new();
-        input.insert_str(&"a".repeat(78));
-        assert_eq!(input.visual_line_count(80), 1);
+        // prompt=0, so 80 chars fit in width 80
+        input.insert_str(&"a".repeat(80));
+        assert_eq!(input.visual_line_count(80), 2); // 1 text row + 1 metadata
     }
 
     #[test]
     fn visual_line_count_cjk_exact_fit() {
         let mut input = InputBox::new();
-        let cjk: String = std::iter::repeat('你').take(39).collect();
+        // prompt=0, so 40 CJK chars (80 cols) fit in width 80
+        let cjk: String = std::iter::repeat('你').take(40).collect();
         input.insert_str(&cjk);
-        assert_eq!(input.visual_line_count(80), 1);
+        assert_eq!(input.visual_line_count(80), 2); // 1 text row + 1 metadata
     }
 
     #[test]
@@ -1510,5 +1575,26 @@ mod tests {
         input.history_push("same");
         input.history_push("same");
         assert_eq!(input.history_len(), 1);
+    }
+
+    #[test]
+    fn render_uses_l2_background() {
+        let input = InputBox::new();
+        let area = Rect::new(0, 0, 40, 5);
+        let mut buf = Buffer::empty(area);
+        input.render(area, &mut buf);
+        let cell = buf.cell((1, 1)).unwrap();
+        assert_eq!(cell.bg, theme::BG_L2);
+    }
+
+    #[test]
+    fn render_no_border_chars() {
+        let input = InputBox::new();
+        let area = Rect::new(0, 0, 40, 5);
+        let mut buf = Buffer::empty(area);
+        input.render(area, &mut buf);
+        let tl = buf.cell((0, 0)).unwrap();
+        assert_ne!(tl.symbol(), "╭");
+        assert_ne!(tl.symbol(), "┌");
     }
 }

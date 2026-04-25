@@ -16,7 +16,7 @@ impl<T: Transport> App<T> {
         let area = frame.area();
         let panel_count = self.split_panels.len();
         let input_inner_w = AppLayout::input_inner_width(area, self.sidebar_visible, panel_count);
-        let input_lines = self.input.visual_line_count(input_inner_w) + 2;
+        let input_lines = self.input.visual_line_count(input_inner_w) + 1; // +1 for top padding
         let layout = AppLayout::build(area, input_lines, self.sidebar_visible, panel_count);
 
         // Sidebar: channels + agents (skip when hidden)
