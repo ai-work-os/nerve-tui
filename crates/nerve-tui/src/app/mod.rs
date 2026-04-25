@@ -1824,12 +1824,13 @@ mod tests {
         let mut app = make_app();
         app.view_mode = ViewMode::Dm { node_id: "n1".into(), node_name: "alice".into() };
         app.dm_view = DmView::new("alice");
+        app.dm_view.model_label = Some("claude-4".into());
 
         terminal.draw(|f| app.render(f)).unwrap();
 
         let text = buffer_text_compact(terminal.backend().buffer());
-        // DM view no longer has a title bar; check that DM status indicator renders
-        assert!(text.contains("就绪"), "buffer should contain DM status indicator in DM mode");
+        // DM model label now renders as input box metadata
+        assert!(text.contains("claude-4"), "buffer should contain model label in DM mode");
     }
 
     #[test]
@@ -1848,18 +1849,20 @@ mod tests {
     }
 
     #[test]
-    fn render_dm_ready_shows_ready() {
+    fn render_dm_ready_shows_model_label() {
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).unwrap();
         let mut app = make_app();
         app.view_mode = ViewMode::Dm { node_id: "n1".into(), node_name: "alice".into() };
         app.dm_view = DmView::new("alice");
         app.dm_view.is_responding = false;
+        app.dm_view.model_label = Some("claude-4".into());
 
         terminal.draw(|f| app.render(f)).unwrap();
 
         let text = buffer_text_compact(terminal.backend().buffer());
-        assert!(text.contains("就绪"), "buffer should show ready indicator");
+        assert!(text.contains("claude-4"), "buffer should show model label when not responding");
+        assert!(!text.contains("回复中"), "buffer should not show responding indicator when idle");
     }
 
     #[test]

@@ -1,12 +1,11 @@
 use nerve_tui_core::Transport;
-use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::Span;
 use ratatui::Frame;
 
 use super::app_state::{SplitFocus, SplitTarget};
 use super::App;
 use crate::components::channel_view;
 use crate::layout::AppLayout;
+use crate::theme;
 
 impl<T: Transport> App<T> {
     pub(crate) fn render(&mut self, frame: &mut Frame) {
@@ -14,6 +13,17 @@ impl<T: Transport> App<T> {
         self.dm_view.tick_blink();
 
         let area = frame.area();
+
+        // Fill entire area with L0 background
+        let buf = frame.buffer_mut();
+        for y in area.y..area.y + area.height {
+            for x in area.x..area.x + area.width {
+                if let Some(cell) = buf.cell_mut((x, y)) {
+                    cell.set_bg(theme::BG_L0);
+                }
+            }
+        }
+
         let panel_count = self.split_panels.len();
         let input_inner_w = AppLayout::input_inner_width(area, self.sidebar_visible, panel_count);
         let input_lines = self.input.visual_line_count(input_inner_w) + 1; // +1 for top padding
@@ -78,21 +88,20 @@ impl<T: Transport> App<T> {
             }
         }
 
-        // Input
-        self.input.render(layout.input, frame.buffer_mut());
-        self.input.render_popup(layout.input, frame.buffer_mut());
-
-        // DM status indicator on input box border
-        if self.is_dm_mode() {
-            let status = if self.dm_view.is_responding {
-                Span::styled(" 回复中... ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
+        // Build metadata text for input box
+        let meta_left = if self.is_dm_mode() {
+            let model = self.dm_view.model_label.as_deref().unwrap_or("");
+            let status = if self.dm_view.is_responding { "回复中..." } else { "" };
+            if status.is_empty() {
+                model.to_string()
             } else {
-                Span::styled(" 就绪 ", Style::default().fg(Color::Green))
-            };
-            let x = layout.input.right().saturating_sub(status.width() as u16 + 2);
-            let y = layout.input.y;
-            frame.buffer_mut().set_span(x, y, &status, status.width() as u16);
-        }
+                format!("{} · {}", model, status)
+            }
+        } else {
+            String::new()
+        };
+        self.input.render_with_meta(layout.input, frame.buffer_mut(), &meta_left);
+        self.input.render_popup(layout.input, frame.buffer_mut());
 
         // Cursor
         let (cx, cy) = self.input.cursor_position(layout.input);
