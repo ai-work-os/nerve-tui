@@ -426,10 +426,9 @@ impl<T: Transport> App<T> {
             self.flush_streaming_as_dm(&node_id_ref, &node_name_ref);
 
             // Add user message locally immediately
-            let tagged = format!("{}: {}", self.client.node_name(), text);
             let user_msg = DmMessage {
                 role: "user".to_string(),
-                content: tagged,
+                content: text.to_string(),
                 timestamp: chrono::Local::now().timestamp(),
             };
             self.dm_view.push(&user_msg);

@@ -62,8 +62,7 @@ pub trait Transport: Clone + Send + Sync + 'static {
         channel_id: &str,
         content: &str,
     ) -> impl Future<Output = Result<MessageInfo>> + Send {
-        let tagged = format!("{}: {}", self.node_name(), content);
-        let params = json!({ "channelId": channel_id, "content": tagged });
+        let params = json!({ "channelId": channel_id, "content": content });
         async move {
             let r = self.request("channel.post", params).await?;
             let msg: MessageInfo =
@@ -134,8 +133,7 @@ pub trait Transport: Clone + Send + Sync + 'static {
         node_id: &str,
         content: &str,
     ) -> impl Future<Output = Result<PromptResult>> + Send {
-        let tagged = format!("{}: {}", self.node_name(), content);
-        let params = json!({ "nodeId": node_id, "content": tagged });
+        let params = json!({ "nodeId": node_id, "content": content });
         async move {
             let r = self.request("node.prompt", params).await?;
             Ok(serde_json::from_value(r)?)
@@ -143,8 +141,7 @@ pub trait Transport: Clone + Send + Sync + 'static {
     }
 
     fn node_message(&self, node_id: &str, content: &str) -> impl Future<Output = Result<()>> + Send {
-        let tagged = format!("{}: {}", self.node_name(), content);
-        let params = json!({ "nodeId": node_id, "content": tagged });
+        let params = json!({ "nodeId": node_id, "content": content });
         async move {
             self.request("node.message", params).await?;
             Ok(())
@@ -378,17 +375,17 @@ mod tests {
         t.set_response(json!({
             "message": {
                 "id": "m1", "channelId": "ch-1", "from": "n",
-                "content": "n: hello", "timestamp": 1.0
+                "content": "hello", "timestamp": 1.0
             }
         }));
 
         let msg = t.channel_post("ch-1", "hello").await.unwrap();
-        assert_eq!(msg.content, "n: hello");
+        assert_eq!(msg.content, "hello");
 
         let (method, params) = t.last_call();
         assert_eq!(method, "channel.post");
         assert_eq!(params["channelId"], json!("ch-1"));
-        assert_eq!(params["content"], json!("n: hello"));
+        assert_eq!(params["content"], json!("hello"));
     }
 
     // --- Test: node_subscribe ---
@@ -435,7 +432,7 @@ mod tests {
         let (method, params) = t.last_call();
         assert_eq!(method, "node.prompt");
         assert_eq!(params["nodeId"], json!("node-1"));
-        assert_eq!(params["content"], json!("n: do something"));
+        assert_eq!(params["content"], json!("do something"));
     }
 
     // --- Test: session_clear ---
@@ -525,7 +522,7 @@ mod tests {
         let (method, params) = t.last_call();
         assert_eq!(method, "node.message");
         assert_eq!(params["nodeId"], json!("n-1"));
-        assert_eq!(params["content"], json!("n: hello"));
+        assert_eq!(params["content"], json!("hello"));
     }
 
     // --- Test: node_cancel ---

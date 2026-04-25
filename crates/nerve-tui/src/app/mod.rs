@@ -152,32 +152,6 @@ mod tests {
         assert!(app.dm_view.dm_history[0].content.contains("agent 正在回复"));
     }
 
-    #[tokio::test]
-    async fn dm_local_echo_uses_client_prefix_immediately() {
-        let mut app = make_app();
-        app.dm_view = DmView::new("alice");
-        app.view_mode = ViewMode::Dm { node_id: "n1".into(), node_name: "alice".into() };
-        app.agents.push(AgentDisplay {
-            name: "alice".into(),
-            node_id: "n1".into(),
-            transport: "stdio".into(),
-            capabilities: vec![],
-            status: "idle".into(),
-            model: None,
-            adapter: None,
-            activity: None,
-            usage: None,
-            tool_call_name: None,
-            tool_call_started: None,
-            waiting_for: None,
-        });
-
-        app.handle_input("hello").await;
-
-        assert_eq!(app.dm_view.dm_history.len(), 1);
-        assert_eq!(app.dm_view.dm_history[0].content, "test-user: hello");
-    }
-
     #[test]
     fn flush_streaming_as_dm_clears_responding_flag() {
         let mut app = make_app();
