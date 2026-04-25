@@ -403,12 +403,15 @@ impl DmView {
         streaming_names.sort();
         for name in streaming_names {
             let msg = &self.streaming_messages[name];
+            let name_color = theme::agent_color(name);
+            let border = Span::styled("│ ".to_string(), Style::default().fg(name_color));
             out.push(Line::from(""));
             out.push(Line::from(vec![
+                border.clone(),
                 Span::styled(
                     name.clone(),
                     Style::default()
-                        .fg(theme::AGENT_MSG)
+                        .fg(name_color)
                         .add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(cursor_char.to_string(), Style::default().fg(theme::WARNING)),
@@ -420,7 +423,12 @@ impl DmView {
                     name, msg.blocks.len()
                 );
                 for block in &msg.blocks {
-                    let rendered = block_renderer::render_block(block, width);
+                    let mut rendered = block_renderer::render_block(block, width);
+                    for line in &mut rendered {
+                        let mut new_spans = vec![border.clone()];
+                        new_spans.extend(std::mem::take(&mut line.spans));
+                        line.spans = new_spans;
+                    }
                     out.extend(rendered);
                 }
             } else {
@@ -503,8 +511,15 @@ impl DmView {
 
             let name_color = theme::agent_color(&msg.from);
             let name_style = Style::default().fg(name_color).add_modifier(Modifier::BOLD);
+            let is_user = msg.from == "user";
+            let border_span = if !is_user {
+                Span::styled("│ ".to_string(), Style::default().fg(name_color))
+            } else {
+                Span::raw("".to_string())
+            };
 
-            let mut header = vec![Span::styled(msg.from.clone(), name_style)];
+            let mut header = vec![border_span.clone()];
+            header.push(Span::styled(msg.from.clone(), name_style));
             if let Some(ref origin) = channel_origin {
                 header.push(Span::styled(
                     format!("  [来自 #{} @{}]", origin.channel, origin.from),
@@ -521,9 +536,7 @@ impl DmView {
             }
             out.push(Line::from(header));
 
-            // Content via block_renderer — use pre-built blocks if they contain
-            // structured content (tool calls, thinking, etc). Plain text-only blocks
-            // go through content_to_blocks for channel-origin stripping etc.
+            // Content via block_renderer
             let fallback_blocks;
             let has_structured = msg.blocks.iter().any(|b| !matches!(b, ContentBlock::Text { .. }));
             let blocks = if has_structured {
@@ -541,6 +554,14 @@ impl DmView {
                 }
             }
             compact_rendered_lines(&mut content_lines);
+            // Prepend border strip to content lines for agent messages
+            if !is_user {
+                for line in &mut content_lines {
+                    let mut new_spans = vec![border_span.clone()];
+                    new_spans.extend(std::mem::take(&mut line.spans));
+                    line.spans = new_spans;
+                }
+            }
             out.extend(content_lines);
         }
 

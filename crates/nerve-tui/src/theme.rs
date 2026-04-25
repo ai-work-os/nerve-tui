@@ -1,9 +1,9 @@
 use ratatui::style::Color;
 
 // --- 背景三级深度（暖白 Light） ---
-pub const BG_L0: Color = Color::Rgb(0xfe, 0xfc, 0xf9); // #fefcf9 页面背景（消息区）
-pub const BG_L1: Color = Color::Rgb(0xf5, 0xf0, 0xe8); // #f5f0e8 面板（sidebar、代码块）
-pub const BG_L2: Color = Color::Rgb(0xeb, 0xe4, 0xd8); // #ebe4d8 元素（输入框、用户消息）
+pub const BG_L0: Color = Color::Rgb(0xf5, 0xf0, 0xe8); // #f5f0e8 页面背景（消息区）
+pub const BG_L1: Color = Color::Rgb(0xeb, 0xe5, 0xda); // #ebe5da 面板（sidebar、代码块）
+pub const BG_L2: Color = Color::Rgb(0xe0, 0xd8, 0xcc); // #e0d8cc 元素（输入框、用户消息）
 
 // --- 文本 ---
 pub const TEXT: Color = Color::Rgb(0x2d, 0x24, 0x18);     // #2d2418 主文本
