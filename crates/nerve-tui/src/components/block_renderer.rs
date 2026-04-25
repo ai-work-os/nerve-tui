@@ -161,11 +161,18 @@ fn render_block_inner(block: &ContentBlock, width: u16, collapsed: bool) -> Vec<
     }
 }
 
-/// Render a ContentBlock in summary mode: only Text blocks (with code fences stripped).
+/// Render a ContentBlock in summary mode.
+/// Text: full render (including code blocks). ToolCall: one-line summary.
+/// Thinking & ToolResult: hidden. Error: shown.
 pub fn render_block_summary(block: &ContentBlock, width: u16) -> Vec<Line<'static>> {
     match block {
-        ContentBlock::Text { text } => render_text_summary(text, width),
-        _ => vec![], // non-text blocks hidden in summary mode
+        ContentBlock::Text { text } => render_text(text, width),
+        ContentBlock::ToolCall { name, input, status, .. } => {
+            render_tool_call_summary(name, input, status)
+        }
+        ContentBlock::Thinking { .. } => vec![],
+        ContentBlock::ToolResult { .. } => vec![],
+        ContentBlock::Error { message } => render_error(message),
     }
 }
 
@@ -1512,7 +1519,7 @@ mod tests {
     }
 
     #[test]
-    fn summary_mode_hides_tool_call_block() {
+    fn summary_mode_shows_tool_call_block() {
         let block = ContentBlock::ToolCall {
             id: "tc1".into(),
             name: "Read".into(),
@@ -1520,24 +1527,19 @@ mod tests {
             status: ToolStatus::Completed,
         };
         let lines = render_block_summary(&block, 80);
-        assert!(
-            lines.is_empty(),
-            "summary mode should hide tool_call blocks, got {} lines",
-            lines.len()
-        );
+        assert_eq!(lines.len(), 1, "summary mode should show tool_call as 1-line summary");
     }
 
     #[test]
-    fn summary_mode_hides_code_fence_in_text() {
+    fn summary_mode_shows_code_fence_in_text() {
         let text_with_code = "Here is some text\n```rust\nfn main() {}\n```\nMore text after";
         let block = ContentBlock::Text { text: text_with_code.into() };
         let lines = render_block_summary(&block, 80);
         let rendered: String = lines.iter()
             .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
             .collect();
-        // Code fence content should be hidden
-        assert!(!rendered.contains("fn main"), "summary mode should hide code fences");
-        // Plain text should remain
+        // Code fence content should now be VISIBLE in summary mode
+        assert!(rendered.contains("fn main"), "summary mode should now show code fences");
         assert!(rendered.contains("Here is some text"), "summary mode should keep plain text");
         assert!(rendered.contains("More text after"), "summary mode should keep text after code fence");
     }
@@ -1898,6 +1900,55 @@ mod tests {
         let lines = render_tool_call_summary("Bash", r#"{"command": "false"}"#, &ToolStatus::Failed);
         let text = lines_to_text(&lines);
         assert!(text.contains("✗"));
+    }
+
+    // --- Task 5: summary_mode improvement tests ---
+
+    #[test]
+    fn summary_mode_shows_tool_call_summary() {
+        let block = ContentBlock::ToolCall {
+            id: "tc1".into(),
+            name: "Read".into(),
+            input: r#"{"file_path": "/tmp/file.rs"}"#.into(),
+            status: ToolStatus::Completed,
+        };
+        let lines = render_block_summary(&block, 80);
+        assert_eq!(lines.len(), 1, "summary mode should show 1-line tool call summary");
+        let text = lines_to_text(&lines);
+        assert!(text.contains("Read"));
+        assert!(text.contains("/tmp/file.rs"));
+        assert!(text.contains("✓"));
+    }
+
+    #[test]
+    fn summary_mode_still_hides_thinking() {
+        let block = ContentBlock::Thinking {
+            text: "deep thought".into(),
+            started_at: Some(Instant::now()),
+            finished_at: Some(Instant::now()),
+        };
+        let lines = render_block_summary(&block, 80);
+        assert!(lines.is_empty(), "summary mode should still hide thinking blocks");
+    }
+
+    #[test]
+    fn summary_mode_still_hides_tool_result() {
+        let block = ContentBlock::ToolResult {
+            tool_call_id: "tc1".into(),
+            content: "some output".into(),
+            is_error: false,
+        };
+        let lines = render_block_summary(&block, 80);
+        assert!(lines.is_empty(), "summary mode should still hide tool result blocks");
+    }
+
+    #[test]
+    fn summary_mode_shows_error() {
+        let block = ContentBlock::Error { message: "something failed".into() };
+        let lines = render_block_summary(&block, 80);
+        assert!(!lines.is_empty(), "summary mode should show error blocks");
+        let text = lines_to_text(&lines);
+        assert!(text.contains("something failed"));
     }
 
 }
