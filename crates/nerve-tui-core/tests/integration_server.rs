@@ -248,7 +248,7 @@ async fn t6_channel_create_join_post_history() {
 
     // Post messages
     let msg = client.channel_post(&ch.id, "hello-int").await.unwrap();
-    assert_eq!(msg.content, "hello-int");
+    assert_eq!(msg.content, "int-test-6: hello-int");
 
     client.channel_post(&ch.id, "second-msg").await.unwrap();
 
@@ -256,11 +256,11 @@ async fn t6_channel_create_join_post_history() {
     let history = client.channel_history(&ch.id, None).await.unwrap();
     let contents: Vec<&str> = history.iter().map(|m| m.content.as_str()).collect();
     assert!(
-        contents.contains(&"hello-int"),
+        contents.contains(&"int-test-6: hello-int"),
         "history should contain hello-int"
     );
     assert!(
-        contents.contains(&"second-msg"),
+        contents.contains(&"int-test-6: second-msg"),
         "history should contain second-msg"
     );
 }

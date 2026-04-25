@@ -6,7 +6,7 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Widget, Wrap};
+use ratatui::widgets::{Paragraph, Widget, Wrap};
 use std::collections::HashMap;
 use tracing::debug;
 use unicode_width::UnicodeWidthStr;
@@ -44,7 +44,7 @@ pub struct ChannelView {
     visible_height: u16,
     has_new_messages: bool,
     pub filter: Option<String>,
-    /// channel_id → (messages, scroll snapshot)
+    /// channel_id -> (messages, scroll snapshot)
     channel_cache: HashMap<String, (Vec<MessageLine>, ViewSnapshot)>,
     channel_unread: HashMap<String, usize>,
     /// Cached rendered lines for build_text.
@@ -210,25 +210,27 @@ impl ChannelView {
     // --- Rendering ---
 
     pub fn render(&mut self, area: Rect, buf: &mut Buffer) {
-        let title = if let Some(ref f) = self.filter {
-            format!(" Messages [@{}] ", f)
-        } else {
-            " Messages ".to_string()
+        // Fill with L0 background
+        for y in area.y..area.y + area.height {
+            for x in area.x..area.x + area.width {
+                if let Some(cell) = buf.cell_mut((x, y)) {
+                    cell.set_bg(theme::BG_L0);
+                }
+            }
+        }
+
+        // Inner area: 2-char left/right padding
+        let inner = Rect {
+            x: area.x + 2,
+            y: area.y,
+            width: area.width.saturating_sub(4),
+            height: area.height,
         };
-
-        let block = Block::default()
-            .borders(Borders::LEFT)
-            .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(theme::BORDER))
-            .title(title)
-            .title_style(Style::default().fg(theme::BORDER));
-
-        let inner = block.inner(area);
         self.visible_height = inner.height;
-        block.render(area, buf);
 
         let text_lines = self.build_text(inner.width);
         let para = Paragraph::new(text_lines)
+            .style(Style::default().bg(theme::BG_L0))
             .wrap(Wrap { trim: false });
         let total_visual = (para.line_count(inner.width) as u32).min(u16::MAX as u32) as u16;
         let max_offset = total_visual.saturating_sub(self.visible_height);
@@ -257,7 +259,7 @@ impl ChannelView {
                 y,
                 indicator,
                 Style::default()
-                    .fg(theme::MENTION)
+                    .fg(theme::WARNING)
                     .add_modifier(Modifier::BOLD),
             );
         }
@@ -272,22 +274,40 @@ impl ChannelView {
         area: Rect,
         buf: &mut Buffer,
     ) {
-        let title = format!(" #{} ", channel_name);
-        let border_color = if focused { theme::BORDER } else { theme::TIMESTAMP };
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(border_color))
-            .title(title)
-            .title_style(Style::default().fg(border_color));
+        // Fill with L1 background for panels
+        for y in area.y..area.y + area.height {
+            for x in area.x..area.x + area.width {
+                if let Some(cell) = buf.cell_mut((x, y)) {
+                    cell.set_bg(theme::BG_L1);
+                }
+            }
+        }
 
-        let inner = block.inner(area);
+        // Title line
+        let title_color = if focused { theme::BORDER_ACTIVE } else { theme::TIMESTAMP };
+        let title = format!("#{}", channel_name);
+        if area.height > 0 {
+            buf.set_string(
+                area.x + 2,
+                area.y,
+                &title,
+                Style::default().fg(title_color).add_modifier(Modifier::BOLD),
+            );
+        }
+
+        // Inner area: 2-char left/right padding, 1 row for title
+        let inner = Rect {
+            x: area.x + 2,
+            y: area.y + 1,
+            width: area.width.saturating_sub(4),
+            height: area.height.saturating_sub(1),
+        };
         state.visible_height = inner.height;
-        block.render(area, buf);
 
         let text_lines = self.build_text(inner.width);
 
         let para = Paragraph::new(text_lines)
+            .style(Style::default().bg(theme::BG_L1))
             .wrap(Wrap { trim: false });
         let total_visual = (para.line_count(inner.width) as u32).min(u16::MAX as u32) as u16;
         let max_offset = total_visual.saturating_sub(state.visible_height);
@@ -384,7 +404,7 @@ impl ChannelView {
                 continue;
             }
 
-            // Header: from → target  HH:MM:SS · +Xs
+            // Header: from -> target  HH:MM:SS +Xs
             let time_str = format_time(msg.timestamp);
             let interval_str = prev_timestamp
                 .map(|prev| format_interval(prev, msg.timestamp))
@@ -487,18 +507,35 @@ pub fn render_text_panel(
     area: Rect,
     buf: &mut Buffer,
 ) {
-    let title = format!(" {} ", title);
-    let border_color = if focused { theme::BORDER } else { theme::TIMESTAMP };
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(border_color))
-        .title(title)
-        .title_style(Style::default().fg(border_color));
+    // Fill with L1 background for panels
+    for y in area.y..area.y + area.height {
+        for x in area.x..area.x + area.width {
+            if let Some(cell) = buf.cell_mut((x, y)) {
+                cell.set_bg(theme::BG_L1);
+            }
+        }
+    }
 
-    let inner = block.inner(area);
+    // Title line
+    let title_color = if focused { theme::BORDER_ACTIVE } else { theme::TIMESTAMP };
+    let title_text = title.to_string();
+    if area.height > 0 {
+        buf.set_string(
+            area.x + 2,
+            area.y,
+            &title_text,
+            Style::default().fg(title_color).add_modifier(Modifier::BOLD),
+        );
+    }
+
+    // Inner area: 2-char left/right padding, 1 row for title
+    let inner = Rect {
+        x: area.x + 2,
+        y: area.y + 1,
+        width: area.width.saturating_sub(4),
+        height: area.height.saturating_sub(1),
+    };
     state.visible_height = inner.height;
-    block.render(area, buf);
 
     let text_lines: Vec<Line<'static>> = content
         .lines()
@@ -506,6 +543,7 @@ pub fn render_text_panel(
         .collect();
 
     let para = Paragraph::new(text_lines)
+        .style(Style::default().bg(theme::BG_L1))
         .wrap(Wrap { trim: false });
     let total_visual = (para.line_count(inner.width) as u32).min(u16::MAX as u32) as u16;
     let max_offset = total_visual.saturating_sub(state.visible_height);
@@ -532,20 +570,38 @@ pub fn render_dm_panel(
     area: Rect,
     buf: &mut Buffer,
 ) {
-    let title = format!(" {} ", title);
-    let border_color = if focused { theme::BORDER } else { theme::TIMESTAMP };
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(border_color))
-        .title(title)
-        .title_style(Style::default().fg(border_color));
+    // Fill with L1 background for panels
+    for y in area.y..area.y + area.height {
+        for x in area.x..area.x + area.width {
+            if let Some(cell) = buf.cell_mut((x, y)) {
+                cell.set_bg(theme::BG_L1);
+            }
+        }
+    }
 
-    let inner = block.inner(area);
+    // Title line
+    let title_color = if focused { theme::BORDER_ACTIVE } else { theme::TIMESTAMP };
+    let title_text = title.to_string();
+    if area.height > 0 {
+        buf.set_string(
+            area.x + 2,
+            area.y,
+            &title_text,
+            Style::default().fg(title_color).add_modifier(Modifier::BOLD),
+        );
+    }
+
+    // Inner area: 2-char left/right padding, 1 row for title
+    let inner = Rect {
+        x: area.x + 2,
+        y: area.y + 1,
+        width: area.width.saturating_sub(4),
+        height: area.height.saturating_sub(1),
+    };
     state.visible_height = inner.height;
-    block.render(area, buf);
 
     let para = Paragraph::new(lines)
+        .style(Style::default().bg(theme::BG_L1))
         .wrap(Wrap { trim: false });
     let total_visual = (para.line_count(inner.width) as u32).min(u16::MAX as u32) as u16;
     let max_offset = total_visual.saturating_sub(state.visible_height);
@@ -828,5 +884,30 @@ mod tests {
         let filtered_text: String = lines_filtered.iter().map(|l| format!("{:?}", l)).collect();
         assert!(filtered_text.contains("alice"));
         assert!(!filtered_text.contains("bob"));
+    }
+
+    // --- Render: no border, background colors ---
+
+    #[test]
+    fn render_fills_l0_background() {
+        let mut v = ChannelView::new();
+        let area = Rect::new(0, 0, 60, 20);
+        let mut buf = Buffer::empty(area);
+        v.render(area, &mut buf);
+        let cell = buf.cell((5, 5)).unwrap();
+        assert_eq!(cell.bg, theme::BG_L0);
+    }
+
+    #[test]
+    fn render_no_border_chars() {
+        let mut v = ChannelView::new();
+        v.push_system("test");
+        let area = Rect::new(0, 0, 60, 20);
+        let mut buf = Buffer::empty(area);
+        v.render(area, &mut buf);
+        // First column should be background, not a border character
+        let cell = buf.cell((0, 0)).unwrap();
+        let sym = cell.symbol();
+        assert!(sym == " " || sym == "", "expected space at (0,0), got {:?}", sym);
     }
 }

@@ -6,7 +6,7 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Widget, Wrap};
+use ratatui::widgets::{Paragraph, Widget, Wrap};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use tracing::debug;
@@ -319,46 +319,27 @@ impl DmView {
     // --- Rendering ---
 
     pub fn render(&mut self, area: Rect, buf: &mut Buffer) {
-        let title = format!(" 与 {} 的对话 ", self.agent_name);
-
-        let mut block = Block::default()
-            .borders(Borders::LEFT)
-            .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(theme::BORDER))
-            .title(title)
-            .title_style(Style::default().fg(theme::BORDER));
-
-        // Right-aligned top: model label + usage (e.g. "opus[1m] / 200k  50K/100K 50% $1.23")
-        let mut right_spans: Vec<Span> = Vec::new();
-        if let Some(ref model) = self.model_label {
-            right_spans.push(Span::styled(
-                format!(" {} ", model),
-                Style::default().fg(theme::BORDER),
-            ));
-        }
-        if let Some(ref label) = self.usage_label {
-            let color = if self.usage_ratio >= 0.9 {
-                Color::Red
-            } else if self.usage_ratio >= 0.8 {
-                Color::Yellow
-            } else {
-                theme::BORDER
-            };
-            right_spans.push(Span::styled(
-                format!(" {} ", label),
-                Style::default().fg(color),
-            ));
-        }
-        if !right_spans.is_empty() {
-            block = block.title_top(Line::from(right_spans).alignment(ratatui::layout::Alignment::Right));
+        // Fill with L0 background
+        for y in area.y..area.y + area.height {
+            for x in area.x..area.x + area.width {
+                if let Some(cell) = buf.cell_mut((x, y)) {
+                    cell.set_bg(theme::BG_L0);
+                }
+            }
         }
 
-        let inner = block.inner(area);
+        // Inner area: 2-char left/right padding
+        let inner = Rect {
+            x: area.x + 2,
+            y: area.y,
+            width: area.width.saturating_sub(4),
+            height: area.height,
+        };
         self.visible_height = inner.height;
-        block.render(area, buf);
 
         let text_lines = self.build_text(inner.width);
         let para = Paragraph::new(text_lines)
+            .style(Style::default().bg(theme::BG_L0))
             .wrap(Wrap { trim: false });
         let total_visual = (para.line_count(inner.width) as u32).min(u16::MAX as u32) as u16;
         let max_offset = total_visual.saturating_sub(self.visible_height);
@@ -386,7 +367,7 @@ impl DmView {
                 y,
                 indicator,
                 Style::default()
-                    .fg(theme::MENTION)
+                    .fg(theme::WARNING)
                     .add_modifier(Modifier::BOLD),
             );
         }
@@ -422,15 +403,18 @@ impl DmView {
         streaming_names.sort();
         for name in streaming_names {
             let msg = &self.streaming_messages[name];
+            let name_color = theme::agent_color(name);
+            let border = Span::styled("│ ".to_string(), Style::default().fg(name_color));
             out.push(Line::from(""));
             out.push(Line::from(vec![
+                border.clone(),
                 Span::styled(
                     name.clone(),
                     Style::default()
-                        .fg(theme::AGENT_MSG)
+                        .fg(name_color)
                         .add_modifier(Modifier::BOLD),
                 ),
-                Span::styled(cursor_char.to_string(), Style::default().fg(theme::MENTION)),
+                Span::styled(cursor_char.to_string(), Style::default().fg(theme::WARNING)),
             ]));
 
             if !msg.blocks.is_empty() {
@@ -439,7 +423,12 @@ impl DmView {
                     name, msg.blocks.len()
                 );
                 for block in &msg.blocks {
-                    let rendered = block_renderer::render_block(block, width);
+                    let mut rendered = block_renderer::render_block(block, width);
+                    for line in &mut rendered {
+                        let mut new_spans = vec![border.clone()];
+                        new_spans.extend(std::mem::take(&mut line.spans));
+                        line.spans = new_spans;
+                    }
                     out.extend(rendered);
                 }
             } else {
@@ -522,8 +511,15 @@ impl DmView {
 
             let name_color = theme::agent_color(&msg.from);
             let name_style = Style::default().fg(name_color).add_modifier(Modifier::BOLD);
+            let is_user = msg.from == "user";
+            let border_span = if !is_user {
+                Span::styled("│ ".to_string(), Style::default().fg(name_color))
+            } else {
+                Span::raw("".to_string())
+            };
 
-            let mut header = vec![Span::styled(msg.from.clone(), name_style)];
+            let mut header = vec![border_span.clone()];
+            header.push(Span::styled(msg.from.clone(), name_style));
             if let Some(ref origin) = channel_origin {
                 header.push(Span::styled(
                     format!("  [来自 #{} @{}]", origin.channel, origin.from),
@@ -540,9 +536,7 @@ impl DmView {
             }
             out.push(Line::from(header));
 
-            // Content via block_renderer — use pre-built blocks if they contain
-            // structured content (tool calls, thinking, etc). Plain text-only blocks
-            // go through content_to_blocks for channel-origin stripping etc.
+            // Content via block_renderer
             let fallback_blocks;
             let has_structured = msg.blocks.iter().any(|b| !matches!(b, ContentBlock::Text { .. }));
             let blocks = if has_structured {
@@ -560,6 +554,14 @@ impl DmView {
                 }
             }
             compact_rendered_lines(&mut content_lines);
+            // Prepend border strip to content lines for agent messages
+            if !is_user {
+                for line in &mut content_lines {
+                    let mut new_spans = vec![border_span.clone()];
+                    new_spans.extend(std::mem::take(&mut line.spans));
+                    line.spans = new_spans;
+                }
+            }
             out.extend(content_lines);
         }
 
@@ -1088,5 +1090,28 @@ mod tests {
         assert_eq!(o.channel, "general");
         assert_eq!(o.from, "bob");
         assert_eq!(text, "actual content");
+    }
+
+    // --- Render: no title bar ---
+
+    #[test]
+    fn render_no_title_bar() {
+        let mut dm = DmView::new("alice");
+        dm.push(&make_dm("user", "hello"));
+        let area = Rect::new(0, 0, 60, 20);
+        let mut buf = Buffer::empty(area);
+        dm.render(area, &mut buf);
+        let row0: String = (0..60).map(|x| buf.cell((x, 0)).unwrap().symbol().to_string()).collect();
+        assert!(!row0.contains("与"), "DM view should not have title bar");
+    }
+
+    #[test]
+    fn render_fills_l0_background() {
+        let mut dm = DmView::new("alice");
+        let area = Rect::new(0, 0, 60, 20);
+        let mut buf = Buffer::empty(area);
+        dm.render(area, &mut buf);
+        let cell = buf.cell((5, 5)).unwrap();
+        assert_eq!(cell.bg, theme::BG_L0);
     }
 }

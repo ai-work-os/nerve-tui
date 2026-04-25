@@ -34,7 +34,7 @@ impl AppLayout {
                 dm_w = main_w - min_panels_total;
             }
         }
-        dm_w.saturating_sub(2) // borders
+        dm_w.saturating_sub(4) // horizontal padding (2 each side)
     }
 
     pub fn new(area: Rect, input_lines: u16) -> Self {
@@ -235,12 +235,12 @@ mod tests {
         let w1 = AppLayout::input_inner_width(area, true, 1);
         let w2 = AppLayout::input_inner_width(area, true, 2);
 
-        // panel_count=0: full width minus borders
-        assert_eq!(w0, main_w - 2); // 98
-        // panel_count=1: 50% minus borders
-        assert_eq!(w1, main_w * 50 / 100 - 2); // 48
-        // panel_count=2: 40% minus borders
-        assert_eq!(w2, main_w * 40 / 100 - 2); // 38
+        // panel_count=0: full width minus horizontal padding (2 each side)
+        assert_eq!(w0, main_w - 4); // 96
+        // panel_count=1: 50% minus padding
+        assert_eq!(w1, main_w * 50 / 100 - 4); // 46
+        // panel_count=2: 40% minus padding
+        assert_eq!(w2, main_w * 40 / 100 - 4); // 36
         // More panels → narrower input
         assert!(w0 > w1);
         assert!(w1 > w2);

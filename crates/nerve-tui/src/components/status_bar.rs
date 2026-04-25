@@ -2,7 +2,7 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Widget};
+use ratatui::widgets::{Paragraph, Widget};
 use std::collections::HashSet;
 use std::time::Instant;
 
@@ -232,13 +232,21 @@ impl StatusBar {
         area: Rect,
         buf: &mut Buffer,
     ) {
-        let block = Block::default()
-            .borders(Borders::RIGHT)
-            .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(theme::BORDER));
-
-        let inner = block.inner(area);
-        block.render(area, buf);
+        // Fill sidebar background with L1
+        for y in area.y..area.y + area.height {
+            for x in area.x..area.x + area.width {
+                if let Some(cell) = buf.cell_mut((x, y)) {
+                    cell.set_bg(theme::BG_L1);
+                }
+            }
+        }
+        // Inner area: 2-char left padding, no border
+        let inner = Rect {
+            x: area.x + 2,
+            y: area.y,
+            width: area.width.saturating_sub(2),
+            height: area.height,
+        };
 
         let mut lines: Vec<Line> = Vec::new();
         lines.push(Line::from(Span::styled(
@@ -272,7 +280,9 @@ impl StatusBar {
                 "  (无)",
                 Style::default().fg(theme::SYSTEM_MSG),
             )));
-            Paragraph::new(lines).render(inner, buf);
+            Paragraph::new(lines)
+                .style(Style::default().bg(theme::BG_L1))
+                .render(inner, buf);
             return;
         }
 
@@ -386,7 +396,9 @@ impl StatusBar {
             }
         }
 
-        Paragraph::new(lines).render(inner, buf);
+        Paragraph::new(lines)
+            .style(Style::default().bg(theme::BG_L1))
+            .render(inner, buf);
     }
 
     /// Build the second line for an agent: `adapter [hint]` or just `adapter`.
@@ -1282,6 +1294,18 @@ mod tests {
         let area = Rect::new(0, 0, 24, 20);
         let mut buf = Buffer::empty(area);
         bar.render(&[], None, &agents, None, None, false, area, &mut buf);
+    }
+
+    #[test]
+    fn render_uses_l1_background_no_border() {
+        let bar = StatusBar::new();
+        let channels = make_channels(1);
+        let agents = make_agents(1);
+        let area = Rect::new(0, 0, 20, 15);
+        let mut buf = Buffer::empty(area);
+        bar.render(&channels, Some("ch0"), &agents, None, None, false, area, &mut buf);
+        let cell = buf.cell((1, 1)).unwrap();
+        assert_eq!(cell.bg, theme::BG_L1, "sidebar interior should have BG_L1 background");
     }
 
     #[test]

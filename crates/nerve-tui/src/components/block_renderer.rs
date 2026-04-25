@@ -7,6 +7,7 @@ use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd, CodeBlockKind};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use std::sync::LazyLock;
+use regex::Regex;
 use syntect::highlighting::{ThemeSet, Theme, Style as SynStyle};
 use syntect::parsing::SyntaxSet;
 use syntect::easy::HighlightLines;
@@ -34,6 +35,99 @@ static CODE_THEME: LazyLock<Theme> = LazyLock::new(|| {
         .cloned()
         .unwrap_or_else(|| ts.themes["base16-ocean.dark"].clone())
 });
+
+/// Maximum lines to show in collapsed tool results.
+const TOOL_RESULT_MAX_LINES: usize = 10;
+/// Maximum lines to show in expanded tool results.
+const TOOL_RESULT_EXPANDED_MAX: usize = 50;
+
+/// Strip known system XML tags and their content from text.
+/// Two passes: first remove paired tags with content, then orphan opening/closing tags.
+fn sanitize_content(text: &str) -> String {
+    static RE_PAIRED: LazyLock<Regex> = LazyLock::new(|| {
+        // The `regex` crate does not support backreferences — enumerate each tag pair explicitly.
+        Regex::new(
+            r"(?s)(?:<system-reminder>.*?</system-reminder>|<persisted-output>.*?</persisted-output>|<thinking>.*?</thinking>|<command-name>.*?</command-name>|<artifact>.*?</artifact>|<EXTREMELY_IMPORTANT>.*?</EXTREMELY_IMPORTANT>|<SUBAGENT-STOP>.*?</SUBAGENT-STOP>|<EXTREMELY-IMPORTANT>.*?</EXTREMELY-IMPORTANT>)"
+        ).unwrap()
+    });
+    let cleaned = RE_PAIRED.replace_all(text, "");
+    static RE_ORPHAN: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"</?(?:system-reminder|persisted-output|antml:thinking|command-name|artifact|EXTREMELY_IMPORTANT|SUBAGENT-STOP|EXTREMELY-IMPORTANT)>").unwrap()
+    });
+    RE_ORPHAN.replace_all(&cleaned, "").into_owned()
+}
+
+/// Extract a one-line summary from tool input based on tool name.
+/// Parses input as JSON and picks the most relevant field for display.
+fn extract_tool_summary(name: &str, input: &str) -> String {
+    if input.is_empty() {
+        return String::new();
+    }
+
+    let val: serde_json::Value = match serde_json::from_str(input) {
+        Ok(v) => v,
+        Err(_) => {
+            // Not JSON — return raw input, truncated
+            return truncate_str(input, 40);
+        }
+    };
+
+    let obj = match val.as_object() {
+        Some(o) => o,
+        None => return truncate_str(input, 40),
+    };
+
+    let get_str = |key: &str| -> Option<String> {
+        obj.get(key).and_then(|v| v.as_str()).map(|s| s.to_string())
+    };
+
+    match name {
+        "Bash" => {
+            if let Some(cmd) = get_str("command") {
+                truncate_str(&cmd, 60)
+            } else {
+                truncate_str(input, 40)
+            }
+        }
+        "Read" => {
+            if let Some(path) = get_str("file_path") {
+                let offset = obj.get("offset").and_then(|v| v.as_u64());
+                let limit = obj.get("limit").and_then(|v| v.as_u64());
+                match (offset, limit) {
+                    (Some(o), Some(l)) => format!("{} ({}-{})", path, o, o + l),
+                    (Some(o), None) => format!("{} ({}-)", path, o),
+                    _ => path,
+                }
+            } else {
+                truncate_str(input, 40)
+            }
+        }
+        "Edit" | "Write" => {
+            get_str("file_path").unwrap_or_else(|| truncate_str(input, 40))
+        }
+        "WebSearch" => {
+            get_str("query").unwrap_or_else(|| truncate_str(input, 40))
+        }
+        "WebFetch" => {
+            get_str("url").unwrap_or_else(|| truncate_str(input, 40))
+        }
+        "Agent" => {
+            get_str("description").unwrap_or_else(|| truncate_str(input, 40))
+        }
+        _ => {
+            truncate_str(input, 40)
+        }
+    }
+}
+
+/// Truncate a string to `max_len` characters, appending "..." if truncated.
+fn truncate_str(s: &str, max_len: usize) -> String {
+    if s.len() <= max_len {
+        s.to_string()
+    } else {
+        format!("{}...", &s[..max_len])
+    }
+}
 
 /// Render any ContentBlock to styled lines (full expanded view).
 pub fn render_block(block: &ContentBlock, width: u16) -> Vec<Line<'static>> {
@@ -67,11 +161,18 @@ fn render_block_inner(block: &ContentBlock, width: u16, collapsed: bool) -> Vec<
     }
 }
 
-/// Render a ContentBlock in summary mode: only Text blocks (with code fences stripped).
+/// Render a ContentBlock in summary mode.
+/// Text: full render (including code blocks). ToolCall: one-line summary.
+/// Thinking & ToolResult: hidden. Error: shown.
 pub fn render_block_summary(block: &ContentBlock, width: u16) -> Vec<Line<'static>> {
     match block {
-        ContentBlock::Text { text } => render_text_summary(text, width),
-        _ => vec![], // non-text blocks hidden in summary mode
+        ContentBlock::Text { text } => render_text(text, width),
+        ContentBlock::ToolCall { name, input, status, .. } => {
+            render_tool_call_summary(name, input, status)
+        }
+        ContentBlock::Thinking { .. } => vec![],
+        ContentBlock::ToolResult { .. } => vec![],
+        ContentBlock::Error { message } => render_error(message),
     }
 }
 
@@ -81,13 +182,15 @@ pub fn render_block_summary(block: &ContentBlock, width: u16) -> Vec<Line<'stati
 
 fn render_text(content: &str, _width: u16) -> Vec<Line<'static>> {
     let mut out = Vec::new();
-    render_markdown(content, &mut out, false);
+    let cleaned = sanitize_content(content);
+    render_markdown(&cleaned, &mut out, false);
     out
 }
 
 fn render_text_summary(content: &str, _width: u16) -> Vec<Line<'static>> {
     let mut out = Vec::new();
-    render_markdown(content, &mut out, true);
+    let cleaned = sanitize_content(content);
+    render_markdown(&cleaned, &mut out, true);
     out
 }
 
@@ -163,7 +266,7 @@ fn render_markdown(content: &str, out: &mut Vec<Line<'static>>, skip_code_blocks
                 out.push(Line::from(Span::styled(
                     text,
                     Style::default()
-                        .fg(Color::Cyan)
+                        .fg(theme::PRIMARY)
                         .add_modifier(Modifier::BOLD),
                 )));
                 is_heading = false;
@@ -204,7 +307,7 @@ fn render_markdown(content: &str, out: &mut Vec<Line<'static>>, skip_code_blocks
                 } else {
                     current_spans.push(Span::styled(
                         text.to_string(),
-                        Style::default().fg(Color::Yellow),
+                        Style::default().fg(theme::WARNING),
                     ));
                 }
             }
@@ -330,7 +433,7 @@ fn render_table(table_rows: &[(Vec<String>, bool)]) -> Vec<Line<'static>> {
             let pad = target_w.saturating_sub(display_w);
             let padded = format!("{}{}", cell, " ".repeat(pad));
             let style = if *is_header {
-                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+                Style::default().fg(theme::PRIMARY).add_modifier(Modifier::BOLD)
             } else {
                 Style::default()
             };
@@ -357,7 +460,7 @@ fn render_table(table_rows: &[(Vec<String>, bool)]) -> Vec<Line<'static>> {
     out
 }
 
-/// Highlight code using syntect. Falls back to plain DarkGray on unknown language.
+/// Highlight code using syntect. Falls back to plain muted text on unknown language.
 fn highlight_code(code: &str, lang: &str) -> Vec<Line<'static>> {
     let ss = &*SYNTAX_SET;
     let theme = &*CODE_THEME;
@@ -372,16 +475,13 @@ fn highlight_code(code: &str, lang: &str) -> Vec<Line<'static>> {
     let mut h = HighlightLines::new(syntax, theme);
     let mut lines = Vec::new();
 
-    // Opening border
-    let lang_label = if lang.is_empty() {
-        "───".to_string()
-    } else {
-        format!("─── {} ───", lang)
-    };
-    lines.push(Line::from(Span::styled(
-        lang_label,
-        Style::default().fg(Color::DarkGray),
-    )));
+    // Language label (small, muted) — no separator lines
+    if !lang.is_empty() {
+        lines.push(Line::from(Span::styled(
+            lang.to_string(),
+            Style::default().fg(theme::TEXT_MUTED).bg(theme::BG_L1),
+        )));
+    }
 
     for line in code.lines() {
         match h.highlight_line(line, &ss) {
@@ -400,24 +500,18 @@ fn highlight_code(code: &str, lang: &str) -> Vec<Line<'static>> {
             Err(_) => {
                 lines.push(Line::from(Span::styled(
                     line.to_string(),
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(theme::TEXT_MUTED).bg(theme::BG_L1),
                 )));
             }
         }
     }
-
-    // Closing border
-    lines.push(Line::from(Span::styled(
-        "───".to_string(),
-        Style::default().fg(Color::DarkGray),
-    )));
 
     lines
 }
 
 fn syntect_style_to_ratatui(syn: SynStyle) -> Style {
     let fg = Color::Rgb(syn.foreground.r, syn.foreground.g, syn.foreground.b);
-    Style::default().fg(fg)
+    Style::default().fg(fg).bg(theme::BG_L1)
 }
 
 // ---------------------------------------------------------------------------
@@ -435,7 +529,7 @@ fn render_thinking(text: &str, elapsed: Option<std::time::Duration>, collapsed: 
     lines.push(Line::from(Span::styled(
         header,
         Style::default()
-            .fg(Color::DarkGray)
+            .fg(theme::BORDER_ACTIVE)
             .add_modifier(Modifier::ITALIC),
     )));
 
@@ -443,7 +537,7 @@ fn render_thinking(text: &str, elapsed: Option<std::time::Duration>, collapsed: 
         for line in text.lines() {
             lines.push(Line::from(Span::styled(
                 format!("  │ {}", line),
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(theme::BORDER_ACTIVE),
             )));
         }
     }
@@ -459,16 +553,89 @@ fn render_tool_call(name: &str, input: &str, status: &ToolStatus, collapsed: boo
     let mut lines = Vec::new();
 
     let (icon, icon_color) = match status {
-        ToolStatus::Pending => ("⏳", Color::Yellow),
-        ToolStatus::Running => ("⏳", Color::Green),
-        ToolStatus::Completed => ("✓", Color::Green),
-        ToolStatus::Failed => ("✗", Color::Red),
+        ToolStatus::Pending => ("⏳", theme::WARNING),
+        ToolStatus::Running => ("⏳", theme::SUCCESS),
+        ToolStatus::Completed => ("✓", theme::SUCCESS),
+        ToolStatus::Failed => ("✗", theme::ERROR),
     };
 
     debug!(tool_name = name, ?status, collapsed, "rendering tool_call block");
 
-    // Header: icon + tool name
-    lines.push(Line::from(vec![
+    if collapsed {
+        // Compact one-line: icon + name + ": " + summary
+        let summary = extract_tool_summary(name, input);
+        let mut spans = vec![
+            Span::styled(format!("  {} ", icon), Style::default().fg(icon_color)),
+            Span::styled(
+                name.to_string(),
+                Style::default()
+                    .fg(theme::TOOL_NAME)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ];
+        if !summary.is_empty() {
+            spans.push(Span::styled(
+                format!(": {}", summary),
+                Style::default().fg(theme::TOOL_VALUE),
+            ));
+        }
+        lines.push(Line::from(spans));
+    } else {
+        // Header: icon + tool name
+        lines.push(Line::from(vec![
+            Span::styled(format!("  {} ", icon), Style::default().fg(icon_color)),
+            Span::styled(
+                name.to_string(),
+                Style::default()
+                    .fg(theme::TOOL_NAME)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]));
+
+        // Show input args when expanded
+        if !input.is_empty() {
+            if let Ok(val) = serde_json::from_str::<serde_json::Value>(input) {
+                if let Some(obj) = val.as_object() {
+                    for (k, v) in obj {
+                        let v_str = match v {
+                            serde_json::Value::String(s) => s.clone(),
+                            _ => v.to_string(),
+                        };
+                        lines.push(Line::from(vec![
+                            Span::styled(
+                                format!("    {}: ", k),
+                                Style::default().fg(theme::TOOL_KEY),
+                            ),
+                            Span::styled(v_str, Style::default().fg(theme::TOOL_VALUE)),
+                        ]));
+                    }
+                }
+            } else {
+                // Plain string input
+                for line in input.lines() {
+                    lines.push(Line::from(Span::styled(
+                        format!("    {}", line),
+                        Style::default().fg(theme::TOOL_VALUE),
+                    )));
+                }
+            }
+        }
+    }
+
+    lines
+}
+
+/// Render a ToolCall as a single summary line (for summary_mode).
+fn render_tool_call_summary(name: &str, input: &str, status: &ToolStatus) -> Vec<Line<'static>> {
+    let (icon, icon_color) = match status {
+        ToolStatus::Pending => ("⏳", theme::WARNING),
+        ToolStatus::Running => ("⏳", theme::SUCCESS),
+        ToolStatus::Completed => ("✓", theme::SUCCESS),
+        ToolStatus::Failed => ("✗", theme::ERROR),
+    };
+
+    let summary = extract_tool_summary(name, input);
+    let mut spans = vec![
         Span::styled(format!("  {} ", icon), Style::default().fg(icon_color)),
         Span::styled(
             name.to_string(),
@@ -476,38 +643,15 @@ fn render_tool_call(name: &str, input: &str, status: &ToolStatus, collapsed: boo
                 .fg(theme::TOOL_NAME)
                 .add_modifier(Modifier::BOLD),
         ),
-    ]));
-
-    // Show input args only when expanded
-    if !collapsed && !input.is_empty() {
-        if let Ok(val) = serde_json::from_str::<serde_json::Value>(input) {
-            if let Some(obj) = val.as_object() {
-                for (k, v) in obj {
-                    let v_str = match v {
-                        serde_json::Value::String(s) => s.clone(),
-                        _ => v.to_string(),
-                    };
-                    lines.push(Line::from(vec![
-                        Span::styled(
-                            format!("    {}: ", k),
-                            Style::default().fg(theme::TOOL_KEY),
-                        ),
-                        Span::styled(v_str, Style::default().fg(theme::TOOL_VALUE)),
-                    ]));
-                }
-            }
-        } else {
-            // Plain string input
-            for line in input.lines() {
-                lines.push(Line::from(Span::styled(
-                    format!("    {}", line),
-                    Style::default().fg(theme::TOOL_VALUE),
-                )));
-            }
-        }
+    ];
+    if !summary.is_empty() {
+        spans.push(Span::styled(
+            format!(": {}", summary),
+            Style::default().fg(theme::TOOL_VALUE),
+        ));
     }
 
-    lines
+    vec![Line::from(spans)]
 }
 
 // ---------------------------------------------------------------------------
@@ -521,11 +665,11 @@ fn render_tool_result(content: &str, is_error: bool, collapsed: bool) -> Vec<Lin
     let line_count = content_lines.len();
 
     let (label, label_color) = if is_error {
-        ("  ✗ 结果（错误）".to_string(), Color::Red)
-    } else if collapsed && line_count > 3 {
-        (format!("  ✓ 结果 ({} 行)", line_count), theme::TOOL_LABEL)
+        ("  ✗ 结果（错误）".to_string(), theme::ERROR)
+    } else if line_count > TOOL_RESULT_MAX_LINES {
+        (format!("  ✓ 结果 ({} 行)", line_count), theme::TEXT_MUTED)
     } else {
-        ("  ✓ 结果".to_string(), theme::TOOL_LABEL)
+        ("  ✓ 结果".to_string(), theme::TEXT_MUTED)
     };
 
     lines.push(Line::from(Span::styled(
@@ -534,22 +678,52 @@ fn render_tool_result(content: &str, is_error: bool, collapsed: bool) -> Vec<Lin
     )));
 
     let content_color = if is_error {
-        Color::Red
+        theme::ERROR
     } else {
-        theme::TOOL_VALUE
+        theme::TEXT
     };
 
-    if collapsed {
-        // Show first 3 lines when collapsed
-        let show_count = line_count.min(3);
-        for line in &content_lines[..show_count] {
+    // Error content is never truncated
+    if is_error {
+        for line in content.lines() {
+            lines.push(Line::from(Span::styled(
+                format!("    {}", line),
+                Style::default().fg(content_color),
+            )));
+        }
+        return lines;
+    }
+
+    let (max_lines, head_count, tail_count) = if collapsed {
+        (TOOL_RESULT_MAX_LINES, 5usize, 2usize)
+    } else {
+        (TOOL_RESULT_EXPANDED_MAX, 25usize, 5usize)
+    };
+
+    if line_count <= max_lines {
+        // Show all lines
+        for line in &content_lines {
             lines.push(Line::from(Span::styled(
                 format!("    {}", line),
                 Style::default().fg(content_color),
             )));
         }
     } else {
-        for line in content.lines() {
+        // Head
+        for line in &content_lines[..head_count] {
+            lines.push(Line::from(Span::styled(
+                format!("    {}", line),
+                Style::default().fg(content_color),
+            )));
+        }
+        // Ellipsis
+        let hidden = line_count - head_count - tail_count;
+        lines.push(Line::from(Span::styled(
+            format!("    \u{2026} +{} lines", hidden),
+            Style::default().fg(theme::TEXT_MUTED),
+        )));
+        // Tail
+        for line in &content_lines[line_count - tail_count..] {
             lines.push(Line::from(Span::styled(
                 format!("    {}", line),
                 Style::default().fg(content_color),
@@ -567,7 +741,7 @@ fn render_tool_result(content: &str, is_error: bool, collapsed: bool) -> Vec<Lin
 fn render_error(message: &str) -> Vec<Line<'static>> {
     vec![Line::from(Span::styled(
         format!("  ⚠ {}", message),
-        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        Style::default().fg(theme::ERROR).add_modifier(Modifier::BOLD),
     ))]
 }
 
@@ -690,7 +864,7 @@ mod tests {
             .flat_map(|l| l.spans.iter())
             .find(|s| s.content.as_ref() == "Title");
         assert!(heading_span.is_some());
-        assert_eq!(heading_span.unwrap().style.fg, Some(Color::Cyan));
+        assert_eq!(heading_span.unwrap().style.fg, Some(theme::PRIMARY));
     }
 
     #[test]
@@ -711,7 +885,7 @@ mod tests {
             .flat_map(|l| l.spans.iter())
             .find(|s| s.content.as_ref() == "foo()");
         assert!(code_span.is_some());
-        assert_eq!(code_span.unwrap().style.fg, Some(Color::Yellow));
+        assert_eq!(code_span.unwrap().style.fg, Some(theme::WARNING));
     }
 
     // --- Thinking block tests ---
@@ -833,7 +1007,7 @@ mod tests {
         let error_span = lines.iter()
             .flat_map(|l| l.spans.iter())
             .find(|s| s.content.contains("command not found"));
-        assert_eq!(error_span.unwrap().style.fg, Some(Color::Red));
+        assert_eq!(error_span.unwrap().style.fg, Some(theme::ERROR));
     }
 
     #[test]
@@ -878,7 +1052,7 @@ mod tests {
         let text: String = lines[0].spans.iter().map(|s| s.content.to_string()).collect();
         assert!(text.contains("⚠"));
         assert!(text.contains("something went wrong"));
-        assert_eq!(lines[0].spans[0].style.fg, Some(Color::Red));
+        assert_eq!(lines[0].spans[0].style.fg, Some(theme::ERROR));
     }
 
     // --- render_block dispatch tests ---
@@ -935,7 +1109,7 @@ mod tests {
     #[test]
     fn highlight_code_rust() {
         let lines = highlight_code("fn main() {\n    println!(\"hello\");\n}", "rust");
-        // Should have: lang label + 2 code lines + closing border = 4+
+        // lang label + 3 code lines = 4
         assert!(lines.len() >= 4);
         let text: String = lines.iter()
             .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
@@ -948,7 +1122,8 @@ mod tests {
     #[test]
     fn highlight_code_unknown_lang_fallback() {
         let lines = highlight_code("some stuff", "nonexistent_lang");
-        assert!(lines.len() >= 3); // border + 1 line + border
+        // lang label + 1 line = 2
+        assert!(lines.len() >= 2);
     }
 
     // --- Table rendering tests ---
@@ -990,7 +1165,7 @@ mod tests {
             .find(|s| s.content.contains("Name"));
         assert!(header_span.is_some(), "should find Name span");
         let span = header_span.unwrap();
-        assert_eq!(span.style.fg, Some(Color::Cyan));
+        assert_eq!(span.style.fg, Some(theme::PRIMARY));
         assert!(span.style.add_modifier.contains(Modifier::BOLD));
     }
 
@@ -1190,13 +1365,13 @@ mod tests {
 
     #[test]
     fn tool_call_collapsed_shows_header_only() {
-        let input = r#"{"path": "/tmp/test.rs", "content": "fn main() {}"}"#;
+        let input = r#"{"file_path": "/tmp/test.rs", "content": "fn main() {}"}"#;
         let lines = render_tool_call("Write", input, &ToolStatus::Completed, true);
-        // Collapsed: only header line (icon + name), no args
+        // Collapsed: one line with summary (file_path)
         assert_eq!(lines.len(), 1);
         let text = lines_to_text(&lines);
         assert!(text.contains("Write"));
-        assert!(!text.contains("path"));
+        assert!(text.contains("/tmp/test.rs"), "collapsed should show file path summary");
     }
 
     #[test]
@@ -1210,16 +1385,80 @@ mod tests {
     }
 
     #[test]
-    fn tool_result_collapsed_shows_first_3_lines() {
+    fn tool_result_collapsed_shows_truncated() {
         let content = (0..10).map(|i| format!("line {}", i)).collect::<Vec<_>>().join("\n");
         let lines = render_tool_result(&content, false, true);
-        // Collapsed: header + 3 content lines = 4
-        assert_eq!(lines.len(), 4);
+        // 10 lines == TOOL_RESULT_MAX_LINES, show all: header + 10 = 11
+        assert_eq!(lines.len(), 11);
         let text = lines_to_text(&lines);
         assert!(text.contains("line 0"));
-        assert!(text.contains("line 2"));
-        assert!(!text.contains("line 3"));
-        assert!(text.contains("10 行")); // line count in header
+        assert!(text.contains("line 9"));
+    }
+
+    // --- ToolResult truncation tests ---
+
+    #[test]
+    fn tool_result_short_content_unchanged_collapsed() {
+        let content = (0..5).map(|i| format!("line {}", i)).collect::<Vec<_>>().join("\n");
+        let lines = render_tool_result(&content, false, true);
+        let text = lines_to_text(&lines);
+        assert!(text.contains("line 0"));
+        assert!(text.contains("line 4"));
+        assert!(!text.contains("\u{2026}"), "short content should not be truncated");
+    }
+
+    #[test]
+    fn tool_result_long_content_truncated_collapsed() {
+        let content = (0..20).map(|i| format!("line {}", i)).collect::<Vec<_>>().join("\n");
+        let lines = render_tool_result(&content, false, true);
+        let text = lines_to_text(&lines);
+        assert!(text.contains("line 0"));
+        assert!(text.contains("line 4"));
+        assert!(!text.contains("line 5\n") && !text.contains("line 5 ") && !text.contains("    line 5"));
+        assert!(text.contains("\u{2026}"));
+        assert!(text.contains("line 18"));
+        assert!(text.contains("line 19"));
+    }
+
+    #[test]
+    fn tool_result_long_content_truncated_expanded() {
+        let content = (0..100).map(|i| format!("line {}", i)).collect::<Vec<_>>().join("\n");
+        let lines = render_tool_result(&content, false, false);
+        let text = lines_to_text(&lines);
+        assert!(text.contains("line 0"));
+        assert!(text.contains("line 24"));
+        assert!(text.contains("\u{2026}"));
+        assert!(text.contains("line 95"));
+        assert!(text.contains("line 99"));
+    }
+
+    #[test]
+    fn tool_result_expanded_short_no_truncation() {
+        let content = (0..30).map(|i| format!("line {}", i)).collect::<Vec<_>>().join("\n");
+        let lines = render_tool_result(&content, false, false);
+        let text = lines_to_text(&lines);
+        assert!(text.contains("line 0"));
+        assert!(text.contains("line 29"));
+        assert!(!text.contains("\u{2026}"), "30 lines should not be truncated in expanded mode");
+    }
+
+    #[test]
+    fn tool_result_error_not_truncated() {
+        let content = (0..100).map(|i| format!("error line {}", i)).collect::<Vec<_>>().join("\n");
+        let lines = render_tool_result(&content, true, false);
+        let text = lines_to_text(&lines);
+        assert!(text.contains("error line 0"));
+        assert!(text.contains("error line 99"));
+        assert!(!text.contains("\u{2026}"), "error content should not be truncated");
+    }
+
+    #[test]
+    fn tool_result_truncation_ellipsis_shows_count() {
+        let content = (0..100).map(|i| format!("line {}", i)).collect::<Vec<_>>().join("\n");
+        let lines = render_tool_result(&content, false, true);
+        let text = lines_to_text(&lines);
+        // Collapsed: 100 lines, show 5 head + 2 tail = 7 shown, 93 hidden
+        assert!(text.contains("+93 lines"), "ellipsis should show hidden line count, got: {}", text);
     }
 
     #[test]
@@ -1280,7 +1519,7 @@ mod tests {
     }
 
     #[test]
-    fn summary_mode_hides_tool_call_block() {
+    fn summary_mode_shows_tool_call_block() {
         let block = ContentBlock::ToolCall {
             id: "tc1".into(),
             name: "Read".into(),
@@ -1288,24 +1527,19 @@ mod tests {
             status: ToolStatus::Completed,
         };
         let lines = render_block_summary(&block, 80);
-        assert!(
-            lines.is_empty(),
-            "summary mode should hide tool_call blocks, got {} lines",
-            lines.len()
-        );
+        assert_eq!(lines.len(), 1, "summary mode should show tool_call as 1-line summary");
     }
 
     #[test]
-    fn summary_mode_hides_code_fence_in_text() {
+    fn summary_mode_shows_code_fence_in_text() {
         let text_with_code = "Here is some text\n```rust\nfn main() {}\n```\nMore text after";
         let block = ContentBlock::Text { text: text_with_code.into() };
         let lines = render_block_summary(&block, 80);
         let rendered: String = lines.iter()
             .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
             .collect();
-        // Code fence content should be hidden
-        assert!(!rendered.contains("fn main"), "summary mode should hide code fences");
-        // Plain text should remain
+        // Code fence content should now be VISIBLE in summary mode
+        assert!(rendered.contains("fn main"), "summary mode should now show code fences");
         assert!(rendered.contains("Here is some text"), "summary mode should keep plain text");
         assert!(rendered.contains("More text after"), "summary mode should keep text after code fence");
     }
@@ -1319,4 +1553,402 @@ mod tests {
             .collect();
         assert!(rendered.contains("simple plain text"));
     }
+
+    // --- Task 5 & 6: separator removal + warm colors ---
+
+    #[test]
+    fn code_block_no_separator_lines() {
+        let lines = highlight_code("fn main() {}", "rust");
+        let text: String = lines.iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
+            .collect();
+        assert!(!text.contains("───"), "code block should not have separator lines");
+        assert!(text.contains("rust"), "code block should show language name");
+    }
+
+    #[test]
+    fn thinking_uses_warm_color() {
+        let elapsed = Some(Duration::from_secs_f64(1.0));
+        let lines = render_thinking("test", elapsed, true);
+        let span = &lines[0].spans[0];
+        assert_eq!(span.style.fg, Some(theme::BORDER_ACTIVE));
+    }
+
+    #[test]
+    fn tool_call_completed_uses_success_color() {
+        let lines = render_tool_call("Read", "{}", &ToolStatus::Completed, true);
+        let icon_span = &lines[0].spans[0];
+        assert_eq!(icon_span.style.fg, Some(theme::SUCCESS));
+    }
+
+    // --- sanitize_content tests ---
+
+    #[test]
+    fn sanitize_strips_system_reminder() {
+        let input = "Hello<system-reminder>secret stuff</system-reminder> world";
+        let result = sanitize_content(input);
+        assert_eq!(result, "Hello world");
+    }
+
+    #[test]
+    fn sanitize_strips_persisted_output() {
+        let input = "Before<persisted-output>hidden</persisted-output>After";
+        let result = sanitize_content(input);
+        assert_eq!(result, "BeforeAfter");
+    }
+
+    #[test]
+    fn sanitize_strips_antml_thinking() {
+        let input = "Start<thinking>internal thought</thinking>End";
+        let result = sanitize_content(input);
+        assert_eq!(result, "StartEnd");
+    }
+
+    #[test]
+    fn sanitize_strips_command_name() {
+        let input = "A<command-name>cmd</command-name>B";
+        let result = sanitize_content(input);
+        assert_eq!(result, "AB");
+    }
+
+    #[test]
+    fn sanitize_strips_artifact() {
+        let input = "X<artifact>content</artifact>Y";
+        let result = sanitize_content(input);
+        assert_eq!(result, "XY");
+    }
+
+    #[test]
+    fn sanitize_strips_extremely_important_underscore() {
+        let input = "A<EXTREMELY_IMPORTANT>do this</EXTREMELY_IMPORTANT>B";
+        let result = sanitize_content(input);
+        assert_eq!(result, "AB");
+    }
+
+    #[test]
+    fn sanitize_strips_subagent_stop() {
+        let input = "A<SUBAGENT-STOP>stop</SUBAGENT-STOP>B";
+        let result = sanitize_content(input);
+        assert_eq!(result, "AB");
+    }
+
+    #[test]
+    fn sanitize_strips_extremely_important_hyphen() {
+        let input = "A<EXTREMELY-IMPORTANT>urgent</EXTREMELY-IMPORTANT>B";
+        let result = sanitize_content(input);
+        assert_eq!(result, "AB");
+    }
+
+    #[test]
+    fn sanitize_preserves_normal_html() {
+        let input = "Use <b>bold</b> and <i>italic</i>";
+        let result = sanitize_content(input);
+        assert_eq!(result, "Use <b>bold</b> and <i>italic</i>");
+    }
+
+    #[test]
+    fn sanitize_handles_nested_tags() {
+        let input = "A<system-reminder>outer<persisted-output>inner</persisted-output>still outer</system-reminder>B";
+        let result = sanitize_content(input);
+        // The outer regex matches system-reminder greedily up to its closing tag.
+        // Inner persisted-output is consumed as part of system-reminder content.
+        assert_eq!(result, "AB");
+    }
+
+    #[test]
+    fn sanitize_strips_multiline_tag() {
+        let input = "Hello\n<system-reminder>\nline1\nline2\n</system-reminder>\nWorld";
+        let result = sanitize_content(input);
+        assert_eq!(result, "Hello\n\nWorld");
+    }
+
+    #[test]
+    fn sanitize_strips_orphan_opening_tag() {
+        let input = "Hello <system-reminder> world";
+        let result = sanitize_content(input);
+        assert_eq!(result, "Hello  world");
+    }
+
+    #[test]
+    fn sanitize_strips_orphan_closing_tag() {
+        let input = "Hello </system-reminder> world";
+        let result = sanitize_content(input);
+        assert_eq!(result, "Hello  world");
+    }
+
+    #[test]
+    fn sanitize_empty_result() {
+        let input = "<system-reminder>everything is hidden</system-reminder>";
+        let result = sanitize_content(input);
+        assert_eq!(result, "");
+    }
+
+    #[test]
+    fn sanitize_content_between_different_tags_preserved() {
+        let input = "<system-reminder>hidden</system-reminder>visible<persisted-output>also hidden</persisted-output>";
+        let result = sanitize_content(input);
+        assert_eq!(result, "visible");
+    }
+
+    #[test]
+    fn sanitize_no_tags_unchanged() {
+        let input = "Just normal text with no XML tags";
+        let result = sanitize_content(input);
+        assert_eq!(result, "Just normal text with no XML tags");
+    }
+
+    // --- extract_tool_summary tests ---
+
+    #[test]
+    fn tool_summary_bash_extracts_command() {
+        let input = r#"{"command": "ls -la /tmp"}"#;
+        let result = extract_tool_summary("Bash", input);
+        assert_eq!(result, "ls -la /tmp");
+    }
+
+    #[test]
+    fn tool_summary_bash_truncates_long_command() {
+        let long_cmd = "a".repeat(100);
+        let input = format!(r#"{{"command": "{}"}}"#, long_cmd);
+        let result = extract_tool_summary("Bash", &input);
+        assert_eq!(result.len(), 63); // 60 chars + "..."
+        assert!(result.ends_with("..."));
+    }
+
+    #[test]
+    fn tool_summary_read_extracts_file_path() {
+        let input = r#"{"file_path": "/src/main.rs"}"#;
+        let result = extract_tool_summary("Read", input);
+        assert_eq!(result, "/src/main.rs");
+    }
+
+    #[test]
+    fn tool_summary_read_with_offset_and_limit() {
+        let input = r#"{"file_path": "/src/main.rs", "offset": 10, "limit": 50}"#;
+        let result = extract_tool_summary("Read", input);
+        assert_eq!(result, "/src/main.rs (10-60)");
+    }
+
+    #[test]
+    fn tool_summary_read_with_offset_only() {
+        let input = r#"{"file_path": "/src/main.rs", "offset": 10}"#;
+        let result = extract_tool_summary("Read", input);
+        assert_eq!(result, "/src/main.rs (10-)");
+    }
+
+    #[test]
+    fn tool_summary_edit_extracts_file_path() {
+        let input = r#"{"file_path": "/src/theme.rs", "old_string": "foo", "new_string": "bar"}"#;
+        let result = extract_tool_summary("Edit", input);
+        assert_eq!(result, "/src/theme.rs");
+    }
+
+    #[test]
+    fn tool_summary_write_extracts_file_path() {
+        let input = r#"{"file_path": "/src/main.rs", "content": "fn main() {}"}"#;
+        let result = extract_tool_summary("Write", input);
+        assert_eq!(result, "/src/main.rs");
+    }
+
+    #[test]
+    fn tool_summary_websearch_extracts_query() {
+        let input = r#"{"query": "ratatui background color"}"#;
+        let result = extract_tool_summary("WebSearch", input);
+        assert_eq!(result, "ratatui background color");
+    }
+
+    #[test]
+    fn tool_summary_webfetch_extracts_url() {
+        let input = r#"{"url": "https://example.com/page"}"#;
+        let result = extract_tool_summary("WebFetch", input);
+        assert_eq!(result, "https://example.com/page");
+    }
+
+    #[test]
+    fn tool_summary_agent_extracts_description() {
+        let input = r#"{"description": "Explore code structure"}"#;
+        let result = extract_tool_summary("Agent", input);
+        assert_eq!(result, "Explore code structure");
+    }
+
+    #[test]
+    fn tool_summary_unknown_tool_truncates_raw() {
+        let input = r#"{"key": "value", "another": "field"}"#;
+        let result = extract_tool_summary("UnknownTool", input);
+        assert!(result.len() <= 43); // 40 + "..."
+    }
+
+    #[test]
+    fn tool_summary_missing_field_fallback() {
+        let input = r#"{"other_field": "value"}"#;
+        let result = extract_tool_summary("Bash", input);
+        // Falls back to truncated raw input
+        assert!(result.len() <= 43);
+    }
+
+    #[test]
+    fn tool_summary_non_json_input() {
+        let input = "just plain text input";
+        let result = extract_tool_summary("Bash", input);
+        assert_eq!(result, "just plain text input");
+    }
+
+    #[test]
+    fn tool_summary_empty_input() {
+        let result = extract_tool_summary("Bash", "");
+        assert_eq!(result, "");
+    }
+
+    #[test]
+    fn tool_summary_empty_json() {
+        let result = extract_tool_summary("Bash", "{}");
+        assert!(result.len() <= 43);
+    }
+
+    // --- Code block background tests ---
+
+    #[test]
+    fn code_block_spans_have_bg_color() {
+        let lines = highlight_code("let x = 1;", "rust");
+        // Skip the language label line (index 0), check code lines
+        for line in &lines[1..] {
+            for span in &line.spans {
+                assert_eq!(
+                    span.style.bg,
+                    Some(theme::BG_L1),
+                    "code span '{}' should have BG_L1 background",
+                    span.content
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn code_block_lang_label_has_bg_color() {
+        let lines = highlight_code("x = 1", "python");
+        // First line is the language label
+        assert!(!lines.is_empty());
+        let label_line = &lines[0];
+        for span in &label_line.spans {
+            assert_eq!(
+                span.style.bg,
+                Some(theme::BG_L1),
+                "language label span should have BG_L1 background"
+            );
+        }
+    }
+
+    #[test]
+    fn code_block_no_lang_has_bg_color() {
+        let lines = highlight_code("plain code", "");
+        // No language label, just code
+        assert!(!lines.is_empty());
+        for line in &lines {
+            for span in &line.spans {
+                assert_eq!(
+                    span.style.bg,
+                    Some(theme::BG_L1),
+                    "code span '{}' should have BG_L1 background even without lang",
+                    span.content
+                );
+            }
+        }
+    }
+    // --- ToolCall compact rendering tests ---
+
+    #[test]
+    fn tool_call_collapsed_shows_summary() {
+        let input = r#"{"command": "ls -la"}"#;
+        let lines = render_tool_call("Bash", input, &ToolStatus::Running, true);
+        assert_eq!(lines.len(), 1);
+        let text = lines_to_text(&lines);
+        assert!(text.contains("Bash"), "should contain tool name");
+        assert!(text.contains("ls -la"), "collapsed should show command summary");
+    }
+
+    #[test]
+    fn tool_call_expanded_still_shows_full_args() {
+        let input = r#"{"command": "ls -la", "description": "list files"}"#;
+        let lines = render_tool_call("Bash", input, &ToolStatus::Completed, false);
+        // Expanded: header + 2 args
+        assert!(lines.len() >= 3);
+        let text = lines_to_text(&lines);
+        assert!(text.contains("command:"));
+        assert!(text.contains("description:"));
+    }
+
+    #[test]
+    fn tool_call_summary_renders_one_line() {
+        let lines = render_tool_call_summary("Edit", r#"{"file_path": "/src/theme.rs"}"#, &ToolStatus::Completed);
+        assert_eq!(lines.len(), 1);
+        let text = lines_to_text(&lines);
+        assert!(text.contains("✓"));
+        assert!(text.contains("Edit"));
+        assert!(text.contains("/src/theme.rs"));
+    }
+
+    #[test]
+    fn tool_call_summary_pending_icon() {
+        let lines = render_tool_call_summary("Bash", r#"{"command": "cargo test"}"#, &ToolStatus::Pending);
+        let text = lines_to_text(&lines);
+        assert!(text.contains("⏳"));
+        assert!(text.contains("cargo test"));
+    }
+
+    #[test]
+    fn tool_call_summary_failed_icon() {
+        let lines = render_tool_call_summary("Bash", r#"{"command": "false"}"#, &ToolStatus::Failed);
+        let text = lines_to_text(&lines);
+        assert!(text.contains("✗"));
+    }
+
+    // --- Task 5: summary_mode improvement tests ---
+
+    #[test]
+    fn summary_mode_shows_tool_call_summary() {
+        let block = ContentBlock::ToolCall {
+            id: "tc1".into(),
+            name: "Read".into(),
+            input: r#"{"file_path": "/tmp/file.rs"}"#.into(),
+            status: ToolStatus::Completed,
+        };
+        let lines = render_block_summary(&block, 80);
+        assert_eq!(lines.len(), 1, "summary mode should show 1-line tool call summary");
+        let text = lines_to_text(&lines);
+        assert!(text.contains("Read"));
+        assert!(text.contains("/tmp/file.rs"));
+        assert!(text.contains("✓"));
+    }
+
+    #[test]
+    fn summary_mode_still_hides_thinking() {
+        let block = ContentBlock::Thinking {
+            text: "deep thought".into(),
+            started_at: Some(Instant::now()),
+            finished_at: Some(Instant::now()),
+        };
+        let lines = render_block_summary(&block, 80);
+        assert!(lines.is_empty(), "summary mode should still hide thinking blocks");
+    }
+
+    #[test]
+    fn summary_mode_still_hides_tool_result() {
+        let block = ContentBlock::ToolResult {
+            tool_call_id: "tc1".into(),
+            content: "some output".into(),
+            is_error: false,
+        };
+        let lines = render_block_summary(&block, 80);
+        assert!(lines.is_empty(), "summary mode should still hide tool result blocks");
+    }
+
+    #[test]
+    fn summary_mode_shows_error() {
+        let block = ContentBlock::Error { message: "something failed".into() };
+        let lines = render_block_summary(&block, 80);
+        assert!(!lines.is_empty(), "summary mode should show error blocks");
+        let text = lines_to_text(&lines);
+        assert!(text.contains("something failed"));
+    }
+
 }
