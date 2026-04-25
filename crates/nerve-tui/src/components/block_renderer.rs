@@ -7,6 +7,7 @@ use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd, CodeBlockKind};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use std::sync::LazyLock;
+use regex::Regex;
 use syntect::highlighting::{ThemeSet, Theme, Style as SynStyle};
 use syntect::parsing::SyntaxSet;
 use syntect::easy::HighlightLines;
@@ -34,6 +35,94 @@ static CODE_THEME: LazyLock<Theme> = LazyLock::new(|| {
         .cloned()
         .unwrap_or_else(|| ts.themes["base16-ocean.dark"].clone())
 });
+
+/// Strip known system XML tags and their content from text.
+/// Two passes: first remove paired tags with content, then orphan opening/closing tags.
+fn sanitize_content(text: &str) -> String {
+    static RE_PAIRED: LazyLock<Regex> = LazyLock::new(|| {
+        // The `regex` crate does not support backreferences — enumerate each tag pair explicitly.
+        Regex::new(
+            r"(?s)(?:<system-reminder>.*?</system-reminder>|<persisted-output>.*?</persisted-output>|<thinking>.*?</thinking>|<command-name>.*?</command-name>|<artifact>.*?</artifact>|<EXTREMELY_IMPORTANT>.*?</EXTREMELY_IMPORTANT>|<SUBAGENT-STOP>.*?</SUBAGENT-STOP>|<EXTREMELY-IMPORTANT>.*?</EXTREMELY-IMPORTANT>)"
+        ).unwrap()
+    });
+    let cleaned = RE_PAIRED.replace_all(text, "");
+    static RE_ORPHAN: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"</?(?:system-reminder|persisted-output|antml:thinking|command-name|artifact|EXTREMELY_IMPORTANT|SUBAGENT-STOP|EXTREMELY-IMPORTANT)>").unwrap()
+    });
+    RE_ORPHAN.replace_all(&cleaned, "").into_owned()
+}
+
+/// Extract a one-line summary from tool input based on tool name.
+/// Parses input as JSON and picks the most relevant field for display.
+fn extract_tool_summary(name: &str, input: &str) -> String {
+    if input.is_empty() {
+        return String::new();
+    }
+
+    let val: serde_json::Value = match serde_json::from_str(input) {
+        Ok(v) => v,
+        Err(_) => {
+            // Not JSON — return raw input, truncated
+            return truncate_str(input, 40);
+        }
+    };
+
+    let obj = match val.as_object() {
+        Some(o) => o,
+        None => return truncate_str(input, 40),
+    };
+
+    let get_str = |key: &str| -> Option<String> {
+        obj.get(key).and_then(|v| v.as_str()).map(|s| s.to_string())
+    };
+
+    match name {
+        "Bash" => {
+            if let Some(cmd) = get_str("command") {
+                truncate_str(&cmd, 60)
+            } else {
+                truncate_str(input, 40)
+            }
+        }
+        "Read" => {
+            if let Some(path) = get_str("file_path") {
+                let offset = obj.get("offset").and_then(|v| v.as_u64());
+                let limit = obj.get("limit").and_then(|v| v.as_u64());
+                match (offset, limit) {
+                    (Some(o), Some(l)) => format!("{} ({}-{})", path, o, o + l),
+                    (Some(o), None) => format!("{} ({}-)", path, o),
+                    _ => path,
+                }
+            } else {
+                truncate_str(input, 40)
+            }
+        }
+        "Edit" | "Write" => {
+            get_str("file_path").unwrap_or_else(|| truncate_str(input, 40))
+        }
+        "WebSearch" => {
+            get_str("query").unwrap_or_else(|| truncate_str(input, 40))
+        }
+        "WebFetch" => {
+            get_str("url").unwrap_or_else(|| truncate_str(input, 40))
+        }
+        "Agent" => {
+            get_str("description").unwrap_or_else(|| truncate_str(input, 40))
+        }
+        _ => {
+            truncate_str(input, 40)
+        }
+    }
+}
+
+/// Truncate a string to `max_len` characters, appending "..." if truncated.
+fn truncate_str(s: &str, max_len: usize) -> String {
+    if s.len() <= max_len {
+        s.to_string()
+    } else {
+        format!("{}...", &s[..max_len])
+    }
+}
 
 /// Render any ContentBlock to styled lines (full expanded view).
 pub fn render_block(block: &ContentBlock, width: u16) -> Vec<Line<'static>> {
@@ -81,13 +170,15 @@ pub fn render_block_summary(block: &ContentBlock, width: u16) -> Vec<Line<'stati
 
 fn render_text(content: &str, _width: u16) -> Vec<Line<'static>> {
     let mut out = Vec::new();
-    render_markdown(content, &mut out, false);
+    let cleaned = sanitize_content(content);
+    render_markdown(&cleaned, &mut out, false);
     out
 }
 
 fn render_text_summary(content: &str, _width: u16) -> Vec<Line<'static>> {
     let mut out = Vec::new();
-    render_markdown(content, &mut out, true);
+    let cleaned = sanitize_content(content);
+    render_markdown(&cleaned, &mut out, true);
     out
 }
 
@@ -1337,5 +1428,121 @@ mod tests {
         let lines = render_tool_call("Read", "{}", &ToolStatus::Completed, true);
         let icon_span = &lines[0].spans[0];
         assert_eq!(icon_span.style.fg, Some(theme::SUCCESS));
+    }
+
+    // --- sanitize_content tests ---
+
+    #[test]
+    fn sanitize_strips_system_reminder() {
+        let input = "Hello<system-reminder>secret stuff</system-reminder> world";
+        let result = sanitize_content(input);
+        assert_eq!(result, "Hello world");
+    }
+
+    #[test]
+    fn sanitize_strips_persisted_output() {
+        let input = "Before<persisted-output>hidden</persisted-output>After";
+        let result = sanitize_content(input);
+        assert_eq!(result, "BeforeAfter");
+    }
+
+    #[test]
+    fn sanitize_strips_antml_thinking() {
+        let input = "Start<thinking>internal thought</thinking>End";
+        let result = sanitize_content(input);
+        assert_eq!(result, "StartEnd");
+    }
+
+    #[test]
+    fn sanitize_strips_command_name() {
+        let input = "A<command-name>cmd</command-name>B";
+        let result = sanitize_content(input);
+        assert_eq!(result, "AB");
+    }
+
+    #[test]
+    fn sanitize_strips_artifact() {
+        let input = "X<artifact>content</artifact>Y";
+        let result = sanitize_content(input);
+        assert_eq!(result, "XY");
+    }
+
+    #[test]
+    fn sanitize_strips_extremely_important_underscore() {
+        let input = "A<EXTREMELY_IMPORTANT>do this</EXTREMELY_IMPORTANT>B";
+        let result = sanitize_content(input);
+        assert_eq!(result, "AB");
+    }
+
+    #[test]
+    fn sanitize_strips_subagent_stop() {
+        let input = "A<SUBAGENT-STOP>stop</SUBAGENT-STOP>B";
+        let result = sanitize_content(input);
+        assert_eq!(result, "AB");
+    }
+
+    #[test]
+    fn sanitize_strips_extremely_important_hyphen() {
+        let input = "A<EXTREMELY-IMPORTANT>urgent</EXTREMELY-IMPORTANT>B";
+        let result = sanitize_content(input);
+        assert_eq!(result, "AB");
+    }
+
+    #[test]
+    fn sanitize_preserves_normal_html() {
+        let input = "Use <b>bold</b> and <i>italic</i>";
+        let result = sanitize_content(input);
+        assert_eq!(result, "Use <b>bold</b> and <i>italic</i>");
+    }
+
+    #[test]
+    fn sanitize_handles_nested_tags() {
+        let input = "A<system-reminder>outer<persisted-output>inner</persisted-output>still outer</system-reminder>B";
+        let result = sanitize_content(input);
+        // The outer regex matches system-reminder greedily up to its closing tag.
+        // Inner persisted-output is consumed as part of system-reminder content.
+        assert_eq!(result, "AB");
+    }
+
+    #[test]
+    fn sanitize_strips_multiline_tag() {
+        let input = "Hello\n<system-reminder>\nline1\nline2\n</system-reminder>\nWorld";
+        let result = sanitize_content(input);
+        assert_eq!(result, "Hello\n\nWorld");
+    }
+
+    #[test]
+    fn sanitize_strips_orphan_opening_tag() {
+        let input = "Hello <system-reminder> world";
+        let result = sanitize_content(input);
+        assert_eq!(result, "Hello  world");
+    }
+
+    #[test]
+    fn sanitize_strips_orphan_closing_tag() {
+        let input = "Hello </system-reminder> world";
+        let result = sanitize_content(input);
+        assert_eq!(result, "Hello  world");
+    }
+
+    #[test]
+    fn sanitize_empty_result() {
+        let input = "<system-reminder>everything is hidden</system-reminder>";
+        let result = sanitize_content(input);
+        assert_eq!(result, "");
+    }
+
+    #[test]
+    fn sanitize_content_between_different_tags_preserved() {
+        let input = "<system-reminder>hidden</system-reminder>visible<persisted-output>also hidden</persisted-output>";
+        let result = sanitize_content(input);
+        assert_eq!(result, "visible");
+    }
+
+    #[test]
+    fn sanitize_no_tags_unchanged() {
+        let input = "Just normal text with no XML tags";
+        let result = sanitize_content(input);
+        assert_eq!(result, "Just normal text with no XML tags");
     }
 }
