@@ -1778,7 +1778,7 @@ mod tests {
         let buf = terminal.backend().buffer();
         // Pick a cell in the middle of the message area (right of sidebar)
         let cell = buf.cell((40, 5)).unwrap();
-        assert_eq!(cell.bg, crate::theme::BG_L0, "channel view should fill with BG_L0 background");
+        assert_eq!(cell.bg, crate::theme::current().background, "channel view should fill with background color");
     }
 
     #[test]
@@ -1866,7 +1866,7 @@ mod tests {
             let area = buf.area;
             let mid_y = area.y + area.height / 2;
             for x in area.x..area.x + area.width {
-                if buf.cell((x, mid_y)).unwrap().bg == crate::theme::BG_L0 {
+                if buf.cell((x, mid_y)).unwrap().bg == crate::theme::current().background {
                     return Some(x);
                 }
             }

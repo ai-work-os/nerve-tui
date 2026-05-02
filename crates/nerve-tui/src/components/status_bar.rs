@@ -232,11 +232,12 @@ impl StatusBar {
         area: Rect,
         buf: &mut Buffer,
     ) {
+        let t = theme::current();
         // Fill sidebar background with L1
         for y in area.y..area.y + area.height {
             for x in area.x..area.x + area.width {
                 if let Some(cell) = buf.cell_mut((x, y)) {
-                    cell.set_bg(theme::BG_L1);
+                    cell.set_bg(t.background_panel);
                 }
             }
         }
@@ -252,23 +253,23 @@ impl StatusBar {
         lines.push(Line::from(Span::styled(
             "导航",
             Style::default()
-                .fg(theme::TITLE)
+                .fg(t.text)
                 .add_modifier(Modifier::BOLD),
         )));
 
         if global_mode {
             lines.push(Line::from(Span::styled(
                 "全局模式",
-                Style::default().fg(theme::MENTION),
+                Style::default().fg(t.warning),
             )));
             lines.push(Line::from(""));
         } else if let Some(project) = project_name {
             lines.push(Line::from(vec![
-                Span::styled("项目 ", Style::default().fg(theme::TIMESTAMP)),
+                Span::styled("项目 ", Style::default().fg(t.text_muted)),
                 Span::styled(
                     project.to_string(),
                     Style::default()
-                        .fg(theme::TITLE)
+                        .fg(t.text)
                         .add_modifier(Modifier::BOLD),
                 ),
             ]));
@@ -278,10 +279,10 @@ impl StatusBar {
         if channels.is_empty() && agents.is_empty() {
             lines.push(Line::from(Span::styled(
                 "  (无)",
-                Style::default().fg(theme::SYSTEM_MSG),
+                Style::default().fg(t.text_muted),
             )));
             Paragraph::new(lines)
-                .style(Style::default().bg(theme::BG_L1))
+                .style(Style::default().bg(t.background_panel))
                 .render(inner, buf);
             return;
         }
@@ -308,10 +309,10 @@ impl StatusBar {
                     let marker = if is_selected { "▸" } else { " " };
                     let base_style = if is_active {
                         Style::default()
-                            .fg(theme::CHANNEL_ACTIVE)
+                            .fg(t.primary)
                             .add_modifier(Modifier::BOLD)
                     } else {
-                        Style::default().fg(theme::CHANNEL_INACTIVE)
+                        Style::default().fg(t.text_muted)
                     };
                     let name_style = if is_selected {
                         base_style.add_modifier(Modifier::BOLD)
@@ -340,14 +341,14 @@ impl StatusBar {
                     let mut spans = vec![
                         Span::raw(format!("{} ", marker)),
                         Span::styled(format!("#{}", truncated), name_style),
-                        Span::styled(count_text, Style::default().fg(theme::TIMESTAMP)),
+                        Span::styled(count_text, Style::default().fg(t.text_muted)),
                     ];
                     if ch.unread > 0 {
                         spans.push(Span::styled(
                             format!(" {}", ch.unread),
                             Style::default()
                                 .fg(Color::White)
-                                .bg(Color::Red)
+                                .bg(t.error)
                                 .add_modifier(Modifier::BOLD),
                         ));
                     }
@@ -359,7 +360,7 @@ impl StatusBar {
                             let status = agent.map(|a| a.status.as_str()).unwrap_or("idle");
                             let name = agent.map(|a| a.name.as_str()).unwrap_or("?");
                             let icon = theme::status_icon(status);
-                            let color = theme::status_color(status);
+                            let color = t.status_color(status);
                             lines.push(Line::from(vec![
                                 Span::raw("    "),
                                 Span::styled(
@@ -378,9 +379,9 @@ impl StatusBar {
                     let arrow = if collapsed { "▸" } else { "▾" };
                     let count = section_counts.get(name.as_str()).copied().unwrap_or(0);
                     let marker = if is_selected { "▸" } else { " " };
-                    let mut style = Style::default().fg(theme::TIMESTAMP).add_modifier(Modifier::BOLD);
+                    let mut style = Style::default().fg(t.text_muted).add_modifier(Modifier::BOLD);
                     if is_selected {
-                        style = style.bg(theme::BORDER).fg(Color::White);
+                        style = style.bg(t.border).fg(Color::White);
                     }
                     lines.push(Line::from(Span::styled(
                         format!("{}{} {} ({})", marker, arrow, name, count),
@@ -397,7 +398,7 @@ impl StatusBar {
         }
 
         Paragraph::new(lines)
-            .style(Style::default().bg(theme::BG_L1))
+            .style(Style::default().bg(t.background_panel))
             .render(inner, buf);
     }
 
@@ -460,13 +461,14 @@ impl StatusBar {
         active_dm: Option<&str>,
         width: u16,
     ) {
+        let t = theme::current();
         let is_selected = *selected == Some(NavigationTarget::Agent(i));
         let is_active = active_dm == Some(agent.name.as_str());
         let marker = if is_selected { "▸" } else { " " };
         let color = if is_active {
-            theme::MENTION
+            t.warning
         } else {
-            theme::status_color(&agent.status)
+            t.status_color(&agent.status)
         };
         let mut name_style = Style::default().fg(color);
         if is_selected || is_active {
@@ -491,7 +493,7 @@ impl StatusBar {
         if !suffix.is_empty() {
             spans.push(Span::styled(
                 suffix.to_string(),
-                Style::default().fg(theme::TIMESTAMP),
+                Style::default().fg(t.text_muted),
             ));
         }
         lines.push(Line::from(spans));
@@ -517,14 +519,14 @@ impl StatusBar {
             if !adapter_part.is_empty() {
                 line2_spans.push(Span::styled(
                     adapter_part.to_string(),
-                    Style::default().fg(theme::TIMESTAMP),
+                    Style::default().fg(t.text_muted),
                 ));
             }
             if let Some(hint) = hint_part {
                 let hint_color = if agent.tool_call_name.is_some() {
-                    theme::TOOL_NAME
+                    t.secondary
                 } else {
-                    theme::TIMESTAMP
+                    t.text_muted
                 };
                 let separator = if adapter_part.is_empty() { "" } else { " " };
                 line2_spans.push(Span::styled(
@@ -1298,6 +1300,7 @@ mod tests {
 
     #[test]
     fn render_uses_l1_background_no_border() {
+        let t = theme::current();
         let bar = StatusBar::new();
         let channels = make_channels(1);
         let agents = make_agents(1);
@@ -1305,7 +1308,7 @@ mod tests {
         let mut buf = Buffer::empty(area);
         bar.render(&channels, Some("ch0"), &agents, None, None, false, area, &mut buf);
         let cell = buf.cell((1, 1)).unwrap();
-        assert_eq!(cell.bg, theme::BG_L1, "sidebar interior should have BG_L1 background");
+        assert_eq!(cell.bg, t.background_panel, "sidebar interior should have background_panel background");
     }
 
     #[test]

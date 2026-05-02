@@ -4,7 +4,7 @@ use chrono::Local;
 use nerve_tui_protocol::{ContentBlock, Message, MessageInfo};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Widget, Wrap};
 use std::collections::HashMap;
@@ -210,11 +210,12 @@ impl ChannelView {
     // --- Rendering ---
 
     pub fn render(&mut self, area: Rect, buf: &mut Buffer) {
+        let t = theme::current();
         // Fill with L0 background
         for y in area.y..area.y + area.height {
             for x in area.x..area.x + area.width {
                 if let Some(cell) = buf.cell_mut((x, y)) {
-                    cell.set_bg(theme::BG_L0);
+                    cell.set_bg(t.background);
                 }
             }
         }
@@ -230,7 +231,7 @@ impl ChannelView {
 
         let text_lines = self.build_text(inner.width);
         let para = Paragraph::new(text_lines)
-            .style(Style::default().bg(theme::BG_L0))
+            .style(Style::default().bg(t.background))
             .wrap(Wrap { trim: false });
         let total_visual = (para.line_count(inner.width) as u32).min(u16::MAX as u32) as u16;
         let max_offset = total_visual.saturating_sub(self.visible_height);
@@ -259,7 +260,7 @@ impl ChannelView {
                 y,
                 indicator,
                 Style::default()
-                    .fg(theme::WARNING)
+                    .fg(t.warning)
                     .add_modifier(Modifier::BOLD),
             );
         }
@@ -274,17 +275,18 @@ impl ChannelView {
         area: Rect,
         buf: &mut Buffer,
     ) {
+        let t = theme::current();
         // Fill with L1 background for panels
         for y in area.y..area.y + area.height {
             for x in area.x..area.x + area.width {
                 if let Some(cell) = buf.cell_mut((x, y)) {
-                    cell.set_bg(theme::BG_L1);
+                    cell.set_bg(t.background_panel);
                 }
             }
         }
 
         // Title line
-        let title_color = if focused { theme::BORDER_ACTIVE } else { theme::TIMESTAMP };
+        let title_color = if focused { t.border_active } else { t.text_muted };
         let title = format!("#{}", channel_name);
         if area.height > 0 {
             buf.set_string(
@@ -307,7 +309,7 @@ impl ChannelView {
         let text_lines = self.build_text(inner.width);
 
         let para = Paragraph::new(text_lines)
-            .style(Style::default().bg(theme::BG_L1))
+            .style(Style::default().bg(t.background_panel))
             .wrap(Wrap { trim: false });
         let total_visual = (para.line_count(inner.width) as u32).min(u16::MAX as u32) as u16;
         let max_offset = total_visual.saturating_sub(state.visible_height);
@@ -355,6 +357,7 @@ impl ChannelView {
     }
 
     fn build_text_inner(&self, width: u16) -> Vec<Line<'static>> {
+        let t = theme::current();
         let mut out: Vec<Line<'static>> = Vec::new();
         let mut prev_timestamp: Option<f64> = None;
 
@@ -383,18 +386,18 @@ impl ChannelView {
                     || content_lower.contains("错误")
                 {
                     Style::default()
-                        .fg(Color::Red)
+                        .fg(t.error)
                         .add_modifier(Modifier::ITALIC)
                 } else if content_lower.contains("已恢复")
                     || content_lower.contains("成功")
                     || content_lower.contains("已注册")
                 {
                     Style::default()
-                        .fg(Color::Green)
+                        .fg(t.success)
                         .add_modifier(Modifier::ITALIC)
                 } else {
                     Style::default()
-                        .fg(Color::DarkGray)
+                        .fg(t.text_muted)
                         .add_modifier(Modifier::ITALIC)
                 };
                 out.push(Line::from(Span::styled(
@@ -411,27 +414,27 @@ impl ChannelView {
                 .unwrap_or_default();
             prev_timestamp = Some(msg.timestamp);
 
-            let name_color = theme::agent_color(&msg.from);
+            let name_color = t.agent_color(&msg.from);
             let name_style = Style::default().fg(name_color).add_modifier(Modifier::BOLD);
 
             let mut header = vec![Span::styled(msg.from.clone(), name_style)];
-            if let Some(ref t) = target {
-                let target_color = theme::agent_color(t);
+            if let Some(ref tgt) = target {
+                let target_color = t.agent_color(tgt);
                 header.push(Span::styled(
                     " → ",
-                    Style::default().fg(theme::TIMESTAMP),
+                    Style::default().fg(t.text_muted),
                 ));
                 header.push(Span::styled(
-                    t.clone(),
+                    tgt.clone(),
                     Style::default().fg(target_color).add_modifier(Modifier::BOLD),
                 ));
             }
             header.push(Span::raw("  "));
-            header.push(Span::styled(time_str, Style::default().fg(theme::TIMESTAMP)));
+            header.push(Span::styled(time_str, Style::default().fg(t.text_muted)));
             if !interval_str.is_empty() {
                 header.push(Span::styled(
                     format!(" · {}", interval_str),
-                    Style::default().fg(theme::TIMESTAMP),
+                    Style::default().fg(t.text_muted),
                 ));
             }
             out.push(Line::from(header));
@@ -507,17 +510,18 @@ pub fn render_text_panel(
     area: Rect,
     buf: &mut Buffer,
 ) {
+    let t = theme::current();
     // Fill with L1 background for panels
     for y in area.y..area.y + area.height {
         for x in area.x..area.x + area.width {
             if let Some(cell) = buf.cell_mut((x, y)) {
-                cell.set_bg(theme::BG_L1);
+                cell.set_bg(t.background_panel);
             }
         }
     }
 
     // Title line
-    let title_color = if focused { theme::BORDER_ACTIVE } else { theme::TIMESTAMP };
+    let title_color = if focused { t.border_active } else { t.text_muted };
     let title_text = title.to_string();
     if area.height > 0 {
         buf.set_string(
@@ -543,7 +547,7 @@ pub fn render_text_panel(
         .collect();
 
     let para = Paragraph::new(text_lines)
-        .style(Style::default().bg(theme::BG_L1))
+        .style(Style::default().bg(t.background_panel))
         .wrap(Wrap { trim: false });
     let total_visual = (para.line_count(inner.width) as u32).min(u16::MAX as u32) as u16;
     let max_offset = total_visual.saturating_sub(state.visible_height);
@@ -570,17 +574,18 @@ pub fn render_dm_panel(
     area: Rect,
     buf: &mut Buffer,
 ) {
+    let t = theme::current();
     // Fill with L1 background for panels
     for y in area.y..area.y + area.height {
         for x in area.x..area.x + area.width {
             if let Some(cell) = buf.cell_mut((x, y)) {
-                cell.set_bg(theme::BG_L1);
+                cell.set_bg(t.background_panel);
             }
         }
     }
 
     // Title line
-    let title_color = if focused { theme::BORDER_ACTIVE } else { theme::TIMESTAMP };
+    let title_color = if focused { t.border_active } else { t.text_muted };
     let title_text = title.to_string();
     if area.height > 0 {
         buf.set_string(
@@ -601,7 +606,7 @@ pub fn render_dm_panel(
     state.visible_height = inner.height;
 
     let para = Paragraph::new(lines)
-        .style(Style::default().bg(theme::BG_L1))
+        .style(Style::default().bg(t.background_panel))
         .wrap(Wrap { trim: false });
     let total_visual = (para.line_count(inner.width) as u32).min(u16::MAX as u32) as u16;
     let max_offset = total_visual.saturating_sub(state.visible_height);
@@ -890,12 +895,13 @@ mod tests {
 
     #[test]
     fn render_fills_l0_background() {
+        let t = theme::current();
         let mut v = ChannelView::new();
         let area = Rect::new(0, 0, 60, 20);
         let mut buf = Buffer::empty(area);
         v.render(area, &mut buf);
         let cell = buf.cell((5, 5)).unwrap();
-        assert_eq!(cell.bg, theme::BG_L0);
+        assert_eq!(cell.bg, t.background);
     }
 
     #[test]

@@ -8,7 +8,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use std::sync::LazyLock;
 use regex::Regex;
-use syntect::highlighting::{ThemeSet, Theme, Style as SynStyle};
+use syntect::highlighting::{ThemeSet, Theme};
 use syntect::parsing::SyntaxSet;
 use syntect::easy::HighlightLines;
 use tracing::debug;
@@ -17,24 +17,14 @@ use unicode_width::UnicodeWidthStr;
 /// Global syntax set (loaded once, reused across all renders).
 static SYNTAX_SET: LazyLock<SyntaxSet> = LazyLock::new(SyntaxSet::load_defaults_newlines);
 
-/// Global theme for code highlighting.
-/// Auto-detect light/dark terminal via COLORFGBG env var.
-static CODE_THEME: LazyLock<Theme> = LazyLock::new(|| {
-    let ts = ThemeSet::load_defaults();
-    let is_dark = std::env::var("COLORFGBG")
-        .map(|v| {
-            // Format: "fg;bg" — bg < 8 means dark background
-            v.rsplit(';').next()
-                .and_then(|bg| bg.parse::<u32>().ok())
-                .map(|bg| bg < 8)
-                .unwrap_or(false)
-        })
-        .unwrap_or(false);
-    let theme_name = if is_dark { "base16-ocean.dark" } else { "base16-ocean.light" };
-    ts.themes.get(theme_name)
-        .cloned()
-        .unwrap_or_else(|| ts.themes["base16-ocean.dark"].clone())
-});
+/// Global theme set for code highlighting (loaded once, theme selected dynamically).
+static THEME_SET: LazyLock<ThemeSet> = LazyLock::new(ThemeSet::load_defaults);
+
+/// Get the syntect theme for code highlighting by name.
+fn code_theme(name: &str) -> &'static Theme {
+    THEME_SET.themes.get(name)
+        .unwrap_or_else(|| &THEME_SET.themes["base16-ocean.dark"])
+}
 
 /// Maximum lines to show in collapsed tool results.
 const TOOL_RESULT_MAX_LINES: usize = 10;
@@ -257,10 +247,11 @@ fn render_markdown(content: &str, out: &mut Vec<Line<'static>>, skip_code_blocks
                     .map(|s| s.content.to_string())
                     .collect();
                 current_spans.clear();
+                let t = theme::current();
                 out.push(Line::from(Span::styled(
                     text,
                     Style::default()
-                        .fg(theme::PRIMARY)
+                        .fg(t.primary)
                         .add_modifier(Modifier::BOLD),
                 )));
                 is_heading = false;
@@ -299,9 +290,10 @@ fn render_markdown(content: &str, out: &mut Vec<Line<'static>>, skip_code_blocks
                 if in_table {
                     table_cell_buf.push_str(&text);
                 } else {
+                    let t = theme::current();
                     current_spans.push(Span::styled(
                         text.to_string(),
-                        Style::default().fg(theme::WARNING),
+                        Style::default().fg(t.warning),
                     ));
                 }
             }
@@ -397,6 +389,7 @@ fn render_markdown(content: &str, out: &mut Vec<Line<'static>>, skip_code_blocks
 ///
 /// Uses `UnicodeWidthStr::width()` for correct CJK alignment and manual padding.
 fn render_table(table_rows: &[(Vec<String>, bool)]) -> Vec<Line<'static>> {
+    let t = theme::current();
     let col_count = table_rows.iter().map(|(cells, _)| cells.len()).max().unwrap_or(0);
     if col_count == 0 {
         return Vec::new();
@@ -427,7 +420,7 @@ fn render_table(table_rows: &[(Vec<String>, bool)]) -> Vec<Line<'static>> {
             let pad = target_w.saturating_sub(display_w);
             let padded = format!("{}{}", cell, " ".repeat(pad));
             let style = if *is_header {
-                Style::default().fg(theme::PRIMARY).add_modifier(Modifier::BOLD)
+                Style::default().fg(t.primary).add_modifier(Modifier::BOLD)
             } else {
                 Style::default()
             };
@@ -456,8 +449,13 @@ fn render_table(table_rows: &[(Vec<String>, bool)]) -> Vec<Line<'static>> {
 
 /// Highlight code using syntect. Falls back to plain muted text on unknown language.
 fn highlight_code(code: &str, lang: &str) -> Vec<Line<'static>> {
+    // Snapshot theme colors and drop the read guard before expensive syntect work
+    let (text_muted, bg, syntect_name) = {
+        let t = theme::current();
+        (t.text_muted, t.background_panel, t.syntect_theme_name.clone())
+    };
     let ss = &*SYNTAX_SET;
-    let theme = &*CODE_THEME;
+    let syn_theme = code_theme(&syntect_name);
 
     let syntax = if lang.is_empty() {
         ss.find_syntax_plain_text()
@@ -466,14 +464,14 @@ fn highlight_code(code: &str, lang: &str) -> Vec<Line<'static>> {
             .unwrap_or_else(|| ss.find_syntax_plain_text())
     };
 
-    let mut h = HighlightLines::new(syntax, theme);
+    let mut h = HighlightLines::new(syntax, syn_theme);
     let mut lines = Vec::new();
 
     // Language label (small, muted) — no separator lines
     if !lang.is_empty() {
         lines.push(Line::from(Span::styled(
             lang.to_string(),
-            Style::default().fg(theme::TEXT_MUTED).bg(theme::BG_L1),
+            Style::default().fg(text_muted).bg(bg),
         )));
     }
 
@@ -483,9 +481,10 @@ fn highlight_code(code: &str, lang: &str) -> Vec<Line<'static>> {
                 let spans: Vec<Span<'static>> = ranges
                     .into_iter()
                     .map(|(syn_style, text)| {
+                        let fg = Color::Rgb(syn_style.foreground.r, syn_style.foreground.g, syn_style.foreground.b);
                         Span::styled(
                             text.to_string(),
-                            syntect_style_to_ratatui(syn_style),
+                            Style::default().fg(fg).bg(bg),
                         )
                     })
                     .collect();
@@ -494,7 +493,7 @@ fn highlight_code(code: &str, lang: &str) -> Vec<Line<'static>> {
             Err(_) => {
                 lines.push(Line::from(Span::styled(
                     line.to_string(),
-                    Style::default().fg(theme::TEXT_MUTED).bg(theme::BG_L1),
+                    Style::default().fg(text_muted).bg(bg),
                 )));
             }
         }
@@ -503,16 +502,12 @@ fn highlight_code(code: &str, lang: &str) -> Vec<Line<'static>> {
     lines
 }
 
-fn syntect_style_to_ratatui(syn: SynStyle) -> Style {
-    let fg = Color::Rgb(syn.foreground.r, syn.foreground.g, syn.foreground.b);
-    Style::default().fg(fg).bg(theme::BG_L1)
-}
-
 // ---------------------------------------------------------------------------
 // Thinking block: collapsed by default, shows timer
 // ---------------------------------------------------------------------------
 
 fn render_thinking(text: &str, elapsed: Option<std::time::Duration>, collapsed: bool) -> Vec<Line<'static>> {
+    let t = theme::current();
     let mut lines = Vec::new();
 
     let timer = elapsed
@@ -523,7 +518,7 @@ fn render_thinking(text: &str, elapsed: Option<std::time::Duration>, collapsed: 
     lines.push(Line::from(Span::styled(
         header,
         Style::default()
-            .fg(theme::BORDER_ACTIVE)
+            .fg(t.border_active)
             .add_modifier(Modifier::ITALIC),
     )));
 
@@ -531,7 +526,7 @@ fn render_thinking(text: &str, elapsed: Option<std::time::Duration>, collapsed: 
         for line in text.lines() {
             lines.push(Line::from(Span::styled(
                 format!("  │ {}", line),
-                Style::default().fg(theme::BORDER_ACTIVE),
+                Style::default().fg(t.border_active),
             )));
         }
     }
@@ -544,13 +539,14 @@ fn render_thinking(text: &str, elapsed: Option<std::time::Duration>, collapsed: 
 // ---------------------------------------------------------------------------
 
 fn render_tool_call(name: &str, input: &str, status: &ToolStatus, collapsed: bool) -> Vec<Line<'static>> {
+    let t = theme::current();
     let mut lines = Vec::new();
 
     let (icon, icon_color) = match status {
-        ToolStatus::Pending => ("⏳", theme::WARNING),
-        ToolStatus::Running => ("⏳", theme::SUCCESS),
-        ToolStatus::Completed => ("✓", theme::SUCCESS),
-        ToolStatus::Failed => ("✗", theme::ERROR),
+        ToolStatus::Pending => ("⏳", t.warning),
+        ToolStatus::Running => ("⏳", t.success),
+        ToolStatus::Completed => ("✓", t.success),
+        ToolStatus::Failed => ("✗", t.error),
     };
 
     debug!(tool_name = name, ?status, collapsed, "rendering tool_call block");
@@ -563,14 +559,14 @@ fn render_tool_call(name: &str, input: &str, status: &ToolStatus, collapsed: boo
             Span::styled(
                 name.to_string(),
                 Style::default()
-                    .fg(theme::TOOL_NAME)
+                    .fg(t.secondary)
                     .add_modifier(Modifier::BOLD),
             ),
         ];
         if !summary.is_empty() {
             spans.push(Span::styled(
                 format!(": {}", summary),
-                Style::default().fg(theme::TOOL_VALUE),
+                Style::default().fg(t.text),
             ));
         }
         lines.push(Line::from(spans));
@@ -581,7 +577,7 @@ fn render_tool_call(name: &str, input: &str, status: &ToolStatus, collapsed: boo
             Span::styled(
                 name.to_string(),
                 Style::default()
-                    .fg(theme::TOOL_NAME)
+                    .fg(t.secondary)
                     .add_modifier(Modifier::BOLD),
             ),
         ]));
@@ -598,9 +594,9 @@ fn render_tool_call(name: &str, input: &str, status: &ToolStatus, collapsed: boo
                         lines.push(Line::from(vec![
                             Span::styled(
                                 format!("    {}: ", k),
-                                Style::default().fg(theme::TOOL_KEY),
+                                Style::default().fg(t.warning),
                             ),
-                            Span::styled(v_str, Style::default().fg(theme::TOOL_VALUE)),
+                            Span::styled(v_str, Style::default().fg(t.text)),
                         ]));
                     }
                 }
@@ -609,7 +605,7 @@ fn render_tool_call(name: &str, input: &str, status: &ToolStatus, collapsed: boo
                 for line in input.lines() {
                     lines.push(Line::from(Span::styled(
                         format!("    {}", line),
-                        Style::default().fg(theme::TOOL_VALUE),
+                        Style::default().fg(t.text),
                     )));
                 }
             }
@@ -621,11 +617,12 @@ fn render_tool_call(name: &str, input: &str, status: &ToolStatus, collapsed: boo
 
 /// Render a ToolCall as a single summary line (for summary_mode).
 fn render_tool_call_summary(name: &str, input: &str, status: &ToolStatus) -> Vec<Line<'static>> {
+    let t = theme::current();
     let (icon, icon_color) = match status {
-        ToolStatus::Pending => ("⏳", theme::WARNING),
-        ToolStatus::Running => ("⏳", theme::SUCCESS),
-        ToolStatus::Completed => ("✓", theme::SUCCESS),
-        ToolStatus::Failed => ("✗", theme::ERROR),
+        ToolStatus::Pending => ("⏳", t.warning),
+        ToolStatus::Running => ("⏳", t.success),
+        ToolStatus::Completed => ("✓", t.success),
+        ToolStatus::Failed => ("✗", t.error),
     };
 
     let summary = extract_tool_summary(name, input);
@@ -634,14 +631,14 @@ fn render_tool_call_summary(name: &str, input: &str, status: &ToolStatus) -> Vec
         Span::styled(
             name.to_string(),
             Style::default()
-                .fg(theme::TOOL_NAME)
+                .fg(t.secondary)
                 .add_modifier(Modifier::BOLD),
         ),
     ];
     if !summary.is_empty() {
         spans.push(Span::styled(
             format!(": {}", summary),
-            Style::default().fg(theme::TOOL_VALUE),
+            Style::default().fg(t.text),
         ));
     }
 
@@ -653,17 +650,18 @@ fn render_tool_call_summary(name: &str, input: &str, status: &ToolStatus) -> Vec
 // ---------------------------------------------------------------------------
 
 fn render_tool_result(content: &str, is_error: bool, collapsed: bool) -> Vec<Line<'static>> {
+    let t = theme::current();
     let mut lines = Vec::new();
 
     let content_lines: Vec<&str> = content.lines().collect();
     let line_count = content_lines.len();
 
     let (label, label_color) = if is_error {
-        ("  ✗ 结果（错误）".to_string(), theme::ERROR)
+        ("  ✗ 结果（错误）".to_string(), t.error)
     } else if line_count > TOOL_RESULT_MAX_LINES {
-        (format!("  ✓ 结果 ({} 行)", line_count), theme::TEXT_MUTED)
+        (format!("  ✓ 结果 ({} 行)", line_count), t.text_muted)
     } else {
-        ("  ✓ 结果".to_string(), theme::TEXT_MUTED)
+        ("  ✓ 结果".to_string(), t.text_muted)
     };
 
     lines.push(Line::from(Span::styled(
@@ -672,9 +670,9 @@ fn render_tool_result(content: &str, is_error: bool, collapsed: bool) -> Vec<Lin
     )));
 
     let content_color = if is_error {
-        theme::ERROR
+        t.error
     } else {
-        theme::TEXT
+        t.text
     };
 
     // Error content is never truncated
@@ -714,7 +712,7 @@ fn render_tool_result(content: &str, is_error: bool, collapsed: bool) -> Vec<Lin
         let hidden = line_count - head_count - tail_count;
         lines.push(Line::from(Span::styled(
             format!("    \u{2026} +{} lines", hidden),
-            Style::default().fg(theme::TEXT_MUTED),
+            Style::default().fg(t.text_muted),
         )));
         // Tail
         for line in &content_lines[line_count - tail_count..] {
@@ -733,9 +731,10 @@ fn render_tool_result(content: &str, is_error: bool, collapsed: bool) -> Vec<Lin
 // ---------------------------------------------------------------------------
 
 fn render_error(message: &str) -> Vec<Line<'static>> {
+    let t = theme::current();
     vec![Line::from(Span::styled(
         format!("  ⚠ {}", message),
-        Style::default().fg(theme::ERROR).add_modifier(Modifier::BOLD),
+        Style::default().fg(t.error).add_modifier(Modifier::BOLD),
     ))]
 }
 
@@ -746,6 +745,8 @@ fn render_error(message: &str) -> Vec<Line<'static>> {
 /// Highlight @mentions in text, returning styled spans.
 /// Non-mention text gets default style, @name gets MENTION color + bold.
 pub(crate) fn highlight_mentions(text: &str) -> Vec<Span<'static>> {
+    let t = theme::current();
+    let mention_color = t.warning;
     let mut spans = Vec::new();
     let mut rest = text;
 
@@ -761,7 +762,7 @@ pub(crate) fn highlight_mentions(text: &str) -> Vec<Span<'static>> {
             spans.push(Span::styled(
                 rest[idx..idx + 1 + end].to_string(),
                 Style::default()
-                    .fg(theme::MENTION)
+                    .fg(mention_color)
                     .add_modifier(Modifier::BOLD),
             ));
             rest = &rest[idx + 1 + end..];
@@ -858,7 +859,7 @@ mod tests {
             .flat_map(|l| l.spans.iter())
             .find(|s| s.content.as_ref() == "Title");
         assert!(heading_span.is_some());
-        assert_eq!(heading_span.unwrap().style.fg, Some(theme::PRIMARY));
+        assert_eq!(heading_span.unwrap().style.fg, Some(theme::current().primary));
     }
 
     #[test]
@@ -879,7 +880,7 @@ mod tests {
             .flat_map(|l| l.spans.iter())
             .find(|s| s.content.as_ref() == "foo()");
         assert!(code_span.is_some());
-        assert_eq!(code_span.unwrap().style.fg, Some(theme::WARNING));
+        assert_eq!(code_span.unwrap().style.fg, Some(theme::current().warning));
     }
 
     // --- Thinking block tests ---
@@ -1001,7 +1002,7 @@ mod tests {
         let error_span = lines.iter()
             .flat_map(|l| l.spans.iter())
             .find(|s| s.content.contains("command not found"));
-        assert_eq!(error_span.unwrap().style.fg, Some(theme::ERROR));
+        assert_eq!(error_span.unwrap().style.fg, Some(theme::current().error));
     }
 
     #[test]
@@ -1046,7 +1047,7 @@ mod tests {
         let text: String = lines[0].spans.iter().map(|s| s.content.to_string()).collect();
         assert!(text.contains("⚠"));
         assert!(text.contains("something went wrong"));
-        assert_eq!(lines[0].spans[0].style.fg, Some(theme::ERROR));
+        assert_eq!(lines[0].spans[0].style.fg, Some(theme::current().error));
     }
 
     // --- render_block dispatch tests ---
@@ -1159,7 +1160,7 @@ mod tests {
             .find(|s| s.content.contains("Name"));
         assert!(header_span.is_some(), "should find Name span");
         let span = header_span.unwrap();
-        assert_eq!(span.style.fg, Some(theme::PRIMARY));
+        assert_eq!(span.style.fg, Some(theme::current().primary));
         assert!(span.style.add_modifier.contains(Modifier::BOLD));
     }
 
@@ -1288,7 +1289,7 @@ mod tests {
         assert_eq!(spans.len(), 3);
         assert_eq!(spans[0].content.as_ref(), "hello ");
         assert_eq!(spans[1].content.as_ref(), "@alice");
-        assert_eq!(spans[1].style.fg, Some(theme::MENTION));
+        assert_eq!(spans[1].style.fg, Some(theme::current().warning));
         assert!(spans[1].style.add_modifier.contains(Modifier::BOLD));
         assert_eq!(spans[2].content.as_ref(), " world");
     }
@@ -1297,13 +1298,13 @@ mod tests {
     fn mention_highlight_at_start() {
         let spans = highlight_mentions("@bob hi");
         assert_eq!(spans[0].content.as_ref(), "@bob");
-        assert_eq!(spans[0].style.fg, Some(theme::MENTION));
+        assert_eq!(spans[0].style.fg, Some(theme::current().warning));
     }
 
     #[test]
     fn mention_highlight_multiple() {
         let spans = highlight_mentions("@alice and @bob");
-        let mention_count = spans.iter().filter(|s| s.style.fg == Some(theme::MENTION)).count();
+        let mention_count = spans.iter().filter(|s| s.style.fg == Some(theme::current().warning)).count();
         assert_eq!(mention_count, 2);
     }
 
@@ -1329,7 +1330,7 @@ mod tests {
         let all_spans: Vec<&Span> = lines.iter().flat_map(|l| l.spans.iter()).collect();
         let mention = all_spans.iter().find(|s| s.content.as_ref() == "@alice");
         assert!(mention.is_some(), "should find @alice span");
-        assert_eq!(mention.unwrap().style.fg, Some(theme::MENTION));
+        assert_eq!(mention.unwrap().style.fg, Some(theme::current().warning));
     }
 
     // --- Collapsed rendering tests ---
@@ -1565,14 +1566,14 @@ mod tests {
         let elapsed = Some(Duration::from_secs_f64(1.0));
         let lines = render_thinking("test", elapsed, true);
         let span = &lines[0].spans[0];
-        assert_eq!(span.style.fg, Some(theme::BORDER_ACTIVE));
+        assert_eq!(span.style.fg, Some(theme::current().border_active));
     }
 
     #[test]
     fn tool_call_completed_uses_success_color() {
         let lines = render_tool_call("Read", "{}", &ToolStatus::Completed, true);
         let icon_span = &lines[0].spans[0];
-        assert_eq!(icon_span.style.fg, Some(theme::SUCCESS));
+        assert_eq!(icon_span.style.fg, Some(theme::current().success));
     }
 
     // --- sanitize_content tests ---
@@ -1803,14 +1804,15 @@ mod tests {
 
     #[test]
     fn code_block_spans_have_bg_color() {
+        let t = theme::current();
         let lines = highlight_code("let x = 1;", "rust");
         // Skip the language label line (index 0), check code lines
         for line in &lines[1..] {
             for span in &line.spans {
                 assert_eq!(
                     span.style.bg,
-                    Some(theme::BG_L1),
-                    "code span '{}' should have BG_L1 background",
+                    Some(t.background_panel),
+                    "code span '{}' should have background_panel background",
                     span.content
                 );
             }
@@ -1819,6 +1821,7 @@ mod tests {
 
     #[test]
     fn code_block_lang_label_has_bg_color() {
+        let t = theme::current();
         let lines = highlight_code("x = 1", "python");
         // First line is the language label
         assert!(!lines.is_empty());
@@ -1826,14 +1829,15 @@ mod tests {
         for span in &label_line.spans {
             assert_eq!(
                 span.style.bg,
-                Some(theme::BG_L1),
-                "language label span should have BG_L1 background"
+                Some(t.background_panel),
+                "language label span should have background_panel background"
             );
         }
     }
 
     #[test]
     fn code_block_no_lang_has_bg_color() {
+        let t = theme::current();
         let lines = highlight_code("plain code", "");
         // No language label, just code
         assert!(!lines.is_empty());
@@ -1841,8 +1845,8 @@ mod tests {
             for span in &line.spans {
                 assert_eq!(
                     span.style.bg,
-                    Some(theme::BG_L1),
-                    "code span '{}' should have BG_L1 background even without lang",
+                    Some(t.background_panel),
+                    "code span '{}' should have background_panel background even without lang",
                     span.content
                 );
             }
