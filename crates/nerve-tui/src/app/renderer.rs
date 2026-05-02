@@ -15,11 +15,12 @@ impl<T: Transport> App<T> {
         let area = frame.area();
 
         // Fill entire area with L0 background
+        let bg = theme::current().background;
         let buf = frame.buffer_mut();
         for y in area.y..area.y + area.height {
             for x in area.x..area.x + area.width {
                 if let Some(cell) = buf.cell_mut((x, y)) {
-                    cell.set_bg(theme::BG_L0);
+                    cell.set_bg(bg);
                 }
             }
         }

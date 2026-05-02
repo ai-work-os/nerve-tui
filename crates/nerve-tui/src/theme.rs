@@ -1,3 +1,5 @@
+use std::sync::{LazyLock, RwLock};
+
 use ratatui::style::Color;
 
 // --- 背景三级深度（暖白 Light） ---
@@ -232,6 +234,21 @@ pub fn status_color(status: &str) -> Color {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Global theme accessor
+// ---------------------------------------------------------------------------
+
+static CURRENT_THEME: LazyLock<RwLock<Theme>> =
+    LazyLock::new(|| RwLock::new(Theme::warm_light()));
+
+pub fn current() -> std::sync::RwLockReadGuard<'static, Theme> {
+    CURRENT_THEME.read().unwrap()
+}
+
+pub fn set_theme(theme: Theme) {
+    *CURRENT_THEME.write().unwrap() = theme;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -319,5 +336,14 @@ mod tests {
                 other => panic!("status_color({}) returned {:?}", status, other),
             }
         }
+    }
+
+    #[test]
+    fn set_and_get_theme() {
+        set_theme(Theme::opencode_dark());
+        let t = current();
+        assert_eq!(t.background, Color::Rgb(0x0a, 0x0a, 0x0a));
+        drop(t);
+        set_theme(Theme::warm_light());
     }
 }
