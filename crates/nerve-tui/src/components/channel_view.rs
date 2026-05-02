@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use tracing::debug;
 use unicode_width::UnicodeWidthStr;
 
-use super::messages::{compact_rendered_lines, extract_route_target, format_interval, format_time};
+use super::messages::{build_message_footer, compact_rendered_lines, extract_route_target, format_time_short};
 
 /// Scroll snapshot saved/restored on channel switch (inspired by nvim WinInfo).
 struct ViewSnapshot {
@@ -359,7 +359,6 @@ impl ChannelView {
     fn build_text_inner(&self, width: u16) -> Vec<Line<'static>> {
         let t = theme::current();
         let mut out: Vec<Line<'static>> = Vec::new();
-        let mut prev_timestamp: Option<f64> = None;
 
         for (i, msg) in self.messages.iter().enumerate() {
             // Filter
@@ -379,7 +378,6 @@ impl ChannelView {
 
             // System messages
             if msg.from == "系统" {
-                prev_timestamp = Some(msg.timestamp);
                 let content_lower = display_content.to_lowercase();
                 let style = if content_lower.contains("失败")
                     || content_lower.contains("error")
@@ -407,17 +405,17 @@ impl ChannelView {
                 continue;
             }
 
-            // Header: from -> target  HH:MM:SS +Xs
-            let time_str = format_time(msg.timestamp);
-            let interval_str = prev_timestamp
-                .map(|prev| format_interval(prev, msg.timestamp))
-                .unwrap_or_default();
-            prev_timestamp = Some(msg.timestamp);
+            // Header: │  name [→ target] · HH:MM
+            let time_str = format_time_short(msg.timestamp);
 
-            let name_color = t.agent_color(&msg.from);
+            let is_user = msg.from == "user";
+            let border_color = if is_user { t.border } else { t.agent_color(&msg.from) };
+            let name_color = border_color;
             let name_style = Style::default().fg(name_color).add_modifier(Modifier::BOLD);
+            let border_span = Span::styled("│  ".to_string(), Style::default().fg(border_color));
 
-            let mut header = vec![Span::styled(msg.from.clone(), name_style)];
+            let mut header = vec![border_span.clone()];
+            header.push(Span::styled(msg.from.clone(), name_style));
             if let Some(ref tgt) = target {
                 let target_color = t.agent_color(tgt);
                 header.push(Span::styled(
@@ -429,14 +427,10 @@ impl ChannelView {
                     Style::default().fg(target_color).add_modifier(Modifier::BOLD),
                 ));
             }
-            header.push(Span::raw("  "));
-            header.push(Span::styled(time_str, Style::default().fg(t.text_muted)));
-            if !interval_str.is_empty() {
-                header.push(Span::styled(
-                    format!(" · {}", interval_str),
-                    Style::default().fg(t.text_muted),
-                ));
-            }
+            header.push(Span::styled(
+                format!(" · {}", time_str),
+                Style::default().fg(t.text_muted),
+            ));
             out.push(Line::from(header));
 
             // Unified rendering: parse content to blocks, render collapsed via block_renderer
@@ -446,7 +440,23 @@ impl ChannelView {
                 content_lines.extend(block_renderer::render_block_collapsed(block, width));
             }
             compact_rendered_lines(&mut content_lines);
+            // Prepend border strip to all content lines
+            for line in &mut content_lines {
+                let mut new_spans = vec![border_span.clone()];
+                new_spans.extend(std::mem::take(&mut line.spans));
+                line.spans = new_spans;
+            }
             out.extend(content_lines);
+
+            // Footer for agent messages (not user, not system)
+            if !is_user {
+                let footer = build_message_footer(&msg.from, "", None);
+                if !footer.spans.is_empty() {
+                    let mut footer_spans = vec![border_span.clone()];
+                    footer_spans.extend(footer.spans);
+                    out.push(Line::from(footer_spans));
+                }
+            }
         }
 
         // Trailing padding

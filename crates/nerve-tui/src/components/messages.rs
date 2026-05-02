@@ -233,7 +233,7 @@ mod tests {
     }
 
     #[test]
-    fn time_interval_in_header() {
+    fn time_shown_in_header() {
         let mut cv = ChannelView::new();
         let mut msg1 = make_msg("alice", "first");
         msg1.timestamp = 1710000000.0;
@@ -249,7 +249,9 @@ mod tests {
         assert!(bob_header.is_some(), "bob header should exist");
         let header_text: String = bob_header.unwrap().spans.iter()
             .map(|s| s.content.to_string()).collect();
-        assert!(header_text.contains("+15s"), "header should show +15s interval");
+        // Header now shows · HH:MM (no interval between messages)
+        assert!(header_text.contains(" · "), "header should show · time separator");
+        assert!(!header_text.contains("+15s"), "header should not show interval");
     }
 
     #[test]
