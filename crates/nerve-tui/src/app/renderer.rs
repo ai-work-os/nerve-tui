@@ -9,8 +9,11 @@ use crate::theme;
 
 impl<T: Transport> App<T> {
     pub(crate) fn render(&mut self, frame: &mut Frame) {
-        // Advance blink tick for streaming cursor
+        // Advance blink tick for streaming cursor and spinner animation
         self.dm_view.tick_blink();
+        self.spinner.advance();
+        let spinner_frame = self.spinner.frame().to_string();
+        self.dm_view.spinner_frame = spinner_frame;
 
         let area = frame.area();
 

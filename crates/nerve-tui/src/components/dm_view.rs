@@ -58,6 +58,8 @@ pub struct DmView {
     text_cache: Option<TextCacheEntry>,
     /// Number of cache hits (for diagnostics/testing).
     pub cache_hit_count: u64,
+    /// Current spinner frame (updated each render tick from App).
+    pub spinner_frame: String,
 }
 
 impl DmView {
@@ -81,6 +83,7 @@ impl DmView {
             summary_mode: false,
             text_cache: None,
             cache_hit_count: 0,
+            spinner_frame: "⠋".to_string(),
         }
     }
 
@@ -400,7 +403,7 @@ impl DmView {
 
         // Streaming previews — always rebuilt (content changes every chunk)
         let t = theme::current();
-        let cursor_char = if self.cursor_visible() { " ▌" } else { "  " };
+        let spinner = self.spinner_frame.clone();
         let mut streaming_names: Vec<&String> = self.streaming_messages.keys().collect();
         streaming_names.sort();
         for name in streaming_names {
@@ -416,7 +419,7 @@ impl DmView {
                         .fg(name_color)
                         .add_modifier(Modifier::BOLD),
                 ),
-                Span::styled(cursor_char.to_string(), Style::default().fg(t.warning)),
+                Span::styled(format!(" {}", spinner), Style::default().fg(name_color)),
             ]));
 
             if !msg.blocks.is_empty() {
@@ -425,7 +428,7 @@ impl DmView {
                     name, msg.blocks.len()
                 );
                 for block in &msg.blocks {
-                    let mut rendered = block_renderer::render_block(block, width);
+                    let mut rendered = block_renderer::render_block_with_spinner(block, width, &spinner);
                     for line in &mut rendered {
                         let mut new_spans = vec![border.clone()];
                         new_spans.extend(std::mem::take(&mut line.spans));

@@ -7,6 +7,7 @@ use tokio::sync::mpsc;
 use crate::components::channel_view::ChannelPanelState;
 use crate::components::channel_view::ChannelView;
 use crate::components::dm_view::DmView;
+use crate::components::spinner::BrailleSpinner;
 use crate::components::*;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -71,6 +72,8 @@ pub struct App<T: Transport> {
     pub(crate) needs_redraw: bool,
     /// When true, clear terminal buffer before next draw (forces full repaint).
     pub(crate) force_clear: bool,
+    /// Spinner for tool pending / streaming cursor animation.
+    pub(crate) spinner: BrailleSpinner,
 }
 
 impl<T: Transport> App<T> {
@@ -117,6 +120,7 @@ impl<T: Transport> App<T> {
             panel_x_boundaries: Vec::new(),
             needs_redraw: true,
             force_clear: false,
+            spinner: BrailleSpinner::new(),
         }
     }
 

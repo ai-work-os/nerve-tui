@@ -121,15 +121,25 @@ fn truncate_str(s: &str, max_len: usize) -> String {
 
 /// Render any ContentBlock to styled lines (full expanded view).
 pub fn render_block(block: &ContentBlock, width: u16) -> Vec<Line<'static>> {
-    render_block_inner(block, width, false)
+    render_block_inner(block, width, false, None)
 }
 
 /// Render any ContentBlock in collapsed mode (one-line summary for thinking/tool_call/tool_result).
 pub fn render_block_collapsed(block: &ContentBlock, width: u16) -> Vec<Line<'static>> {
-    render_block_inner(block, width, true)
+    render_block_inner(block, width, true, None)
 }
 
-fn render_block_inner(block: &ContentBlock, width: u16, collapsed: bool) -> Vec<Line<'static>> {
+/// Render any ContentBlock to styled lines with spinner frame for pending/running tools.
+pub fn render_block_with_spinner(block: &ContentBlock, width: u16, spinner_frame: &str) -> Vec<Line<'static>> {
+    render_block_inner(block, width, false, Some(spinner_frame))
+}
+
+/// Render any ContentBlock in collapsed mode with spinner frame for pending/running tools.
+pub fn render_block_collapsed_with_spinner(block: &ContentBlock, width: u16, spinner_frame: &str) -> Vec<Line<'static>> {
+    render_block_inner(block, width, true, Some(spinner_frame))
+}
+
+fn render_block_inner(block: &ContentBlock, width: u16, collapsed: bool, spinner_frame: Option<&str>) -> Vec<Line<'static>> {
     debug!(block_type = block.kind(), width, collapsed, "rendering content block");
     match block {
         ContentBlock::Text { text } => render_text(text, width),
@@ -142,7 +152,7 @@ fn render_block_inner(block: &ContentBlock, width: u16, collapsed: bool) -> Vec<
             render_thinking(text, elapsed, collapsed)
         }
         ContentBlock::ToolCall { id: _, name, input, status } => {
-            render_tool_call(name, input, status, collapsed)
+            render_tool_call(name, input, status, collapsed, spinner_frame)
         }
         ContentBlock::ToolResult { tool_call_id: _, content, is_error } => {
             render_tool_result(content, *is_error, collapsed)
@@ -556,15 +566,21 @@ fn tool_icon(name: &str) -> &'static str {
     }
 }
 
-fn render_tool_call(name: &str, input: &str, status: &ToolStatus, collapsed: bool) -> Vec<Line<'static>> {
+fn render_tool_call(name: &str, input: &str, status: &ToolStatus, collapsed: bool, spinner_frame: Option<&str>) -> Vec<Line<'static>> {
     let t = theme::current();
     let mut lines = Vec::new();
 
-    let (status_icon, icon_color) = match status {
-        ToolStatus::Pending => ("⏳", t.text),
-        ToolStatus::Running => ("⏳", t.success),
-        ToolStatus::Completed => ("✓", t.success),
-        ToolStatus::Failed => ("✗", t.error),
+    let (status_icon, icon_color): (std::borrow::Cow<str>, _) = match status {
+        ToolStatus::Pending => {
+            let icon = spinner_frame.map(|f| std::borrow::Cow::Owned(f.to_string())).unwrap_or(std::borrow::Cow::Borrowed("⏳"));
+            (icon, t.text)
+        }
+        ToolStatus::Running => {
+            let icon = spinner_frame.map(|f| std::borrow::Cow::Owned(f.to_string())).unwrap_or(std::borrow::Cow::Borrowed("⏳"));
+            (icon, t.success)
+        }
+        ToolStatus::Completed => (std::borrow::Cow::Borrowed("✓"), t.success),
+        ToolStatus::Failed => (std::borrow::Cow::Borrowed("✗"), t.error),
     };
 
     let ticon = tool_icon(name);
@@ -935,7 +951,7 @@ mod tests {
 
     #[test]
     fn tool_call_pending() {
-        let lines = render_tool_call("Read", "{}", &ToolStatus::Pending, false);
+        let lines = render_tool_call("Read", "{}", &ToolStatus::Pending, false, None);
         let text: String = lines.iter()
             .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
             .collect();
@@ -945,7 +961,7 @@ mod tests {
 
     #[test]
     fn tool_call_completed() {
-        let lines = render_tool_call("Edit", "{}", &ToolStatus::Completed, false);
+        let lines = render_tool_call("Edit", "{}", &ToolStatus::Completed, false, None);
         let text: String = lines.iter()
             .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
             .collect();
@@ -955,7 +971,7 @@ mod tests {
 
     #[test]
     fn tool_call_failed() {
-        let lines = render_tool_call("Bash", "{}", &ToolStatus::Failed, false);
+        let lines = render_tool_call("Bash", "{}", &ToolStatus::Failed, false, None);
         let text: String = lines.iter()
             .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
             .collect();
@@ -965,7 +981,7 @@ mod tests {
     #[test]
     fn tool_call_shows_all_args() {
         let input = r#"{"path": "/tmp/test.rs", "content": "fn main() {}"}"#;
-        let lines = render_tool_call("Write", input, &ToolStatus::Running, false);
+        let lines = render_tool_call("Write", input, &ToolStatus::Running, false, None);
         let text: String = lines.iter()
             .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
             .collect();
@@ -977,7 +993,7 @@ mod tests {
     #[test]
     fn tool_call_many_args_all_shown() {
         let input = r#"{"a":"1","b":"2","c":"3","d":"4","e":"5"}"#;
-        let lines = render_tool_call("Foo", input, &ToolStatus::Pending, false);
+        let lines = render_tool_call("Foo", input, &ToolStatus::Pending, false, None);
         let text: String = lines.iter()
             .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
             .collect();
@@ -1372,7 +1388,7 @@ mod tests {
     #[test]
     fn tool_call_collapsed_shows_header_only() {
         let input = r#"{"file_path": "/tmp/test.rs", "content": "fn main() {}"}"#;
-        let lines = render_tool_call("Write", input, &ToolStatus::Completed, true);
+        let lines = render_tool_call("Write", input, &ToolStatus::Completed, true, None);
         // Collapsed: one line with summary (file_path)
         assert_eq!(lines.len(), 1);
         let text = lines_to_text(&lines);
@@ -1383,7 +1399,7 @@ mod tests {
     #[test]
     fn tool_call_expanded_shows_args() {
         let input = r#"{"path": "/tmp/test.rs"}"#;
-        let lines = render_tool_call("Write", input, &ToolStatus::Completed, false);
+        let lines = render_tool_call("Write", input, &ToolStatus::Completed, false, None);
         // Expanded: header + 1 arg = 2
         assert_eq!(lines.len(), 2);
         let text = lines_to_text(&lines);
@@ -1582,7 +1598,7 @@ mod tests {
 
     #[test]
     fn tool_call_completed_uses_success_color() {
-        let lines = render_tool_call("Read", "{}", &ToolStatus::Completed, true);
+        let lines = render_tool_call("Read", "{}", &ToolStatus::Completed, true, None);
         let icon_span = &lines[0].spans[0];
         assert_eq!(icon_span.style.fg, Some(theme::current().success));
     }
@@ -1891,7 +1907,7 @@ mod tests {
     #[test]
     fn tool_call_collapsed_shows_summary() {
         let input = r#"{"command": "ls -la"}"#;
-        let lines = render_tool_call("Bash", input, &ToolStatus::Running, true);
+        let lines = render_tool_call("Bash", input, &ToolStatus::Running, true, None);
         assert_eq!(lines.len(), 1);
         let text = lines_to_text(&lines);
         assert!(text.contains("$"), "Bash should use $ tool icon");
@@ -1901,7 +1917,7 @@ mod tests {
     #[test]
     fn tool_call_expanded_still_shows_full_args() {
         let input = r#"{"command": "ls -la", "description": "list files"}"#;
-        let lines = render_tool_call("Bash", input, &ToolStatus::Completed, false);
+        let lines = render_tool_call("Bash", input, &ToolStatus::Completed, false, None);
         // Expanded: header + 2 args
         assert!(lines.len() >= 3);
         let text = lines_to_text(&lines);

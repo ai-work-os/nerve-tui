@@ -442,26 +442,23 @@ mod tests {
     }
 
     #[test]
-    fn streaming_cursor_blinks_in_output() {
+    fn streaming_cursor_shows_spinner_in_output() {
+        use crate::components::spinner::BRAILLE_FRAMES;
         let mut dm = DmView::new("agent");
         dm.start_streaming_message("agent");
         let update = serde_json::json!({ "content": { "text": "text" } });
         dm.apply_streaming_event("agent", "agent_message_chunk", &update);
 
+        // Default spinner_frame is the first braille character
         let lines = dm.build_text(80);
         let text: String = lines.iter()
             .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
             .collect();
-        assert!(text.contains("▌"), "cursor visible in on phase");
-
-        for _ in 0..15 {
-            dm.tick_blink();
-        }
-        let lines = dm.build_text(80);
-        let text: String = lines.iter()
-            .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
-            .collect();
-        assert!(!text.contains("▌"), "cursor hidden in off phase");
+        assert!(
+            BRAILLE_FRAMES.iter().any(|f| text.contains(*f)),
+            "streaming header should contain a braille spinner frame, got: {}", text
+        );
+        assert!(!text.contains("▌"), "blinking cursor ▌ should be replaced by spinner");
     }
 
     #[test]
