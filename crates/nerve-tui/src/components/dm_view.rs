@@ -406,7 +406,7 @@ impl DmView {
         for name in streaming_names {
             let msg = &self.streaming_messages[name];
             let name_color = t.agent_color(name);
-            let border = Span::styled("│ ".to_string(), Style::default().fg(name_color));
+            let border = Span::styled("│  ".to_string(), Style::default().fg(name_color));
             out.push(Line::from(""));
             out.push(Line::from(vec![
                 border.clone(),
@@ -512,14 +512,11 @@ impl DmView {
                 .unwrap_or_default();
             prev_timestamp = Some(msg.timestamp);
 
-            let name_color = t.agent_color(&msg.from);
-            let name_style = Style::default().fg(name_color).add_modifier(Modifier::BOLD);
             let is_user = msg.from == "user";
-            let border_span = if !is_user {
-                Span::styled("│ ".to_string(), Style::default().fg(name_color))
-            } else {
-                Span::raw("".to_string())
-            };
+            let border_color = if is_user { t.border } else { t.agent_color(&msg.from) };
+            let name_color = if is_user { t.agent_color(&msg.from) } else { border_color };
+            let name_style = Style::default().fg(name_color).add_modifier(Modifier::BOLD);
+            let border_span = Span::styled("│  ".to_string(), Style::default().fg(border_color));
 
             let mut header = vec![border_span.clone()];
             header.push(Span::styled(msg.from.clone(), name_style));
@@ -557,13 +554,11 @@ impl DmView {
                 }
             }
             compact_rendered_lines(&mut content_lines);
-            // Prepend border strip to content lines for agent messages
-            if !is_user {
-                for line in &mut content_lines {
-                    let mut new_spans = vec![border_span.clone()];
-                    new_spans.extend(std::mem::take(&mut line.spans));
-                    line.spans = new_spans;
-                }
+            // Prepend border strip to all content lines
+            for line in &mut content_lines {
+                let mut new_spans = vec![border_span.clone()];
+                new_spans.extend(std::mem::take(&mut line.spans));
+                line.spans = new_spans;
             }
             out.extend(content_lines);
         }
