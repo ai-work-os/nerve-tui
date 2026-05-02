@@ -27,7 +27,7 @@ pub const SCANNER_INTERVAL_MS: u64 = 40;
 const SCANNER_TRAIL_LEN: usize = 4;
 
 pub struct KnightRiderScanner {
-    width: usize,
+    pub width: usize,
     pos: usize,
     going_right: bool,
 }

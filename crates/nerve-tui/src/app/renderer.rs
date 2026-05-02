@@ -1,9 +1,11 @@
 use nerve_tui_core::Transport;
+use ratatui::style::Style;
 use ratatui::Frame;
 
 use super::app_state::{SplitFocus, SplitTarget};
 use super::App;
 use crate::components::channel_view;
+use crate::components::spinner::KnightRiderScanner;
 use crate::layout::AppLayout;
 use crate::theme;
 
@@ -110,6 +112,44 @@ impl<T: Transport> App<T> {
         };
         self.input.render_with_meta(layout.input, frame.buffer_mut(), &meta_left, agent_c);
         self.input.render_popup(layout.input, frame.buffer_mut());
+
+        // Knight Rider scanner overlay on metadata line when agent is responding
+        if self.dm_view.is_responding {
+            let scanner_width = layout.input.width.saturating_sub(4) as usize; // -4 for padding
+            if self.scanner.width != scanner_width {
+                self.scanner = KnightRiderScanner::new(scanner_width);
+            }
+            self.scanner.advance();
+
+            let t = theme::current();
+            let agent_c = t.agent_color(self.dm_view.agent_name());
+            let meta_y = layout.input.y + layout.input.height - 1;
+            let start_x = layout.input.x + 2; // after left border
+            let end_x = layout.input.x + layout.input.width.saturating_sub(10); // leave room for "esc 中断"
+
+            let spans = self.scanner.render_spans(agent_c);
+            let buf = frame.buffer_mut();
+            for (i, (ch, color)) in spans.iter().enumerate() {
+                let x = start_x + i as u16;
+                if x < end_x {
+                    if let Some(cell) = buf.cell_mut((x, meta_y)) {
+                        cell.set_char(*ch);
+                        cell.set_fg(*color);
+                        cell.set_bg(t.background_element);
+                    }
+                }
+            }
+
+            // "esc 中断" hint on the right
+            let hint = "esc 中断";
+            let hint_x = layout.input.x + layout.input.width.saturating_sub(10);
+            buf.set_string(
+                hint_x,
+                meta_y,
+                hint,
+                Style::default().fg(t.text_muted).bg(t.background_element),
+            );
+        }
 
         // Cursor
         let (cx, cy) = self.input.cursor_position_with_border(layout.input, agent_c.is_some());

@@ -7,7 +7,7 @@ use tokio::sync::mpsc;
 use crate::components::channel_view::ChannelPanelState;
 use crate::components::channel_view::ChannelView;
 use crate::components::dm_view::DmView;
-use crate::components::spinner::BrailleSpinner;
+use crate::components::spinner::{BrailleSpinner, KnightRiderScanner};
 use crate::components::*;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -74,6 +74,8 @@ pub struct App<T: Transport> {
     pub(crate) force_clear: bool,
     /// Spinner for tool pending / streaming cursor animation.
     pub(crate) spinner: BrailleSpinner,
+    /// Knight Rider scanner animation for input metadata line during agent response.
+    pub(crate) scanner: KnightRiderScanner,
 }
 
 impl<T: Transport> App<T> {
@@ -121,6 +123,7 @@ impl<T: Transport> App<T> {
             needs_redraw: true,
             force_clear: false,
             spinner: BrailleSpinner::new(),
+            scanner: KnightRiderScanner::new(0),
         }
     }
 

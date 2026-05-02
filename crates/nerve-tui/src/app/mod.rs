@@ -1821,8 +1821,10 @@ mod tests {
 
         terminal.draw(|f| app.render(f)).unwrap();
 
+        // When responding, the metadata line shows Knight Rider scanner + "esc 中断" hint
+        // buffer_text_compact strips whitespace, so "esc 中断" becomes "esc中断"
         let text = buffer_text_compact(terminal.backend().buffer());
-        assert!(text.contains("回复中..."), "buffer should show responding indicator");
+        assert!(text.contains("esc中断"), "buffer should show esc hint during scanner animation");
     }
 
     #[test]
