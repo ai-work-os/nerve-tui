@@ -334,8 +334,8 @@ mod tests {
         let text: String = lines.iter()
             .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
             .collect();
-        // Collapsed: should show ▶ indicator
-        assert!(text.contains("▶") || text.contains("Read"));
+        // Collapsed: should show ▶ indicator or tool icon for Read (→)
+        assert!(text.contains("▶") || text.contains("→"));
     }
 
     #[test]

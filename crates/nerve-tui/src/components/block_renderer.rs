@@ -541,51 +541,54 @@ fn render_thinking(text: &str, elapsed: Option<std::time::Duration>, collapsed: 
 // ToolCall block: tool name + status icon + collapsible args
 // ---------------------------------------------------------------------------
 
+/// Return a single-character icon for a tool name.
+fn tool_icon(name: &str) -> &'static str {
+    match name {
+        "Bash" | "Shell" => "$",
+        "Write" | "Edit" => "←",
+        "Read" => "→",
+        "Glob" | "Grep" => "✱",
+        "WebFetch" => "%",
+        "WebSearch" => "◈",
+        "CodeSearch" => "◇",
+        "TodoWrite" => "⚙",
+        _ => "⚙",
+    }
+}
+
 fn render_tool_call(name: &str, input: &str, status: &ToolStatus, collapsed: bool) -> Vec<Line<'static>> {
     let t = theme::current();
     let mut lines = Vec::new();
 
-    let (icon, icon_color) = match status {
-        ToolStatus::Pending => ("⏳", t.warning),
+    let (status_icon, icon_color) = match status {
+        ToolStatus::Pending => ("⏳", t.text),
         ToolStatus::Running => ("⏳", t.success),
         ToolStatus::Completed => ("✓", t.success),
         ToolStatus::Failed => ("✗", t.error),
     };
 
+    let ticon = tool_icon(name);
+
     debug!(tool_name = name, ?status, collapsed, "rendering tool_call block");
 
-    if collapsed {
-        // Compact one-line: icon + name + ": " + summary
-        let summary = extract_tool_summary(name, input);
-        let mut spans = vec![
-            Span::styled(format!("  {} ", icon), Style::default().fg(icon_color)),
-            Span::styled(
-                name.to_string(),
-                Style::default()
-                    .fg(t.secondary)
-                    .add_modifier(Modifier::BOLD),
-            ),
-        ];
-        if !summary.is_empty() {
-            spans.push(Span::styled(
-                format!(": {}", summary),
-                Style::default().fg(t.text),
-            ));
-        }
-        lines.push(Line::from(spans));
-    } else {
-        // Header: icon + tool name
-        lines.push(Line::from(vec![
-            Span::styled(format!("  {} ", icon), Style::default().fg(icon_color)),
-            Span::styled(
-                name.to_string(),
-                Style::default()
-                    .fg(t.secondary)
-                    .add_modifier(Modifier::BOLD),
-            ),
-        ]));
+    // Header line (same format for both collapsed and expanded = InlineTool)
+    let summary = extract_tool_summary(name, input);
+    let header_color = match status {
+        ToolStatus::Completed => t.text_muted,
+        ToolStatus::Failed => t.error,
+        _ => t.text,
+    };
+    let mut header_spans = vec![
+        Span::styled(format!("  {} ", status_icon), Style::default().fg(icon_color)),
+        Span::styled(format!("{} ", ticon), Style::default().fg(t.secondary)),
+    ];
+    if !summary.is_empty() {
+        header_spans.push(Span::styled(summary, Style::default().fg(header_color)));
+    }
+    lines.push(Line::from(header_spans));
 
-        // Show input args when expanded
+    if !collapsed {
+        // BlockTool: content lines with ┃ border
         if !input.is_empty() {
             if let Ok(val) = serde_json::from_str::<serde_json::Value>(input) {
                 if let Some(obj) = val.as_object() {
@@ -596,20 +599,27 @@ fn render_tool_call(name: &str, input: &str, status: &ToolStatus, collapsed: boo
                         };
                         lines.push(Line::from(vec![
                             Span::styled(
-                                format!("    {}: ", k),
-                                Style::default().fg(t.warning),
+                                "  ┃  ".to_string(),
+                                Style::default().fg(t.border_active).bg(t.background_panel),
                             ),
-                            Span::styled(v_str, Style::default().fg(t.text)),
+                            Span::styled(
+                                format!("{}: ", k),
+                                Style::default().fg(t.warning).bg(t.background_panel),
+                            ),
+                            Span::styled(v_str, Style::default().fg(t.text).bg(t.background_panel)),
                         ]));
                     }
                 }
             } else {
                 // Plain string input
                 for line in input.lines() {
-                    lines.push(Line::from(Span::styled(
-                        format!("    {}", line),
-                        Style::default().fg(t.text),
-                    )));
+                    lines.push(Line::from(vec![
+                        Span::styled(
+                            "  ┃  ".to_string(),
+                            Style::default().fg(t.border_active).bg(t.background_panel),
+                        ),
+                        Span::styled(line.to_string(), Style::default().fg(t.text).bg(t.background_panel)),
+                    ]));
                 }
             }
         }
@@ -621,28 +631,26 @@ fn render_tool_call(name: &str, input: &str, status: &ToolStatus, collapsed: boo
 /// Render a ToolCall as a single summary line (for summary_mode).
 fn render_tool_call_summary(name: &str, input: &str, status: &ToolStatus) -> Vec<Line<'static>> {
     let t = theme::current();
-    let (icon, icon_color) = match status {
-        ToolStatus::Pending => ("⏳", t.warning),
+    let (status_icon, icon_color) = match status {
+        ToolStatus::Pending => ("⏳", t.text),
         ToolStatus::Running => ("⏳", t.success),
         ToolStatus::Completed => ("✓", t.success),
         ToolStatus::Failed => ("✗", t.error),
     };
 
+    let ticon = tool_icon(name);
     let summary = extract_tool_summary(name, input);
+    let header_color = match status {
+        ToolStatus::Completed => t.text_muted,
+        ToolStatus::Failed => t.error,
+        _ => t.text,
+    };
     let mut spans = vec![
-        Span::styled(format!("  {} ", icon), Style::default().fg(icon_color)),
-        Span::styled(
-            name.to_string(),
-            Style::default()
-                .fg(t.secondary)
-                .add_modifier(Modifier::BOLD),
-        ),
+        Span::styled(format!("  {} ", status_icon), Style::default().fg(icon_color)),
+        Span::styled(format!("{} ", ticon), Style::default().fg(t.secondary)),
     ];
     if !summary.is_empty() {
-        spans.push(Span::styled(
-            format!(": {}", summary),
-            Style::default().fg(t.text),
-        ));
+        spans.push(Span::styled(summary, Style::default().fg(header_color)));
     }
 
     vec![Line::from(spans)]
@@ -932,7 +940,7 @@ mod tests {
             .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
             .collect();
         assert!(text.contains("⏳"));
-        assert!(text.contains("Read"));
+        assert!(text.contains("→"), "Read should use → icon");
     }
 
     #[test]
@@ -942,7 +950,7 @@ mod tests {
             .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
             .collect();
         assert!(text.contains("✓"));
-        assert!(text.contains("Edit"));
+        assert!(text.contains("←"), "Edit should use ← icon");
     }
 
     #[test]
@@ -961,7 +969,7 @@ mod tests {
         let text: String = lines.iter()
             .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
             .collect();
-        assert!(text.contains("Write"));
+        assert!(text.contains("←"), "Write should use ← icon");
         assert!(text.contains("path"));
         assert!(text.contains("/tmp/test.rs"));
     }
@@ -1089,7 +1097,7 @@ mod tests {
         let text: String = lines.iter()
             .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
             .collect();
-        assert!(text.contains("Bash"));
+        assert!(text.contains("$"), "Bash tool should use $ icon");
     }
 
     #[test]
@@ -1368,7 +1376,7 @@ mod tests {
         // Collapsed: one line with summary (file_path)
         assert_eq!(lines.len(), 1);
         let text = lines_to_text(&lines);
-        assert!(text.contains("Write"));
+        assert!(text.contains("←"), "Write should use ← icon");
         assert!(text.contains("/tmp/test.rs"), "collapsed should show file path summary");
     }
 
@@ -1886,7 +1894,7 @@ mod tests {
         let lines = render_tool_call("Bash", input, &ToolStatus::Running, true);
         assert_eq!(lines.len(), 1);
         let text = lines_to_text(&lines);
-        assert!(text.contains("Bash"), "should contain tool name");
+        assert!(text.contains("$"), "Bash should use $ tool icon");
         assert!(text.contains("ls -la"), "collapsed should show command summary");
     }
 
@@ -1907,7 +1915,7 @@ mod tests {
         assert_eq!(lines.len(), 1);
         let text = lines_to_text(&lines);
         assert!(text.contains("✓"));
-        assert!(text.contains("Edit"));
+        assert!(text.contains("←"), "Edit should use ← icon");
         assert!(text.contains("/src/theme.rs"));
     }
 
@@ -1926,6 +1934,49 @@ mod tests {
         assert!(text.contains("✗"));
     }
 
+    // --- Task 8: tool_icon mapping tests ---
+
+    #[test]
+    fn tool_icon_mapping() {
+        assert_eq!(tool_icon("Bash"), "$");
+        assert_eq!(tool_icon("Write"), "←");
+        assert_eq!(tool_icon("Edit"), "←");
+        assert_eq!(tool_icon("Read"), "→");
+        assert_eq!(tool_icon("Glob"), "✱");
+        assert_eq!(tool_icon("Grep"), "✱");
+        assert_eq!(tool_icon("WebFetch"), "%");
+        assert_eq!(tool_icon("Unknown"), "⚙");
+    }
+
+    #[test]
+    fn tool_call_collapsed_uses_tool_icon() {
+        let block = ContentBlock::ToolCall {
+            id: "1".into(),
+            name: "Bash".into(),
+            input: r#"{"command":"ls"}"#.into(),
+            status: ToolStatus::Completed,
+        };
+        let lines = render_block_collapsed(&block, 80);
+        let text: String = lines[0].spans.iter().map(|s| s.content.to_string()).collect();
+        assert!(text.contains("$"), "Bash should use $ icon, got: {}", text);
+        assert!(text.contains("✓"), "Completed should show ✓, got: {}", text);
+    }
+
+    #[test]
+    fn tool_call_expanded_has_border() {
+        let block = ContentBlock::ToolCall {
+            id: "1".into(),
+            name: "Read".into(),
+            input: r#"{"file_path":"/tmp/test.rs"}"#.into(),
+            status: ToolStatus::Completed,
+        };
+        let lines = render_block(&block, 80);
+        // Should have header + at least one content line with ┃
+        assert!(lines.len() > 1);
+        let content: String = lines[1].spans.iter().map(|s| s.content.to_string()).collect();
+        assert!(content.contains("┃"), "expanded content should have ┃ border, got: {}", content);
+    }
+
     // --- Task 5: summary_mode improvement tests ---
 
     #[test]
@@ -1939,7 +1990,7 @@ mod tests {
         let lines = render_block_summary(&block, 80);
         assert_eq!(lines.len(), 1, "summary mode should show 1-line tool call summary");
         let text = lines_to_text(&lines);
-        assert!(text.contains("Read"));
+        assert!(text.contains("→"), "Read should use → icon");
         assert!(text.contains("/tmp/file.rs"));
         assert!(text.contains("✓"));
     }
