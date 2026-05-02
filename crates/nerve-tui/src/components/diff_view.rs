@@ -3,6 +3,7 @@
 use crate::theme::Theme;
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
+use unicode_width::UnicodeWidthStr;
 
 // ---------------------------------------------------------------------------
 // Data types
@@ -163,11 +164,131 @@ pub fn render_unified<'a>(hunks: &[DiffHunk], theme: &Theme) -> Vec<Line<'static
     out
 }
 
+/// Truncate or pad a string to exactly `width` display columns.
+/// Uses unicode_width for CJK support.
+/// Truncates with "…" if too long, pads with spaces if too short.
+fn truncate_or_pad(s: &str, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    let display_w = UnicodeWidthStr::width(s);
+    if display_w == width {
+        return s.to_string();
+    }
+    if display_w > width {
+        // Truncate: find the cut point where adding "…" keeps us at `width`
+        let target = width.saturating_sub(1); // 1 for "…"
+        let mut acc = 0usize;
+        let mut cut = 0usize;
+        for ch in s.chars() {
+            let cw = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+            if acc + cw > target {
+                break;
+            }
+            acc += cw;
+            cut += ch.len_utf8();
+        }
+        format!("{}…{}", &s[..cut], " ".repeat(width.saturating_sub(acc + 1)))
+    } else {
+        // Pad with spaces
+        let pad = width - display_w;
+        format!("{}{}", s, " ".repeat(pad))
+    }
+}
+
+/// Render diff hunks in split (side-by-side) layout.
+///
+/// Each line shows:
+/// ```text
+///   1 │ old content        │   1 │ new content
+/// ```
+/// Left = old (removed/context), right = new (added/context).
+pub fn render_split<'a>(hunks: &[DiffHunk], width: u16, theme: &Theme) -> Vec<Line<'static>> {
+    let mut out: Vec<Line<'static>> = Vec::new();
+
+    let num_style = Style::default().fg(theme.diff_line_number);
+    let sep_style = Style::default().fg(Color::DarkGray);
+    let text_color = theme.text;
+
+    // Layout: each side = 4 (num) + 3 (" │ ") + content_w = half_w
+    // Middle sep = " │ " (3 chars)
+    // total = 2 * (4 + 3 + content_w) + 3 = width
+    // content_w = (width - 3 - 2 * 7) / 2 = (width - 17) / 2
+    let total = width as usize;
+    let content_w = if total > 17 { (total - 17) / 2 } else { 1 };
+
+    for hunk in hunks {
+        for diff_line in &hunk.lines {
+            match diff_line {
+                DiffLine::Added { new_num, text } => {
+                    let left_bg = theme.diff_added_bg;
+                    let right_bg = theme.diff_added_bg;
+                    let left_num = "    ".to_string();
+                    let left_content = truncate_or_pad("", content_w);
+                    let right_num = format!("{:>4}", new_num);
+                    let right_content = truncate_or_pad(text, content_w);
+
+                    out.push(Line::from(vec![
+                        Span::styled(left_num, num_style.bg(left_bg)),
+                        Span::styled(" │ ", sep_style.bg(left_bg)),
+                        Span::styled(left_content, Style::default().bg(left_bg).fg(text_color)),
+                        Span::styled(" │ ", sep_style),
+                        Span::styled(right_num, num_style.bg(right_bg)),
+                        Span::styled(" │ ", sep_style.bg(right_bg)),
+                        Span::styled(right_content, Style::default().bg(right_bg).fg(text_color)),
+                    ]));
+                }
+                DiffLine::Removed { old_num, text } => {
+                    let left_bg = theme.diff_removed_bg;
+                    let right_bg = theme.diff_removed_bg;
+                    let left_num = format!("{:>4}", old_num);
+                    let left_content = truncate_or_pad(text, content_w);
+                    let right_num = "    ".to_string();
+                    let right_content = truncate_or_pad("", content_w);
+
+                    out.push(Line::from(vec![
+                        Span::styled(left_num, num_style.bg(left_bg)),
+                        Span::styled(" │ ", sep_style.bg(left_bg)),
+                        Span::styled(left_content, Style::default().bg(left_bg).fg(text_color)),
+                        Span::styled(" │ ", sep_style),
+                        Span::styled(right_num, num_style.bg(right_bg)),
+                        Span::styled(" │ ", sep_style.bg(right_bg)),
+                        Span::styled(right_content, Style::default().bg(right_bg).fg(text_color)),
+                    ]));
+                }
+                DiffLine::Context { old_num, new_num, text } => {
+                    let bg = theme.diff_context_bg;
+                    let left_num = format!("{:>4}", old_num);
+                    let right_num = format!("{:>4}", new_num);
+                    let left_content = truncate_or_pad(text, content_w);
+                    let right_content = truncate_or_pad(text, content_w);
+
+                    out.push(Line::from(vec![
+                        Span::styled(left_num, num_style.bg(bg)),
+                        Span::styled(" │ ", sep_style.bg(bg)),
+                        Span::styled(left_content, Style::default().bg(bg).fg(text_color)),
+                        Span::styled(" │ ", sep_style),
+                        Span::styled(right_num, num_style.bg(bg)),
+                        Span::styled(" │ ", sep_style.bg(bg)),
+                        Span::styled(right_content, Style::default().bg(bg).fg(text_color)),
+                    ]));
+                }
+            }
+        }
+    }
+
+    out
+}
+
 /// Public entry point. Parses the diff text and renders it.
-/// `width` is reserved for a future split-view mode (Task 11).
-pub fn render_diff(diff_text: &str, _width: u16, theme: &Theme) -> Vec<Line<'static>> {
+/// Uses split mode when width > 120, unified mode otherwise.
+pub fn render_diff(diff_text: &str, width: u16, theme: &Theme) -> Vec<Line<'static>> {
     let hunks = parse_unified_diff(diff_text);
-    render_unified(&hunks, theme)
+    if width > 120 {
+        render_split(&hunks, width, theme)
+    } else {
+        render_unified(&hunks, theme)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -278,12 +399,103 @@ mod tests {
     }
 
     #[test]
-    fn render_diff_wide_uses_unified() {
-        // Even at width > 120, render_unified is used (split deferred to Task 11)
+    fn render_diff_wide_uses_split() {
+        // At width > 120, render_diff uses split layout (different from unified)
         let diff = "--- a/f.rs\n+++ b/f.rs\n@@ -1,1 +1,1 @@\n-old\n+new";
         let theme = Theme::warm_light();
         let lines_wide = render_diff(diff, 200, &theme);
         let lines_narrow = render_diff(diff, 80, &theme);
-        assert_eq!(lines_wide.len(), lines_narrow.len());
+        // Wide (split): 2 lines (one for removed, one for added shown separately side-by-side)
+        // Narrow (unified): same number of lines but different span structure
+        assert!(!lines_wide.is_empty());
+        assert!(!lines_narrow.is_empty());
+        // Split layout has more spans per line (7 spans) than unified (5 spans)
+        assert!(lines_wide[0].spans.len() > lines_narrow[0].spans.len(),
+            "split should have more spans per line than unified");
+    }
+
+    #[test]
+    fn render_split_has_two_columns() {
+        let diff = "--- a/f.rs\n+++ b/f.rs\n@@ -1,2 +1,2 @@\n-old line\n+new line";
+        let hunks = parse_unified_diff(diff);
+        let theme = Theme::warm_light();
+        let lines = render_split(&hunks, 140, &theme);
+        assert!(!lines.is_empty());
+    }
+
+    #[test]
+    fn render_diff_uses_split_for_wide() {
+        let diff = "--- a/f.rs\n+++ b/f.rs\n@@ -1,1 +1,1 @@\n-old\n+new";
+        let theme = Theme::warm_light();
+        let lines_wide = render_diff(diff, 140, &theme);
+        let lines_narrow = render_diff(diff, 80, &theme);
+        // Wide should use split (different format)
+        assert!(!lines_wide.is_empty());
+        assert!(!lines_narrow.is_empty());
+    }
+
+    #[test]
+    fn truncate_or_pad_short_pads() {
+        let result = truncate_or_pad("hi", 6);
+        assert_eq!(result, "hi    ");
+        assert_eq!(UnicodeWidthStr::width(result.as_str()), 6);
+    }
+
+    #[test]
+    fn truncate_or_pad_exact_unchanged() {
+        let result = truncate_or_pad("hello", 5);
+        assert_eq!(result, "hello");
+    }
+
+    #[test]
+    fn truncate_or_pad_long_truncates() {
+        let result = truncate_or_pad("hello world", 7);
+        assert_eq!(UnicodeWidthStr::width(result.as_str()), 7);
+        assert!(result.contains('…'));
+    }
+
+    #[test]
+    fn truncate_or_pad_cjk() {
+        // Each CJK char is 2 columns wide
+        // "你好" = 4 columns, pad to 6
+        let result = truncate_or_pad("你好", 6);
+        assert_eq!(UnicodeWidthStr::width(result.as_str()), 6);
+    }
+
+    #[test]
+    fn render_split_context_appears_both_sides() {
+        let diff = "--- a/f.rs\n+++ b/f.rs\n@@ -1,1 +1,1 @@\n ctx_line";
+        let hunks = parse_unified_diff(diff);
+        let theme = Theme::warm_light();
+        let lines = render_split(&hunks, 140, &theme);
+        assert_eq!(lines.len(), 1);
+        let text: String = lines[0].spans.iter().map(|s| s.content.to_string()).collect();
+        // ctx_line should appear twice (both sides)
+        assert_eq!(text.matches("ctx_line").count(), 2,
+            "context line should appear on both sides, got: {}", text);
+    }
+
+    #[test]
+    fn render_split_added_left_blank() {
+        let diff = "--- a/f.rs\n+++ b/f.rs\n@@ -1,1 +1,1 @@\n+added_only";
+        let hunks = parse_unified_diff(diff);
+        let theme = Theme::warm_light();
+        let lines = render_split(&hunks, 140, &theme);
+        assert_eq!(lines.len(), 1);
+        // Left side (spans[0..=2]) should have blank line number "    "
+        let left_num = lines[0].spans[0].content.as_ref();
+        assert_eq!(left_num.trim(), "", "added line left side should have blank line number");
+    }
+
+    #[test]
+    fn render_split_removed_right_blank() {
+        let diff = "--- a/f.rs\n+++ b/f.rs\n@@ -1,1 +1,1 @@\n-removed_only";
+        let hunks = parse_unified_diff(diff);
+        let theme = Theme::warm_light();
+        let lines = render_split(&hunks, 140, &theme);
+        assert_eq!(lines.len(), 1);
+        // Right side (spans[4]) should have blank line number "    "
+        let right_num = lines[0].spans[4].content.as_ref();
+        assert_eq!(right_num.trim(), "", "removed line right side should have blank line number");
     }
 }

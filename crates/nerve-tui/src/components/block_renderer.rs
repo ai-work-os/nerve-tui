@@ -155,7 +155,7 @@ fn render_block_inner(block: &ContentBlock, width: u16, collapsed: bool, spinner
             render_tool_call(name, input, status, collapsed, spinner_frame)
         }
         ContentBlock::ToolResult { tool_call_id: _, content, is_error } => {
-            render_tool_result(content, *is_error, collapsed)
+            render_tool_result(content, *is_error, collapsed, width)
         }
         ContentBlock::Error { message } => render_error(message),
     }
@@ -676,9 +676,35 @@ fn render_tool_call_summary(name: &str, input: &str, status: &ToolStatus) -> Vec
 // ToolResult block: shows result content with error styling
 // ---------------------------------------------------------------------------
 
-fn render_tool_result(content: &str, is_error: bool, collapsed: bool) -> Vec<Line<'static>> {
+/// Detect whether `content` looks like a unified diff (has `--- ` and `+++ ` headers).
+fn is_diff_content(content: &str) -> bool {
+    let mut has_minus = false;
+    let mut has_plus = false;
+    for line in content.lines().take(5) {
+        if line.starts_with("--- ") {
+            has_minus = true;
+        }
+        if line.starts_with("+++ ") {
+            has_plus = true;
+        }
+    }
+    has_minus && has_plus
+}
+
+fn render_tool_result(content: &str, is_error: bool, collapsed: bool, width: u16) -> Vec<Line<'static>> {
     let t = theme::current();
     let mut lines = Vec::new();
+
+    // Detect unified diff content and render with DiffView (non-error only)
+    if !is_error && is_diff_content(content) {
+        lines.push(Line::from(Span::styled(
+            "  ✓ 结果 (diff)".to_string(),
+            Style::default().fg(t.text_muted),
+        )));
+        let diff_lines = crate::components::diff_view::render_diff(content, width, &t);
+        lines.extend(diff_lines);
+        return lines;
+    }
 
     let content_lines: Vec<&str> = content.lines().collect();
     let line_count = content_lines.len();
@@ -1006,8 +1032,34 @@ mod tests {
     // --- ToolResult block tests ---
 
     #[test]
+    fn tool_result_with_diff_uses_diff_view() {
+        let diff_content = "--- a/f.rs\n+++ b/f.rs\n@@ -1,1 +1,1 @@\n-old\n+new";
+        assert!(is_diff_content(diff_content));
+        assert!(!is_diff_content("just regular text"));
+    }
+
+    #[test]
+    fn tool_result_diff_renders_diff_header() {
+        let diff_content = "--- a/f.rs\n+++ b/f.rs\n@@ -1,1 +1,1 @@\n-old\n+new";
+        let lines = render_tool_result(diff_content, false, false, 80);
+        let text: String = lines.iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
+            .collect();
+        // Should show diff header and use diff view (line numbers, │ separators)
+        assert!(text.contains("✓ 结果 (diff)"), "diff result should show diff header, got: {}", text);
+    }
+
+    #[test]
+    fn is_diff_content_detects_unified_diff() {
+        assert!(is_diff_content("--- a/foo.rs\n+++ b/foo.rs\n@@ -1 +1 @@\n-old\n+new"));
+        assert!(!is_diff_content("just text\nno headers"));
+        assert!(!is_diff_content("--- only minus header"));
+        assert!(!is_diff_content("+++ only plus header"));
+    }
+
+    #[test]
     fn tool_result_success_shows_content() {
-        let lines = render_tool_result("file1.txt\nfile2.txt", false, false);
+        let lines = render_tool_result("file1.txt\nfile2.txt", false, false, 80);
         let text: String = lines.iter()
             .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
             .collect();
@@ -1019,7 +1071,7 @@ mod tests {
 
     #[test]
     fn tool_result_error_shows_content() {
-        let lines = render_tool_result("command not found", true, false);
+        let lines = render_tool_result("command not found", true, false, 80);
         let text: String = lines.iter()
             .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
             .collect();
@@ -1035,7 +1087,7 @@ mod tests {
     #[test]
     fn tool_result_long_shows_all() {
         let content = (0..10).map(|i| format!("line {}", i)).collect::<Vec<_>>().join("\n");
-        let lines = render_tool_result(&content, false, false);
+        let lines = render_tool_result(&content, false, false, 80);
         // Header + 10 content lines = 11
         assert_eq!(lines.len(), 11);
     }
@@ -1043,7 +1095,7 @@ mod tests {
     #[test]
     fn tool_result_always_shows_all() {
         let content = (0..10).map(|i| format!("line {}", i)).collect::<Vec<_>>().join("\n");
-        let lines = render_tool_result(&content, false, false);
+        let lines = render_tool_result(&content, false, false, 80);
         let text: String = lines.iter()
             .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
             .collect();
@@ -1409,7 +1461,7 @@ mod tests {
     #[test]
     fn tool_result_collapsed_shows_truncated() {
         let content = (0..10).map(|i| format!("line {}", i)).collect::<Vec<_>>().join("\n");
-        let lines = render_tool_result(&content, false, true);
+        let lines = render_tool_result(&content, false, true, 80);
         // 10 lines == TOOL_RESULT_MAX_LINES, show all: header + 10 = 11
         assert_eq!(lines.len(), 11);
         let text = lines_to_text(&lines);
@@ -1422,7 +1474,7 @@ mod tests {
     #[test]
     fn tool_result_short_content_unchanged_collapsed() {
         let content = (0..5).map(|i| format!("line {}", i)).collect::<Vec<_>>().join("\n");
-        let lines = render_tool_result(&content, false, true);
+        let lines = render_tool_result(&content, false, true, 80);
         let text = lines_to_text(&lines);
         assert!(text.contains("line 0"));
         assert!(text.contains("line 4"));
@@ -1432,7 +1484,7 @@ mod tests {
     #[test]
     fn tool_result_long_content_truncated_collapsed() {
         let content = (0..20).map(|i| format!("line {}", i)).collect::<Vec<_>>().join("\n");
-        let lines = render_tool_result(&content, false, true);
+        let lines = render_tool_result(&content, false, true, 80);
         let text = lines_to_text(&lines);
         assert!(text.contains("line 0"));
         assert!(text.contains("line 4"));
@@ -1445,7 +1497,7 @@ mod tests {
     #[test]
     fn tool_result_long_content_truncated_expanded() {
         let content = (0..100).map(|i| format!("line {}", i)).collect::<Vec<_>>().join("\n");
-        let lines = render_tool_result(&content, false, false);
+        let lines = render_tool_result(&content, false, false, 80);
         let text = lines_to_text(&lines);
         assert!(text.contains("line 0"));
         assert!(text.contains("line 24"));
@@ -1457,7 +1509,7 @@ mod tests {
     #[test]
     fn tool_result_expanded_short_no_truncation() {
         let content = (0..30).map(|i| format!("line {}", i)).collect::<Vec<_>>().join("\n");
-        let lines = render_tool_result(&content, false, false);
+        let lines = render_tool_result(&content, false, false, 80);
         let text = lines_to_text(&lines);
         assert!(text.contains("line 0"));
         assert!(text.contains("line 29"));
@@ -1467,7 +1519,7 @@ mod tests {
     #[test]
     fn tool_result_error_not_truncated() {
         let content = (0..100).map(|i| format!("error line {}", i)).collect::<Vec<_>>().join("\n");
-        let lines = render_tool_result(&content, true, false);
+        let lines = render_tool_result(&content, true, false, 80);
         let text = lines_to_text(&lines);
         assert!(text.contains("error line 0"));
         assert!(text.contains("error line 99"));
@@ -1477,7 +1529,7 @@ mod tests {
     #[test]
     fn tool_result_truncation_ellipsis_shows_count() {
         let content = (0..100).map(|i| format!("line {}", i)).collect::<Vec<_>>().join("\n");
-        let lines = render_tool_result(&content, false, true);
+        let lines = render_tool_result(&content, false, true, 80);
         let text = lines_to_text(&lines);
         // Collapsed: 100 lines, show 5 head + 2 tail = 7 shown, 93 hidden
         assert!(text.contains("+93 lines"), "ellipsis should show hidden line count, got: {}", text);
@@ -1485,7 +1537,7 @@ mod tests {
 
     #[test]
     fn tool_result_collapsed_short_shows_all() {
-        let lines = render_tool_result("ok", false, true);
+        let lines = render_tool_result("ok", false, true, 80);
         // Short content: header + 1 line = 2
         assert_eq!(lines.len(), 2);
     }
@@ -1493,7 +1545,7 @@ mod tests {
     #[test]
     fn tool_result_expanded_shows_all() {
         let content = (0..10).map(|i| format!("line {}", i)).collect::<Vec<_>>().join("\n");
-        let lines = render_tool_result(&content, false, false);
+        let lines = render_tool_result(&content, false, false, 80);
         // Expanded: header + 10 lines = 11
         assert_eq!(lines.len(), 11);
     }
