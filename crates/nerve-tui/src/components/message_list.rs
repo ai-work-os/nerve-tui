@@ -347,7 +347,7 @@ mod tests {
         let text1: String = lines1.iter()
             .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
             .collect();
-        assert!(text1.contains("思考中"));
+        assert!(text1.contains("Thinking"));
         // The timer value changes each call since Instant::now() is live
         // Just verify it renders without error on second call
         let lines2 = list.build_visible_lines(&msgs, 80, 20);

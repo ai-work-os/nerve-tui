@@ -6,6 +6,7 @@ use std::hash::{Hash, Hasher};
 use std::collections::hash_map::DefaultHasher;
 
 use nerve_tui_protocol::{ContentBlock, Message, ToolStatus};
+use ratatui::style::Color;
 use ratatui::text::Line;
 use tracing::debug;
 
@@ -113,7 +114,14 @@ fn render_message(msg: &Message, width: u16, _expand_state: &HashMap<usize, bool
 
 /// Hash the content of a message's blocks for cache invalidation.
 fn content_hash(msg: &Message, expand_state: &HashMap<usize, bool>) -> u64 {
+    use crate::theme;
     let mut hasher = DefaultHasher::new();
+    let t = theme::current();
+    let theme_id = match t.background {
+        Color::Rgb(r, g, b) => ((r as u64) << 16) | ((g as u64) << 8) | (b as u64),
+        _ => 0u64,
+    };
+    theme_id.hash(&mut hasher);
     msg.blocks.len().hash(&mut hasher);
     msg.meta.partial.hash(&mut hasher);
     // Include expand state in hash so toggling invalidates cache

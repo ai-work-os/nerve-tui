@@ -527,20 +527,20 @@ fn render_thinking(text: &str, elapsed: Option<std::time::Duration>, collapsed: 
         .map(|d| format!("{:.1}s", d.as_secs_f64()))
         .unwrap_or_else(|| "…".to_string());
 
-    let header = format!("  💭 思考中 ({})", timer);
+    let header = format!("  Thinking · {}", timer);
     lines.push(Line::from(Span::styled(
         header,
         Style::default()
-            .fg(t.border_active)
+            .fg(t.text_muted)
             .add_modifier(Modifier::ITALIC),
     )));
 
     if !collapsed {
         for line in text.lines() {
-            lines.push(Line::from(Span::styled(
-                format!("  │ {}", line),
-                Style::default().fg(t.border_active),
-            )));
+            lines.push(Line::from(vec![
+                Span::styled("  │ ", Style::default().fg(t.border_subtle)),
+                Span::styled(line.to_string(), Style::default().fg(t.text_muted)),
+            ]));
         }
     }
 
@@ -945,7 +945,7 @@ mod tests {
         let text: String = lines.iter()
             .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
             .collect();
-        assert!(text.contains("思考中"));
+        assert!(text.contains("Thinking"));
         assert!(text.contains("2.5s"));
         assert!(text.contains("check the file"));
     }
@@ -968,7 +968,7 @@ mod tests {
         let text: String = lines.iter()
             .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
             .collect();
-        assert!(text.contains("思考中"));
+        assert!(text.contains("Thinking"));
         assert!(text.contains("line 0"));
         assert!(text.contains("line 9"));
     }
@@ -1150,7 +1150,7 @@ mod tests {
         let text: String = lines.iter()
             .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
             .collect();
-        assert!(text.contains("思考中"));
+        assert!(text.contains("Thinking"));
     }
 
     #[test]
@@ -1421,7 +1421,7 @@ mod tests {
         // Collapsed: only header, no content lines
         assert_eq!(lines.len(), 1);
         let text = lines_to_text(&lines);
-        assert!(text.contains("思考中"));
+        assert!(text.contains("Thinking"));
         assert!(text.contains("2.5s"));
         assert!(!text.contains("line 1"));
     }
@@ -1561,7 +1561,7 @@ mod tests {
         // Should be collapsed: only header
         assert_eq!(lines.len(), 1);
         let text = lines_to_text(&lines);
-        assert!(text.contains("思考中"));
+        assert!(text.contains("Thinking"));
         assert!(!text.contains("long thought"));
     }
 
@@ -1645,7 +1645,7 @@ mod tests {
         let elapsed = Some(Duration::from_secs_f64(1.0));
         let lines = render_thinking("test", elapsed, true);
         let span = &lines[0].spans[0];
-        assert_eq!(span.style.fg, Some(theme::current().border_active));
+        assert_eq!(span.style.fg, Some(theme::current().text_muted));
     }
 
     #[test]
@@ -2000,6 +2000,21 @@ mod tests {
         let lines = render_tool_call_summary("Bash", r#"{"command": "false"}"#, &ToolStatus::Failed);
         let text = lines_to_text(&lines);
         assert!(text.contains("✗"));
+    }
+
+    // --- Task 15: thinking block style ---
+
+    #[test]
+    fn thinking_block_uses_text_prefix() {
+        let block = ContentBlock::Thinking {
+            text: "reasoning...".into(),
+            started_at: None,
+            finished_at: None,
+        };
+        let lines = render_block_collapsed(&block, 80);
+        let text: String = lines[0].spans.iter().map(|s| s.content.to_string()).collect();
+        assert!(text.contains("Thinking"), "should use 'Thinking', got: {}", text);
+        assert!(!text.contains("💭"), "should not have emoji");
     }
 
     // --- Task 8: tool_icon mapping tests ---
