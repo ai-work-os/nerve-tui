@@ -450,9 +450,9 @@ fn render_table(table_rows: &[(Vec<String>, bool)]) -> Vec<Line<'static>> {
 /// Highlight code using syntect. Falls back to plain muted text on unknown language.
 fn highlight_code(code: &str, lang: &str) -> Vec<Line<'static>> {
     // Snapshot theme colors and drop the read guard before expensive syntect work
-    let (text_muted, bg, syntect_name) = {
+    let (text_muted, bg, line_num_color, syntect_name) = {
         let t = theme::current();
-        (t.text_muted, t.background_panel, t.syntect_theme_name.clone())
+        (t.text_muted, t.background_panel, t.diff_line_number, t.syntect_theme_name.clone())
     };
     let ss = &*SYNTAX_SET;
     let syn_theme = code_theme(&syntect_name);
@@ -467,36 +467,39 @@ fn highlight_code(code: &str, lang: &str) -> Vec<Line<'static>> {
     let mut h = HighlightLines::new(syntax, syn_theme);
     let mut lines = Vec::new();
 
-    // Language label (small, muted) — no separator lines
+    let code_lines: Vec<&str> = code.lines().collect();
+    let total_lines = code_lines.len();
+    let num_width = total_lines.to_string().len().max(3);
+
+    // Language label (small, muted, indented) — no separator lines
     if !lang.is_empty() {
         lines.push(Line::from(Span::styled(
-            lang.to_string(),
+            format!("  {}", lang.to_lowercase()),
             Style::default().fg(text_muted).bg(bg),
         )));
     }
 
-    for line in code.lines() {
-        match h.highlight_line(line, &ss) {
+    for (i, line) in code_lines.iter().enumerate() {
+        let line_num = format!("{:>width$} \u{2502} ", i + 1, width = num_width);
+        let mut spans = vec![
+            Span::styled(
+                line_num,
+                Style::default().fg(line_num_color).bg(bg),
+            ),
+        ];
+
+        match h.highlight_line(line, ss) {
             Ok(ranges) => {
-                let spans: Vec<Span<'static>> = ranges
-                    .into_iter()
-                    .map(|(syn_style, text)| {
-                        let fg = Color::Rgb(syn_style.foreground.r, syn_style.foreground.g, syn_style.foreground.b);
-                        Span::styled(
-                            text.to_string(),
-                            Style::default().fg(fg).bg(bg),
-                        )
-                    })
-                    .collect();
-                lines.push(Line::from(spans));
+                for (syn_style, text) in ranges {
+                    let fg = Color::Rgb(syn_style.foreground.r, syn_style.foreground.g, syn_style.foreground.b);
+                    spans.push(Span::styled(text.to_string(), Style::default().fg(fg).bg(bg)));
+                }
             }
             Err(_) => {
-                lines.push(Line::from(Span::styled(
-                    line.to_string(),
-                    Style::default().fg(text_muted).bg(bg),
-                )));
+                spans.push(Span::styled(line.to_string(), Style::default().fg(text_muted).bg(bg)));
             }
         }
+        lines.push(Line::from(spans));
     }
 
     lines
@@ -1798,6 +1801,29 @@ mod tests {
     fn tool_summary_empty_json() {
         let result = extract_tool_summary("Bash", "{}");
         assert!(result.len() <= 43);
+    }
+
+    // --- Task 7: line numbers in code blocks ---
+
+    #[test]
+    fn code_block_has_line_numbers() {
+        let lines = highlight_code("fn main() {\n    println!(\"hi\");\n}", "rust");
+        // First line is language label
+        let label: String = lines[0].spans.iter().map(|s| s.content.to_string()).collect();
+        assert!(label.contains("rust"));
+        // Second line is line 1 of code — should have "1" and "│"
+        let line1: String = lines[1].spans.iter().map(|s| s.content.to_string()).collect();
+        assert!(line1.contains("1"), "should have line number 1, got: {}", line1);
+        assert!(line1.contains("│"), "should have separator │, got: {}", line1);
+    }
+
+    #[test]
+    fn code_block_line_numbers_right_aligned() {
+        let code = (1..=15).map(|i| format!("line{}", i)).collect::<Vec<_>>().join("\n");
+        let lines = highlight_code(&code, "");
+        // Line 15 should be right-aligned
+        let last: String = lines.last().unwrap().spans.iter().map(|s| s.content.to_string()).collect();
+        assert!(last.contains("15"), "last line should show 15, got: {}", last);
     }
 
     // --- Code block background tests ---
