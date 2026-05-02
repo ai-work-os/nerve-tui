@@ -92,23 +92,27 @@ impl<T: Transport> App<T> {
             }
         }
 
-        // Build metadata text for input box
-        let meta_left = if self.is_dm_mode() {
+        // Build metadata text and agent color for input box
+        let (meta_left, agent_c) = if self.is_dm_mode() {
+            let t = theme::current();
+            let agent_name = self.dm_view.agent_name();
             let model = self.dm_view.model_label.as_deref().unwrap_or("");
             let status = if self.dm_view.is_responding { "回复中..." } else { "" };
-            if status.is_empty() {
-                model.to_string()
+            let meta = if status.is_empty() {
+                format!("{} · {}", agent_name, model)
             } else {
-                format!("{} · {}", model, status)
-            }
+                format!("{} · {} · {}", agent_name, model, status)
+            };
+            let color = t.agent_color(agent_name);
+            (meta, Some(color))
         } else {
-            String::new()
+            (String::new(), None)
         };
-        self.input.render_with_meta(layout.input, frame.buffer_mut(), &meta_left);
+        self.input.render_with_meta(layout.input, frame.buffer_mut(), &meta_left, agent_c);
         self.input.render_popup(layout.input, frame.buffer_mut());
 
         // Cursor
-        let (cx, cy) = self.input.cursor_position(layout.input);
+        let (cx, cy) = self.input.cursor_position_with_border(layout.input, agent_c.is_some());
         frame.set_cursor_position((cx, cy));
     }
 }
