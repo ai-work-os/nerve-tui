@@ -179,6 +179,22 @@ impl<T: Transport> App<T> {
                 self.needs_redraw = true;
             }
 
+            // Ctrl+T: cycle theme
+            KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                let themes = crate::config::available_themes();
+                let current_name = self.current_theme_name.as_deref().unwrap_or("warm-light");
+                let idx = themes.iter().position(|&t| t == current_name).unwrap_or(0);
+                let next = themes[(idx + 1) % themes.len()];
+                if let Some(theme) = crate::config::resolve_theme(next) {
+                    crate::theme::set_theme(theme);
+                    self.current_theme_name = Some(next.to_string());
+                    let mut cfg = crate::config::load_config();
+                    cfg.theme = next.to_string();
+                    crate::config::save_config(&cfg);
+                    self.needs_redraw = true;
+                }
+            }
+
             // Ctrl+V: check clipboard for image, fall back to text paste
             KeyCode::Char('v') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.handle_paste_from_key().await;
