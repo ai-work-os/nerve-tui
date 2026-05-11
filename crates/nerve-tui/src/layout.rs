@@ -1,5 +1,7 @@
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 
+const SIDEBAR_WIDTH: u16 = 32;
+
 pub struct AppLayout {
     pub sidebar: Rect,
     pub messages: Rect,
@@ -23,7 +25,7 @@ impl AppLayout {
     /// Calculate the inner width of the input box (excluding borders) for a given configuration.
     /// Use this to call visual_line_count consistently with the actual layout width.
     pub fn input_inner_width(area: Rect, sidebar_visible: bool, panel_count: usize) -> u16 {
-        let sidebar_width: u16 = if sidebar_visible { 20 } else { 0 };
+        let sidebar_width: u16 = if sidebar_visible { SIDEBAR_WIDTH } else { 0 };
         let main_w = area.width.saturating_sub(sidebar_width);
         let mut dm_w = main_w * dm_pct(panel_count) / 100;
         // Match build(): shrink DM if panels need min width
@@ -51,7 +53,7 @@ impl AppLayout {
         sidebar_visible: bool,
         panel_count: usize,
     ) -> Self {
-        let sidebar_width: u16 = if sidebar_visible { 20 } else { 0 };
+        let sidebar_width: u16 = if sidebar_visible { SIDEBAR_WIDTH } else { 0 };
         let max_input_height = 12.min(area.height / 3); // 10 content lines + 2 borders
         let input_height = input_lines.clamp(3, max_input_height.max(3));
 
@@ -159,7 +161,7 @@ mod tests {
     // --- Split Step 2: multi-panel layout tests ---
 
     const TEST_AREA: Rect = Rect { x: 0, y: 0, width: 120, height: 30 };
-    const SIDEBAR_W: u16 = 20;
+    const SIDEBAR_W: u16 = SIDEBAR_WIDTH;
 
     #[test]
     fn panel_count_0_no_panels_messages_fill() {
@@ -198,8 +200,14 @@ mod tests {
     fn panel_count_3_dm_35_percent() {
         let layout = AppLayout::build(TEST_AREA, 3, true, 3);
         assert_eq!(layout.panels.len(), 3);
-        let main_w = TEST_AREA.width - SIDEBAR_W; // 100
-        let dm_w = main_w * 35 / 100; // 35
+        let main_w = TEST_AREA.width - SIDEBAR_W;
+        let n: u16 = 3;
+        const MIN_PANEL_W: u16 = 20;
+        let min_panels_total = MIN_PANEL_W * n;
+        let mut dm_w = main_w * 35 / 100;
+        if main_w.saturating_sub(dm_w) < min_panels_total && main_w > min_panels_total {
+            dm_w = main_w - min_panels_total;
+        }
         assert!((layout.messages.width as i16 - dm_w as i16).unsigned_abs() <= 1);
         let remaining = main_w - layout.messages.width;
         for panel in &layout.panels {
@@ -244,6 +252,12 @@ mod tests {
         // More panels → narrower input
         assert!(w0 > w1);
         assert!(w1 > w2);
+    }
+
+    #[test]
+    fn sidebar_width_is_32() {
+        let layout = AppLayout::build(Rect::new(0, 0, 120, 40), 3, true, 0);
+        assert_eq!(layout.sidebar.width, 32);
     }
 
     #[test]

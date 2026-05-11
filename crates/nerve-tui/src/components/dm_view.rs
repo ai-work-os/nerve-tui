@@ -4,7 +4,7 @@ use chrono::Local;
 use nerve_tui_protocol::{ContentBlock, DmMessage, Message, Role, SnapshotMessage, ToolStatus};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Widget, Wrap};
 use serde_json::Value;
@@ -12,7 +12,7 @@ use std::collections::{HashMap, HashSet};
 use tracing::debug;
 use unicode_width::UnicodeWidthStr;
 
-use super::messages::{compact_rendered_lines, format_interval, format_time};
+use super::messages::{build_message_footer, compact_rendered_lines, format_time_short};
 
 #[allow(dead_code)]
 pub(crate) struct MessageLine {
@@ -58,6 +58,8 @@ pub struct DmView {
     text_cache: Option<TextCacheEntry>,
     /// Number of cache hits (for diagnostics/testing).
     pub cache_hit_count: u64,
+    /// Current spinner frame (updated each render tick from App).
+    pub spinner_frame: String,
 }
 
 impl DmView {
@@ -81,6 +83,7 @@ impl DmView {
             summary_mode: false,
             text_cache: None,
             cache_hit_count: 0,
+            spinner_frame: "⠋".to_string(),
         }
     }
 
@@ -319,11 +322,12 @@ impl DmView {
     // --- Rendering ---
 
     pub fn render(&mut self, area: Rect, buf: &mut Buffer) {
+        let t = theme::current();
         // Fill with L0 background
         for y in area.y..area.y + area.height {
             for x in area.x..area.x + area.width {
                 if let Some(cell) = buf.cell_mut((x, y)) {
-                    cell.set_bg(theme::BG_L0);
+                    cell.set_bg(t.background);
                 }
             }
         }
@@ -339,7 +343,7 @@ impl DmView {
 
         let text_lines = self.build_text(inner.width);
         let para = Paragraph::new(text_lines)
-            .style(Style::default().bg(theme::BG_L0))
+            .style(Style::default().bg(t.background))
             .wrap(Wrap { trim: false });
         let total_visual = (para.line_count(inner.width) as u32).min(u16::MAX as u32) as u16;
         let max_offset = total_visual.saturating_sub(self.visible_height);
@@ -367,7 +371,7 @@ impl DmView {
                 y,
                 indicator,
                 Style::default()
-                    .fg(theme::WARNING)
+                    .fg(t.warning)
                     .add_modifier(Modifier::BOLD),
             );
         }
@@ -398,13 +402,14 @@ impl DmView {
         let mut out = static_lines;
 
         // Streaming previews — always rebuilt (content changes every chunk)
-        let cursor_char = if self.cursor_visible() { " ▌" } else { "  " };
+        let t = theme::current();
+        let spinner = self.spinner_frame.clone();
         let mut streaming_names: Vec<&String> = self.streaming_messages.keys().collect();
         streaming_names.sort();
         for name in streaming_names {
             let msg = &self.streaming_messages[name];
-            let name_color = theme::agent_color(name);
-            let border = Span::styled("│ ".to_string(), Style::default().fg(name_color));
+            let name_color = t.agent_color(name);
+            let border = Span::styled("│  ".to_string(), Style::default().fg(name_color));
             out.push(Line::from(""));
             out.push(Line::from(vec![
                 border.clone(),
@@ -414,7 +419,7 @@ impl DmView {
                         .fg(name_color)
                         .add_modifier(Modifier::BOLD),
                 ),
-                Span::styled(cursor_char.to_string(), Style::default().fg(theme::WARNING)),
+                Span::styled(format!(" {}", spinner), Style::default().fg(name_color)),
             ]));
 
             if !msg.blocks.is_empty() {
@@ -423,7 +428,7 @@ impl DmView {
                     name, msg.blocks.len()
                 );
                 for block in &msg.blocks {
-                    let mut rendered = block_renderer::render_block(block, width);
+                    let mut rendered = block_renderer::render_block_with_spinner(block, width, &spinner);
                     for line in &mut rendered {
                         let mut new_spans = vec![border.clone()];
                         new_spans.extend(std::mem::take(&mut line.spans));
@@ -446,8 +451,8 @@ impl DmView {
 
     /// Build rendered lines for static (non-streaming) messages.
     fn build_static_lines(&self, width: u16) -> Vec<Line<'static>> {
+        let t = theme::current();
         let mut out: Vec<Line<'static>> = Vec::new();
-        let mut prev_timestamp: Option<f64> = None;
 
         for (i, msg) in self.messages.iter().enumerate() {
             if i > 0 {
@@ -455,30 +460,29 @@ impl DmView {
             }
 
             // DM mode: detect channel-origin prefix
-            let (channel_origin, base_content) = extract_channel_origin(&msg.content);
+            let (_channel_origin, base_content) = extract_channel_origin(&msg.content);
             let display_content = base_content;
 
             // System messages
             if msg.from == "系统" {
-                prev_timestamp = Some(msg.timestamp);
                 let content_lower = display_content.to_lowercase();
                 let style = if content_lower.contains("失败")
                     || content_lower.contains("error")
                     || content_lower.contains("错误")
                 {
                     Style::default()
-                        .fg(Color::Red)
+                        .fg(t.error)
                         .add_modifier(Modifier::ITALIC)
                 } else if content_lower.contains("已恢复")
                     || content_lower.contains("成功")
                     || content_lower.contains("已注册")
                 {
                     Style::default()
-                        .fg(Color::Green)
+                        .fg(t.success)
                         .add_modifier(Modifier::ITALIC)
                 } else {
                     Style::default()
-                        .fg(Color::DarkGray)
+                        .fg(t.text_muted)
                         .add_modifier(Modifier::ITALIC)
                 };
                 out.push(Line::from(Span::styled(
@@ -490,50 +494,32 @@ impl DmView {
 
             // Log entries from program nodes
             if msg.from == "log" {
-                prev_timestamp = Some(msg.timestamp);
                 let style = if display_content.contains("[ERROR]") {
-                    Style::default().fg(Color::Red)
+                    Style::default().fg(t.error)
                 } else if display_content.contains("[WARN]") {
-                    Style::default().fg(Color::Yellow)
+                    Style::default().fg(t.warning)
                 } else {
-                    Style::default().fg(Color::DarkGray)
+                    Style::default().fg(t.text_muted)
                 };
                 out.push(Line::from(Span::styled(display_content.clone(), style)));
                 continue;
             }
 
-            // Header
-            let time_str = format_time(msg.timestamp);
-            let interval_str = prev_timestamp
-                .map(|prev| format_interval(prev, msg.timestamp))
-                .unwrap_or_default();
-            prev_timestamp = Some(msg.timestamp);
+            // Header: agent-name · HH:MM
+            let time_str = format_time_short(msg.timestamp);
 
-            let name_color = theme::agent_color(&msg.from);
-            let name_style = Style::default().fg(name_color).add_modifier(Modifier::BOLD);
             let is_user = msg.from == "user";
-            let border_span = if !is_user {
-                Span::styled("│ ".to_string(), Style::default().fg(name_color))
-            } else {
-                Span::raw("".to_string())
-            };
+            let border_color = if is_user { t.border } else { t.agent_color(&msg.from) };
+            let name_color = if is_user { t.agent_color(&msg.from) } else { border_color };
+            let name_style = Style::default().fg(name_color).add_modifier(Modifier::BOLD);
+            let border_span = Span::styled("│  ".to_string(), Style::default().fg(border_color));
 
             let mut header = vec![border_span.clone()];
             header.push(Span::styled(msg.from.clone(), name_style));
-            if let Some(ref origin) = channel_origin {
-                header.push(Span::styled(
-                    format!("  [来自 #{} @{}]", origin.channel, origin.from),
-                    Style::default().fg(theme::SYSTEM_MSG),
-                ));
-            }
-            header.push(Span::raw("  "));
-            header.push(Span::styled(time_str, Style::default().fg(theme::TIMESTAMP)));
-            if !interval_str.is_empty() {
-                header.push(Span::styled(
-                    format!(" · {}", interval_str),
-                    Style::default().fg(theme::TIMESTAMP),
-                ));
-            }
+            header.push(Span::styled(
+                format!(" · {}", time_str),
+                Style::default().fg(t.text_muted),
+            ));
             out.push(Line::from(header));
 
             // Content via block_renderer
@@ -554,15 +540,23 @@ impl DmView {
                 }
             }
             compact_rendered_lines(&mut content_lines);
-            // Prepend border strip to content lines for agent messages
-            if !is_user {
-                for line in &mut content_lines {
-                    let mut new_spans = vec![border_span.clone()];
-                    new_spans.extend(std::mem::take(&mut line.spans));
-                    line.spans = new_spans;
-                }
+            // Prepend border strip to all content lines
+            for line in &mut content_lines {
+                let mut new_spans = vec![border_span.clone()];
+                new_spans.extend(std::mem::take(&mut line.spans));
+                line.spans = new_spans;
             }
             out.extend(content_lines);
+
+            // Footer for agent messages (not user)
+            if !is_user {
+                let footer = build_message_footer(&msg.from, "", None);
+                if !footer.spans.is_empty() {
+                    let mut footer_spans = vec![border_span.clone()];
+                    footer_spans.extend(footer.spans);
+                    out.push(Line::from(footer_spans));
+                }
+            }
         }
 
         out
@@ -1107,11 +1101,12 @@ mod tests {
 
     #[test]
     fn render_fills_l0_background() {
+        let t = theme::current();
         let mut dm = DmView::new("alice");
         let area = Rect::new(0, 0, 60, 20);
         let mut buf = Buffer::empty(area);
         dm.render(area, &mut buf);
         let cell = buf.cell((5, 5)).unwrap();
-        assert_eq!(cell.bg, theme::BG_L0);
+        assert_eq!(cell.bg, t.background);
     }
 }

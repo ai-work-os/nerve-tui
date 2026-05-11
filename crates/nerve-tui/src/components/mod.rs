@@ -1,4 +1,6 @@
 pub mod block_renderer;
+pub mod diff_view;
+pub mod spinner;
 pub mod channel_view;
 pub mod dm_view;
 pub mod input;

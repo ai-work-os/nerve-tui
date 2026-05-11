@@ -1,7 +1,10 @@
 //! Shared utility functions used by channel_view and dm_view.
 
 use chrono::{Local, TimeZone};
-use ratatui::text::Line;
+use ratatui::style::Style;
+use ratatui::text::{Line, Span};
+
+use crate::theme;
 
 /// Extract the first @mention as route target, return (target, content_without_prefix).
 /// "@bob hello world" → (Some("bob"), "hello world")
@@ -33,6 +36,19 @@ pub(crate) fn format_time(ts: f64) -> String {
         .timestamp_opt(secs, 0)
         .single()
         .map(|dt| dt.format("%H:%M:%S").to_string())
+        .unwrap_or_default()
+}
+
+pub(crate) fn format_time_short(ts: f64) -> String {
+    let secs = if ts > 1e12 {
+        (ts / 1000.0) as i64
+    } else {
+        ts as i64
+    };
+    Local
+        .timestamp_opt(secs, 0)
+        .single()
+        .map(|dt| dt.format("%H:%M").to_string())
         .unwrap_or_default()
 }
 
@@ -73,6 +89,31 @@ pub(crate) fn format_interval(prev: f64, curr: f64) -> String {
     } else {
         format!("+{}d", d)
     }
+}
+
+pub(crate) fn build_message_footer(from: &str, model: &str, duration_secs: Option<f64>) -> Line<'static> {
+    if from == "user" {
+        return Line::from(vec![]);
+    }
+    let t = theme::current();
+    let agent_c = t.agent_color(from);
+    let mut spans = vec![
+        Span::styled("▣ ", Style::default().fg(agent_c)),
+        Span::styled(from.to_string(), Style::default().fg(t.text)),
+    ];
+    if !model.is_empty() {
+        spans.push(Span::styled(
+            format!(" · {}", model),
+            Style::default().fg(t.text_muted),
+        ));
+    }
+    if let Some(d) = duration_secs {
+        spans.push(Span::styled(
+            format!(" · {:.1}s", d),
+            Style::default().fg(t.text_muted),
+        ));
+    }
+    Line::from(spans)
 }
 
 pub(crate) fn compact_rendered_lines(lines: &mut Vec<Line<'static>>) {
@@ -192,7 +233,7 @@ mod tests {
     }
 
     #[test]
-    fn time_interval_in_header() {
+    fn time_shown_in_header() {
         let mut cv = ChannelView::new();
         let mut msg1 = make_msg("alice", "first");
         msg1.timestamp = 1710000000.0;
@@ -208,7 +249,9 @@ mod tests {
         assert!(bob_header.is_some(), "bob header should exist");
         let header_text: String = bob_header.unwrap().spans.iter()
             .map(|s| s.content.to_string()).collect();
-        assert!(header_text.contains("+15s"), "header should show +15s interval");
+        // Header now shows · HH:MM (no interval between messages)
+        assert!(header_text.contains(" · "), "header should show · time separator");
+        assert!(!header_text.contains("+15s"), "header should not show interval");
     }
 
     #[test]
@@ -316,14 +359,14 @@ mod tests {
     }
 
     #[test]
-    fn dm_channel_origin_shows_tag() {
+    fn dm_channel_origin_strips_prefix_from_content() {
         let mut dm = DmView::new("agent-1");
         dm.push(&make_dm("user", "[channel: ch_123] from: main\n\n@agent-1 fix this bug"));
         let lines = dm.build_text(80);
+        // Header is simplified: no channel origin shown there anymore
         let header: String = lines[0].spans.iter().map(|s| s.content.to_string()).collect();
-        assert!(header.contains("来自"), "header shows channel origin tag");
-        assert!(header.contains("ch_123"), "header contains channel id");
-        assert!(header.contains("main"), "header contains sender name");
+        assert!(header.contains("user"), "header shows sender");
+        assert!(!header.contains("来自"), "channel origin removed from header");
         let content: String = lines[1..].iter()
             .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
             .collect();
@@ -401,26 +444,23 @@ mod tests {
     }
 
     #[test]
-    fn streaming_cursor_blinks_in_output() {
+    fn streaming_cursor_shows_spinner_in_output() {
+        use crate::components::spinner::BRAILLE_FRAMES;
         let mut dm = DmView::new("agent");
         dm.start_streaming_message("agent");
         let update = serde_json::json!({ "content": { "text": "text" } });
         dm.apply_streaming_event("agent", "agent_message_chunk", &update);
 
+        // Default spinner_frame is the first braille character
         let lines = dm.build_text(80);
         let text: String = lines.iter()
             .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
             .collect();
-        assert!(text.contains("▌"), "cursor visible in on phase");
-
-        for _ in 0..15 {
-            dm.tick_blink();
-        }
-        let lines = dm.build_text(80);
-        let text: String = lines.iter()
-            .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
-            .collect();
-        assert!(!text.contains("▌"), "cursor hidden in off phase");
+        assert!(
+            BRAILLE_FRAMES.iter().any(|f| text.contains(*f)),
+            "streaming header should contain a braille spinner frame, got: {}", text
+        );
+        assert!(!text.contains("▌"), "blinking cursor ▌ should be replaced by spinner");
     }
 
     #[test]
@@ -454,6 +494,33 @@ mod tests {
         assert_eq!(dm.messages[2].content, "question 2");
         assert_eq!(dm.messages[3].from, "assistant");
         assert_eq!(dm.messages[3].content, "answer 2");
+    }
+
+    // --- build_message_footer tests ---
+
+    #[test]
+    fn footer_contains_agent_info() {
+        let footer = build_message_footer("claude", "opus-4", Some(2.3));
+        let text: String = footer.spans.iter().map(|s| s.content.to_string()).collect();
+        assert!(text.contains("▣"));
+        assert!(text.contains("claude"));
+        assert!(text.contains("opus-4"));
+        assert!(text.contains("2.3s"));
+    }
+
+    #[test]
+    fn user_footer_is_empty() {
+        let footer = build_message_footer("user", "", None);
+        assert!(footer.spans.is_empty());
+    }
+
+    #[test]
+    fn footer_without_model() {
+        let footer = build_message_footer("claude", "", None);
+        let text: String = footer.spans.iter().map(|s| s.content.to_string()).collect();
+        assert!(text.contains("▣"));
+        assert!(text.contains("claude"));
+        assert!(!text.contains("·")); // No model separator
     }
 
     // --- Shared utility tests ---

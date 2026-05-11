@@ -7,6 +7,7 @@ use tokio::sync::mpsc;
 use crate::components::channel_view::ChannelPanelState;
 use crate::components::channel_view::ChannelView;
 use crate::components::dm_view::DmView;
+use crate::components::spinner::{BrailleSpinner, KnightRiderScanner};
 use crate::components::*;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -71,6 +72,12 @@ pub struct App<T: Transport> {
     pub(crate) needs_redraw: bool,
     /// When true, clear terminal buffer before next draw (forces full repaint).
     pub(crate) force_clear: bool,
+    /// Spinner for tool pending / streaming cursor animation.
+    pub(crate) spinner: BrailleSpinner,
+    /// Knight Rider scanner animation for input metadata line during agent response.
+    pub(crate) scanner: KnightRiderScanner,
+    /// Currently active theme name (for Ctrl+T cycling and persistence).
+    pub(crate) current_theme_name: Option<String>,
 }
 
 impl<T: Transport> App<T> {
@@ -93,6 +100,14 @@ impl<T: Transport> App<T> {
         let project_name = project_path
             .as_deref()
             .and_then(Self::project_name_from_path);
+
+        // Load persisted theme config
+        let cfg = crate::config::load_config();
+        if let Some(theme) = crate::config::resolve_theme(&cfg.theme) {
+            crate::theme::set_theme(theme);
+        }
+        let current_theme_name = Some(cfg.theme);
+
         Self {
             client,
             event_rx,
@@ -117,6 +132,9 @@ impl<T: Transport> App<T> {
             panel_x_boundaries: Vec::new(),
             needs_redraw: true,
             force_clear: false,
+            spinner: BrailleSpinner::new(),
+            scanner: KnightRiderScanner::new(0),
+            current_theme_name,
         }
     }
 

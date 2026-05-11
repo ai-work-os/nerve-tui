@@ -571,7 +571,8 @@ impl InputBox {
             return 1;
         }
         let rows = wrap_lines(&self.text, width as usize, 0, 0);
-        (rows.len() as u16 + 1).max(2) // +1 for metadata row, min 2
+        let raw = rows.len() as u16 + 1; // +1 for metadata row
+        raw.max(2).min(10 + 1) // min 2, max 10 content rows + 1 metadata
     }
 
     fn cursor_visual_position_inner(&self, width: u16, first_prompt: usize, cont_prompt: usize) -> (u16, u16) {
@@ -608,11 +609,12 @@ impl InputBox {
     }
 
     pub fn render(&self, area: Rect, buf: &mut Buffer) {
+        let t = theme::current();
         // Fill with L2 background
         for y in area.y..area.y + area.height {
             for x in area.x..area.x + area.width {
                 if let Some(cell) = buf.cell_mut((x, y)) {
-                    cell.set_bg(theme::BG_L2);
+                    cell.set_bg(t.background_element);
                 }
             }
         }
@@ -634,7 +636,7 @@ impl InputBox {
             cursor_row.saturating_sub(visible_height.saturating_sub(1))
         };
 
-        let text_style = Style::default().fg(theme::TEXT).bg(theme::BG_L2);
+        let text_style = Style::default().fg(t.text).bg(t.background_element);
 
         for (i, row) in rows.iter().enumerate() {
             let visual_y = i as u16;
@@ -650,27 +652,41 @@ impl InputBox {
 
         // Metadata line at bottom
         let meta_y = area.y + area.height - 1;
-        let meta_style = Style::default().fg(theme::TEXT_MUTED).bg(theme::BG_L2);
+        let meta_style = Style::default().fg(t.text_muted).bg(t.background_element);
         let right_hint = "↩ 发送 · ⇧↩ 换行";
         let hint_w = unicode_width::UnicodeWidthStr::width(right_hint) as u16;
         let hint_x = area.x + area.width.saturating_sub(hint_w + 2);
         buf.set_string(hint_x, meta_y, right_hint, meta_style);
     }
 
-    pub fn render_with_meta(&self, area: Rect, buf: &mut Buffer, meta_left: &str) {
-        // Fill with L2 background
+    pub fn render_with_meta(&self, area: Rect, buf: &mut Buffer, meta_left: &str, agent_color: Option<Color>) {
+        let t = theme::current();
+        // Fill with background_element
         for y in area.y..area.y + area.height {
             for x in area.x..area.x + area.width {
                 if let Some(cell) = buf.cell_mut((x, y)) {
-                    cell.set_bg(theme::BG_L2);
+                    cell.set_bg(t.background_element);
                 }
             }
         }
 
+        // Draw left border when agent_color is set
+        if let Some(color) = agent_color {
+            for y in area.y..area.y + area.height {
+                if let Some(cell) = buf.cell_mut((area.x, y)) {
+                    cell.set_char('│');
+                    cell.set_fg(color);
+                    cell.set_bg(t.background_element);
+                }
+            }
+        }
+
+        // Content area: shift right by 2 extra chars when border present (border + space)
+        let border_offset: u16 = if agent_color.is_some() { 2 } else { 0 };
         let inner = Rect {
-            x: area.x + 2,
+            x: area.x + 2 + border_offset,
             y: area.y + 1,
-            width: area.width.saturating_sub(4),
+            width: area.width.saturating_sub(4 + border_offset),
             height: area.height.saturating_sub(1),
         };
 
@@ -683,7 +699,7 @@ impl InputBox {
             cursor_row.saturating_sub(visible_height.saturating_sub(1))
         };
 
-        let text_style = Style::default().fg(theme::TEXT).bg(theme::BG_L2);
+        let text_style = Style::default().fg(t.text).bg(t.background_element);
 
         for (i, row) in rows.iter().enumerate() {
             let visual_y = i as u16;
@@ -699,9 +715,10 @@ impl InputBox {
 
         // Metadata line at bottom
         let meta_y = area.y + area.height - 1;
-        let meta_style = Style::default().fg(theme::TEXT_MUTED).bg(theme::BG_L2);
+        let meta_style = Style::default().fg(t.text_muted).bg(t.background_element);
+        let meta_x = area.x + 2 + border_offset;
         if !meta_left.is_empty() {
-            buf.set_string(area.x + 2, meta_y, meta_left, meta_style);
+            buf.set_string(meta_x, meta_y, meta_left, meta_style);
         }
         let right_hint = "↩ 发送 · ⇧↩ 换行";
         let hint_w = unicode_width::UnicodeWidthStr::width(right_hint) as u16;
@@ -746,9 +763,19 @@ impl InputBox {
 
     /// Get cursor screen position.
     pub fn cursor_position(&self, area: Rect) -> (u16, u16) {
-        let inner_x = area.x + 2;
+        self.cursor_position_inner(area, 0)
+    }
+
+    /// Get cursor screen position with optional left border offset (2 chars: border + space).
+    pub fn cursor_position_with_border(&self, area: Rect, has_border: bool) -> (u16, u16) {
+        let border_offset: u16 = if has_border { 2 } else { 0 };
+        self.cursor_position_inner(area, border_offset)
+    }
+
+    fn cursor_position_inner(&self, area: Rect, border_offset: u16) -> (u16, u16) {
+        let inner_x = area.x + 2 + border_offset;
         let inner_y = area.y + 1;
-        let inner_width = area.width.saturating_sub(4);
+        let inner_width = area.width.saturating_sub(4 + border_offset);
         let visible_height = area.height.saturating_sub(2); // 1 top pad + 1 metadata
         let (col, visual_row) = self.cursor_visual_position_inner(inner_width, 0, 0);
         let scroll_y = if visible_height == 0 {
@@ -1579,12 +1606,13 @@ mod tests {
 
     #[test]
     fn render_uses_l2_background() {
+        let t = theme::current();
         let input = InputBox::new();
         let area = Rect::new(0, 0, 40, 5);
         let mut buf = Buffer::empty(area);
         input.render(area, &mut buf);
         let cell = buf.cell((1, 1)).unwrap();
-        assert_eq!(cell.bg, theme::BG_L2);
+        assert_eq!(cell.bg, t.background_element);
     }
 
     #[test]
